@@ -1,0 +1,12 @@
+# Generated C++ headers (should be built locally, not committed)
+*_generated.h
+
+# Build artifacts
+*.so
+*.o
+build/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

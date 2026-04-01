@@ -1,0 +1,250 @@
+{
+  "vllm_responses": {
+    "streaming_chunks": [
+      {
+        "id": "cmpl-fixture-streaming-001",
+        "object": "chat.completion.chunk", 
+        "created": 1699123456,
+        "model": "test-model",
+        "choices": [
+          {
+            "index": 0,
+            "delta": {"content": "Once"},
+            "finish_reason": null
+          }
+        ]
+      },
+      {
+        "id": "cmpl-fixture-streaming-001",
+        "object": "chat.completion.chunk",
+        "created": 1699123456,
+        "model": "test-model", 
+        "choices": [
+          {
+            "index": 0,
+            "delta": {"content": " upon"},
+            "finish_reason": null
+          }
+        ]
+      },
+      {
+        "id": "cmpl-fixture-streaming-001",
+        "object": "chat.completion.chunk",
+        "created": 1699123456,
+        "model": "test-model",
+        "choices": [
+          {
+            "index": 0,
+            "delta": {"content": " a time"},
+            "finish_reason": "stop"
+          }
+        ]
+      }
+    ],
+    "non_streaming": {
+      "id": "cmpl-fixture-non-streaming-001",
+      "object": "chat.completion",
+      "created": 1699123456,
+      "model": "test-model",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "I'm doing well, thank you for asking! How can I help you today?"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 15,
+        "completion_tokens": 17,
+        "total_tokens": 32
+      }
+    },
+    "malformed_no_id": {
+      "object": "chat.completion",
+      "created": 1699123456,
+      "model": "test-model",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant", 
+            "content": "This response is missing the required 'id' field"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 12,
+        "total_tokens": 22
+      }
+    }
+  },
+  "broker_messages": {
+    "hello": {
+      "type": "HELLO",
+      "worker_id": "worker-fixture-001",
+      "models": ["Qwen/Qwen3-8B", "test-model"],
+      "capacity": 4,
+      "capabilities": {
+        "compute_type": "nvidia-8.6",
+        "gpu_model": "A100-80GB", 
+        "memory_gb": 80,
+        "region": "us-west-2",
+        "max_context_window": 128000,
+        "features": ["streaming", "pow_injection"],
+        "quantization": ["fp16", "int8"]
+      }
+    },
+    "ack": {
+      "type": "ACK",
+      "heartbeat_interval_sec": 15,
+      "worker_id": "worker-fixture-001",
+      "status": "registered"
+    },
+    "challenge": {
+      "type": "CHALLENGE",
+      "nonce": "challenge-fixture-nonce-12345",
+      "timestamp": 1699123456
+    },
+    "start_streaming": {
+      "type": "START",
+      "job_id": "job-fixture-streaming-001",
+      "payload": {
+        "messages": [
+          {"role": "user", "content": "Tell me a short story"}
+        ],
+        "model": "test-model",
+        "stream": true,
+        "max_tokens": 100
+      }
+    },
+    "start_non_streaming": {
+      "type": "START", 
+      "job_id": "job-fixture-non-streaming-001",
+      "payload": {
+        "messages": [
+          {"role": "user", "content": "How are you?"}
+        ],
+        "model": "test-model",
+        "stream": false,
+        "max_tokens": 50
+      }
+    },
+    "proof_request": {
+      "type": "PROOF_REQUEST",
+      "completion_id": "cmpl-fixture-proof-request-001"
+    },
+    "heartbeat": {
+      "type": "HEARTBEAT",
+      "busy": 2,
+      "input_tokens_per_sec": 125.5,
+      "output_tokens_per_sec": 38.7,
+      "error_rate": 0.02,
+      "queue_depth": 1
+    }
+  },
+  "expected_responses": {
+    "challenge_response": {
+      "type": "CHALLENGE_RESP",
+      "nonce": "challenge-fixture-nonce-12345"
+    },
+    "chunk": {
+      "type": "CHUNK",
+      "job_id": "job-fixture-streaming-001",
+      "completion_id": "cmpl-fixture-streaming-001",
+      "delta": "Once"
+    },
+    "end": {
+      "type": "END",
+      "job_id": "job-fixture-streaming-001", 
+      "completion_id": "cmpl-fixture-streaming-001",
+      "usage": {}
+    },
+    "error": {
+      "type": "ERROR",
+      "job_id": "job-fixture-error-001",
+      "error": "No completion_id received from vLLM for streaming job job-fixture-error-001"
+    },
+    "proof_result_success": {
+      "type": "PROOF_RESULT",
+      "completion_id": "cmpl-fixture-proof-request-001",
+      "proof_b64": "bW9ja19wcm9vZl9kYXRhXzEyMzQ1"
+    },
+    "proof_result_not_ready": {
+      "type": "PROOF_RESULT",
+      "completion_id": "cmpl-fixture-proof-request-001", 
+      "error": "proof_not_ready"
+    }
+  },
+  "test_scenarios": [
+    {
+      "name": "successful_streaming_job",
+      "description": "Complete successful streaming job from START to END",
+      "broker_messages": ["start_streaming"],
+      "vllm_response": "streaming_chunks", 
+      "expected_worker_messages": ["chunk", "chunk", "chunk", "end"]
+    },
+    {
+      "name": "successful_non_streaming_job",
+      "description": "Complete successful non-streaming job",
+      "broker_messages": ["start_non_streaming"],
+      "vllm_response": "non_streaming",
+      "expected_worker_messages": ["chunk", "end"]
+    },
+    {
+      "name": "missing_completion_id_error",
+      "description": "Job fails when vLLM response lacks completion_id",
+      "broker_messages": ["start_non_streaming"],
+      "vllm_response": "malformed_no_id",
+      "expected_worker_messages": ["error"]
+    },
+    {
+      "name": "proof_request_success",
+      "description": "Successful proof retrieval",
+      "broker_messages": ["proof_request"],
+      "proof_available": true,
+      "expected_worker_messages": ["proof_result_success"]
+    },
+    {
+      "name": "proof_request_not_ready", 
+      "description": "Proof not yet available",
+      "broker_messages": ["proof_request"],
+      "proof_available": false,
+      "expected_worker_messages": ["proof_result_not_ready"]
+    }
+  ],
+  "authentication": {
+    "valid_jwt": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXByb3ZpZGVyIiwiaWF0IjoxNjk5MTIzNDU2LCJzY29wZXMiOlsiY29tcHV0ZTpwcm92aWRlIl19.test_signature_fixture",
+    "shared_secret": "test-shared-secret-fixture-12345",
+    "challenge_secret": "test-challenge-secret-fixture-67890"
+  },
+  "error_conditions": {
+    "connection_timeout": {
+      "type": "timeout",
+      "duration_ms": 5000
+    },
+    "websocket_close": {
+      "type": "close", 
+      "code": 1000,
+      "reason": "Normal closure"
+    },
+    "websocket_error": {
+      "type": "error",
+      "message": "WebSocket protocol error"
+    },
+    "http_500": {
+      "type": "http_error",
+      "status": 500,
+      "message": "Internal server error"
+    },
+    "http_404": {
+      "type": "http_error", 
+      "status": 404,
+      "message": "Not found"
+    }
+  }
+}

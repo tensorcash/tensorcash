@@ -1,0 +1,20 @@
+accelerate==1.6.0
+#bitsandbytes==0.45.5
+einops==0.8.1
+fastapi==0.115.12
+flatbuffers==25.2.10
+h5py==3.14.0
+huggingface-hub==0.34.0
+matplotlib==3.10.1
+numpy==1.26.4
+psutil==7.0.0
+scikit-learn==1.6.1
+scipy==1.15.2
+tqdm==4.67.1
+transformers==4.56.1
+pyzmq==25.1.1
+uvicorn==0.34.2
+# Pin torch to 2.8.0 to match Dockerfile installation
+torch==2.8.0
+hf-xet==1.1.5
+#line_profiler

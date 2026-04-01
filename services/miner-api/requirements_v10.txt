@@ -1,0 +1,10 @@
+torch==2.7.1
+transformers>=4.53.2,<4.54
+tokenizers>=0.21.1,<0.22
+huggingface_hub>=0.23
+flatbuffers>=24.3
+uvicorn>=0.29
+torchvision==0.22.1
+vllm==0.10.0
+pyzmq>=25.0.0
+setproctitle>=1.2.3

@@ -1,0 +1,10 @@
+flatbuffers>=24.3
+aiohttp>=3.8.0
+websockets>=11.0.0
+pyzmq>=25.0.0
+httpx==0.28.1
+numpy==1.26.4
+mcp[cli]==1.12.3
+uvicorn
+starlette
+cryptography>=42.0.0

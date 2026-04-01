@@ -1,0 +1,56 @@
+{
+  "getmodelslist_simple": [
+    {
+      "model_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "model_name": "Qwen/Qwen3-8B",
+      "model_commit": "9c925d64d72725edaf899c6cb9c377fd0709d9c5",
+      "difficulty": 1000000
+    },
+    {
+      "model_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "model_name": "test_model",
+      "model_commit": "abcdef1234567890abcdef1234567890abcdef12",
+      "difficulty": 2000000
+    }
+  ],
+  "getmodelslist_extended": [
+    {
+      "model_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "model_name": "Qwen/Qwen3-8B",
+      "model_commit": "9c925d64d72725edaf899c6cb9c377fd0709d9c5",
+      "difficulty": 1000000,
+      "cid": "bafybeihosbewxanqruo7br4va7vul3j3ntnudynczfckohya7yo4mqa3oy",
+      "extra": "",
+      "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+      "block_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "block_height": 0
+    },
+    {
+      "model_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "model_name": "test_model",
+      "model_commit": "abcdef1234567890abcdef1234567890abcdef12",
+      "difficulty": 2000000,
+      "cid": "QmTestCIDForTestingPurposaes123456789",
+      "extra": "test_extra_data",
+      "txid": "1111111111111111111111111111111111111111111111111111111111111111",
+      "block_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "block_height": 42
+    }
+  ],
+  "getmodelinfo": {
+    "0000000000000000000000000000000000000000000000000000000000000000": "ModelRecord(name=default_model, commit=9c925d64d72725edaf899c6cb9c377fd0709d9c5, difficulty=1000000, cid=bafybeihosbewxanqruo7br4va7vul3j3ntnudynczfckohya7yo4mqa3oy, extra=, txid=0000000000000000000000000000000000000000000000000000000000000000, block_hash=0000000000000000000000000000000000000000000000000000000000000000, block_height=0)",
+    "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef": "ModelRecord(name=test_model, commit=abcdef1234567890abcdef1234567890abcdef12, difficulty=2000000, cid=QmTestCIDForTestingPurposes123456789, extra=test_extra_data, txid=1111111111111111111111111111111111111111111111111111111111111111, block_hash=2222222222222222222222222222222222222222222222222222222222222222, block_height=42)"
+  },
+  "getblockchaininfo": {
+    "blocks": 850000,
+    "headers": 850000,
+    "bestblockhash": "7ff93077930e9aee7de120ddfb0824e0f3e841c36b188afb7bcddcc1bd7fe8b7",
+    "difficulty": 1234567890.123456,
+    "mediantime": 1700000000,
+    "verificationprogress": 0.999999,
+    "initialblockdownload": false,
+    "chainwork": "00000000000000000000000000000000000000000000000000000000deadbeef",
+    "size_on_disk": 500000000000,
+    "pruned": false
+  }
+}

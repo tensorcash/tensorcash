@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  mining-proxy:
+    environment:
+      - PRIORITY_MODE=true
+
+  test-runner:
+    volumes:
+      - ./e2e_priority_tests.py:/app/e2e_priority_tests.py
+    command: >
+      sh -c "pip install pytest aiohttp pyzmq requests && \
+             sleep 10 && \
+             python -m pytest tests.py e2e_priority_tests.py -v --tb=short --junit-xml=results/junit.xml"
+

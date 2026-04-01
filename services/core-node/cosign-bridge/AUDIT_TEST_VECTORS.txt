@@ -1,0 +1,72 @@
+
+running 7 tests
+=== Session ID Generation Test Vector ===
+Test Mode Enabled: timestamp and randomness are deterministic
+Expected behavior: Same seed produces same session ID
+
+=== Complete Protocol Flow Test Vector ===
+Test Seed: 4242424242424242424242424242424242424242424242424242424242424242
+Test Time: 1609459200000 (2021-01-01 00:00:00 UTC)
+Password: golf-hotel-foxtrot-echo-hotel
+
+--- Phase 1: SPAKE2 PAKE ---
+test test_vector_deterministic_session_id ... ok
+=== SPAKE2 Test Vector ===
+Password: golf-hotel-foxtrot-echo-hotel
+Initiator message: 416d80c19d952441382a9bfb05d9682e3142fafc7b216f37a0989b98d0eaa35cc6
+Responder message: 420b801bc4f1cd1f1036c9563feb5509bafc737388c47204bac87a3b7124e42c22
+✓ SPAKE2 messages exchanged
+Shared secret: 339116c218dba16c373163d0f73e319f516d8e35cf4156e26d0a913c4f50a11a
+
+test test_vector_spake2_exchange ... ok
+=== HKDF-SHA256 PSK Derivation Test Vector ===
+Input (SPAKE2 shared secret): 3c019a2fad26532308e049749049ea7311e7d4975bbb1e3c1f1addc06fe7e652
+HKDF Info: cosign-noise-psk-v1
+✓ Shared secret derived: 32 bytes
+
+--- Phase 2: HKDF Key Derivation ---
+=== Noise NNpsk0 Handshake Test Vector ===
+Pattern: Noise_NNpsk0_25519_ChaChaPoly_BLAKE2b
+✓ Noise PSK derived using HKDF-SHA256
+  Info string: cosign-noise-psk-v1
+
+--- Phase 3: Noise NNpsk0 Handshake ---
+Output: PSK used internally in Noise protocol (32 bytes)
+
+test test_vector_noise_psk_derivation ... ok
+Initiator -> Responder: c5456710fbc6a7e3ab1a682ea95e2469e4357d6841f8fcc7a72111c684791e5a937527d76d8c29c3f537997585c9ebb7
+✓ Initiator → Responder: 48 bytes
+Responder -> Initiator: 209abeb3e20fac26231eb459cd333708168290e22ec30016ebfef52cadda4819c2cb4285a2bcad0d459b2cc657259fc8
+
+test test_vector_noise_handshake ... ok
+✓ Responder → Initiator: 48 bytes
+✓ Handshake complete, transport mode established
+
+--- Phase 4: SAS Generation ---
+=== Noise Transport Encryption Test Vector ===
+✓ SAS: magma-shamrock-offer-fog-gig
+Plaintext: 48656c6c6f2c2073656375726520776f726c6421
+  (Both parties must verify this matches)
+
+--- Phase 5: Encrypted Transport ---
+Ciphertext: ec90760bb54c11cd7a544edb271d80f8a01f1b5abd42aaf948ef10e708ed5a7f85c7b70f
+Length: 20 bytes (plaintext) -> 36 bytes (ciphertext)
+Decrypted: 48656c6c6f2c2073656375726520776f726c6421
+✓ Message 1 encrypted and decrypted
+
+test test_vector_encryption_decryption ... ok
+✓ Message 2 encrypted and decrypted (bidirectional)
+
+=== Protocol Flow Complete ===
+test test_vector_full_protocol_flow ... ok
+=== SAS Derivation Test Vector ===
+Source: Noise handshake hash (post-handshake)
+Wordlist: EFF (2048 words, 11 bits per word)
+Initiator SAS: plan-range-noise-rock-graph
+Responder SAS: plan-range-noise-rock-graph
+Entropy: 55 bits (5 words × 11 bits)
+
+test test_vector_sas_derivation ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

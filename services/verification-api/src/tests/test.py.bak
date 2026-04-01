@@ -1,0 +1,106 @@
+
+from proof_verifier import ProofVerifier
+from proof_verifier import mca_install, mca_set_enabled, mca_set_params
+
+#------ modules
+from utils.proof import Proof
+from utils.proof import FloatArray
+from utils.proof import UIntArray
+from utils.proof import MiningResponse
+
+from config.constants import *
+from utils.shared_utils import validate_by_quantiles, validate_by_quantiles_higher, validate_by_quantiles_lower, proof_to_dict, _snap, _ulp, _sigma_from_ulp, _bucket_means, chiavdf_verify, parse_safetensors_header, inspect_bin_dtype, get_native_dtype_from_commit, inspect_model_dtype, fit_nb_mom, right_tail_test, RunningMeanCov      
+from utils.pow_utils import POW_WINDOW_SIZE, SequenceCache, PowState, Logger, RowManager, RingBuffers, PowHasher, ProofWriter, _to_bytes, serialize_proof, sha256_many, check_hash_against_target
+from utils.pow_utils import _tok_le_bytes, _u32le, _str_bytes, _build_msg, _digest_to_u, hex_to_bytes_tensor, nbits_to_target, _has_pow, to_python_string
+from utils.uint256_arithmetics import set_compact, get_compact
+import pfunpack
+
+buf = open("tests/pow_proof_test.bin","rb").read()
+# buf = open("tests/pow_proof_test.bin.roundtrip","rb").read()
+
+pf  = Proof.Proof.GetRootAsProof(buf, 0)
+d   = proof_to_dict(pf)
+
+buf = open("/data/tmp/llama_pow_proofs/proof_0_0_1754128564591.bin","rb").read()
+
+# d = pfunpack.unpack_validation_request(buf)['request']['pow_blob']
+
+mining_response = MiningResponse.MiningResponse.GetRootAs(buf, 0)
+
+# Extract basic fields
+req_id = mining_response.ReqId()
+nonce = mining_response.Nonce()
+adjusted_bits = mining_response.AdjustedBits()
+difficulty = mining_response.Difficulty()
+
+# Extract PowBlobHash (byte array)
+pow_blob_hash = b''
+if not mining_response.PowBlobHashIsNone():
+    pow_blob_hash = mining_response.PowBlobHashAsNumpy().tobytes()
+
+# Extract PowBlob (nested Proof object)
+pow_blob_info = "None"
+pow_blob_size = 0
+if mining_response.PowBlob() is not None:
+    proof_obj = mining_response.PowBlob()
+    pow_blob_info = f"Proof object: {type(proof_obj)}"
+    # If the Proof object has serialization methods, we could get its size
+    try:
+        # Try to get some info about the proof object
+        proof_methods = [m for m in dir(proof_obj) if not m.startswith('_')]
+        pow_blob_info = f"Proof object with methods: {proof_methods[:5]}..."  # Show first 5 methods
+    except:
+        pass
+
+print(
+f"MINING RESPONSE - "
+f"req_id={req_id}, "
+f"nonce={nonce}, "
+f"adjusted_bits={adjusted_bits}, "
+f"difficulty={difficulty}, "
+f"pow_blob_hash_len={len(pow_blob_hash)}, "
+f"pow_blob={pow_blob_info}"
+)
+# pf  = Proof.Proof.GetRootAsProof(buf, 0)
+d   = proof_to_dict(proof_obj)
+# d = pfunpack.unpack_proof(pow_blob_hash)
+print(d.keys())
+print(d['topk_logits'][13])
+print(d['topk_indices'][13])
+print(d['top_p'])
+print(d['top_k'])
+print(d['repetition_penalty'])
+print(d['temperature'])
+
+mca_set_enabled(True)
+mca_set_params(k_lin=1.5, k_attn=8.0, target_dtype=torch.float16)  
+
+verifier = ProofVerifier()
+
+verifier.initialise(d)
+
+verifier._verify_block_sanity()
+
+verifier._verify_parameters()
+
+verifier.verify_sequence_light_vectorized()
+
+verifier._load_or_reuse_model()
+# verifier._dump_cpu_env()
+# model_device = next(verifier.model.parameters()).device
+
+# Build the full sequence for the longest context
+# full_ctx = torch.cat([
+#     verifier.prompt_tokens,
+#     verifier.chosen_tokens[:verifier.window_size]
+# ]).to(model_device)
+
+# print(full_ctx.shape)
+# for _ in range(3):
+#     verifier._fwd(full_ctx)
+status, message = verifier.verify_full_sequence_adaptive_parallel_efficient(bootstrap = 15_000, charting=True)
+print(status, message)
+
+# status, message = verifier.verify_full_sequence_adaptive_parallel_efficient_v2(bootstrap = 15_000, charting=True)
+
+# print(status, message)

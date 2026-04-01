@@ -1,0 +1,130 @@
+version: '3.3'
+
+services:
+  # Mock Core Node API for model sync
+  mock-core-node:
+    image: python:3.10-slim
+    container_name: mock-core-node
+    working_dir: /app
+    volumes:
+      - ./mock_core_node.py:/app/server.py
+    command: >
+      sh -c "pip install aiohttp &&
+             python server.py"
+    ports:
+      - "8050:8050"
+    networks:
+      - test-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8050/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Mock VLLM server for testing
+  mock-vllm:
+    image: python:3.10-slim
+    container_name: mock-vllm
+    working_dir: /app
+    volumes:
+      - ./mock_vllm_server.py:/app/server.py
+    command: >
+      sh -c "pip install aiohttp &&
+             python server.py"
+    ports:
+      - "8000:8000"
+    networks:
+      - test-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/status')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Mining proxy under test
+  mining-proxy:
+    build:
+      context: ../../..
+      dockerfile: services/miner-api/proxy.Dockerfile
+    container_name: mining-proxy-test
+    command: >
+      sh -c "echo 'Waiting for services to be ready...' &&
+             until python -c 'import socket; s=socket.socket(); s.settimeout(1); s.connect((\"mock-vllm\", 8000)); s.close()' 2>/dev/null; do
+               echo 'Waiting for mock-vllm...';
+               sleep 2;
+             done &&
+             until python -c 'import socket; s=socket.socket(); s.settimeout(1); s.connect((\"mock-core-node\", 8050)); s.close()' 2>/dev/null; do
+               echo 'Waiting for mock-core-node...';
+               sleep 2;
+             done &&
+             echo 'All services ready, starting proxy...' &&
+             python main.py"
+    environment:
+      - TARGET_URL=http://mock-vllm:8000/v1/completions
+      - HTTP_HOST=0.0.0.0
+      - HTTP_PORT=8081
+      - ZMQ_PULL_PORT=6000
+      - MIN_ACTIVE_REQUESTS=0
+      - DUMMY_REQUEST_TIMEOUT=10
+      - LOG_LEVEL=DEBUG
+      - TEST_MODE=true
+      - MODEL_API_URL=http://mock-core-node:8050
+      - PROOF_CACHE_ENABLED=true
+      - BATCH_SIZE=5
+    ports:
+      - "8081:8081"
+      - "6000:6000"
+      - "7002:7002"
+    depends_on:
+      - mock-vllm
+      - mock-core-node
+    networks:
+      - test-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ZMQ job sender for testing (disabled - file missing)
+  # zmq-sender:
+  #   image: python:3.10-slim
+  #   container_name: zmq-sender
+  #   working_dir: /app
+  #   volumes:
+  #     - ./zmq_test_sender.py:/app/sender.py
+  #     - ../../../shared-utils/fb-schemas:/app/schemas
+  #   command: >
+  #     sh -c "pip install pyzmq flatbuffers && 
+  #            flatc --python schemas/blockheader.fbs &&
+  #            python sender.py"
+  #   depends_on:
+  #     - mining-proxy
+  #   networks:
+  #     - test-network
+
+  # E2E test runner (disabled - run from host instead)
+  # test-runner:
+  #   image: python:3.10-slim
+  #   container_name: e2e-test-runner
+  #   working_dir: /app
+  #   volumes:
+  #     - ./e2e_tests.py:/app/tests.py
+  #     - ./test_results:/app/results
+  #   environment:
+  #     - PROXY_URL=http://mining-proxy:8081
+  #     - MOCK_VLLM_URL=http://mock-vllm:8000
+  #     - ZMQ_PUSH_HOST=mining-proxy
+  #     - ZMQ_PUSH_PORT=6000
+  #   command: >
+  #     sh -c "pip install pytest pytest-asyncio aiohttp pyzmq requests &&
+  #            sleep 15 &&
+  #            python -m pytest tests.py -v --tb=short --junit-xml=results/junit.xml"
+  #   depends_on:
+  #     - mining-proxy
+  #   networks:
+  #     - test-network
+
+networks:
+  test-network:
+    driver: bridge

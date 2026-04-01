@@ -1,0 +1,109 @@
+# Pinned dependencies for vLLM 0.19.0 + PoW sampler.
+# Distilled from the v0.19.0 source tree's own requirements/{common,cuda}.txt.
+# Install BEFORE the vllm wheel (--no-deps).
+#
+# Verify against upstream before each rebuild:
+#   git -C services/miner-api/vllm-v019 show v0.19.0:requirements/common.txt
+#   git -C services/miner-api/vllm-v019 show v0.19.0:requirements/cuda.txt
+#
+# ── PyTorch stack (from requirements/cuda.txt) ───────────────────────
+# v0.19's compiled .so files in the PyPI wheel link against torch 2.10.0;
+# pinning anything older here breaks ABI when overlaying our patched .py
+# files onto the wheel's compiled extensions.
+torch==2.10.0
+torchaudio==2.10.0
+torchvision==0.25.0
+flashinfer-python==0.6.6
+flashinfer-cubin==0.6.6
+nvidia-cudnn-frontend>=1.13.0,<1.19.0
+nvidia-cutlass-dsl>=4.4.0.dev1
+quack-kernels>=0.2.7
+
+numba==0.61.2  # N-gram speculative decoding (PoW miner doesn't use, but transitive)
+
+# ── Core ML / tokenization ──────────────────────────────────────────
+transformers>=4.56.0,<5
+tokenizers>=0.21.1
+huggingface_hub>=0.34.0,<1.0
+sentencepiece
+tiktoken>=0.6.0
+einops
+numpy
+
+# ── Serving ─────────────────────────────────────────────────────────
+fastapi[standard]>=0.115.0
+aiohttp>=3.13.3
+openai>=2.0.0
+pydantic>=2.12.0
+prometheus_client>=0.18.0
+prometheus-fastapi-instrumentator>=7.0.0
+
+# ── Sampling / grammar ──────────────────────────────────────────────
+lm-format-enforcer==0.11.3
+llguidance>=1.3.0,<1.4.0; platform_machine == "x86_64" or platform_machine == "arm64" or platform_machine == "aarch64" or platform_machine == "s390x" or platform_machine == "ppc64le"
+outlines_core==0.2.11
+diskcache==5.6.3
+lark==1.2.2
+xgrammar>=0.1.32,<1.0.0; platform_machine == "x86_64" or platform_machine == "aarch64" or platform_machine == "arm64" or platform_machine == "s390x" or platform_machine == "ppc64le"
+
+# ── Serialization ───────────────────────────────────────────────────
+# v0.19 widened protobuf to >=5.29.6 with multiple !=6.x.* exclusions;
+# matching that exactly so the wheel's protobuf-derived modules import.
+protobuf>=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*
+flatbuffers
+msgspec
+gguf>=0.17.0
+pyyaml
+cbor2
+ijson
+
+# ── Image / multimodal ──────────────────────────────────────────────
+pillow
+opencv-python-headless>=4.13.0
+mistral_common[image]>=1.10.0
+
+# ── Parallelism / scheduling ────────────────────────────────────────
+ray[cgraph]==2.54.0  # not pinned by upstream but matches v0.16 production
+
+# ── Compression / quantization ──────────────────────────────────────
+compressed-tensors==0.14.0.1
+
+# ── Build / debug ───────────────────────────────────────────────────
+depyf==0.20.0
+ninja
+
+# ── Networking / messaging ──────────────────────────────────────────
+pyzmq>=25.0.0
+requests>=2.26.0
+
+# ── Utilities ───────────────────────────────────────────────────────
+regex
+cachetools
+psutil
+tqdm
+blake3
+py-cpuinfo
+typing_extensions>=4.10
+filelock>=3.16.1
+partial-json-parser
+cloudpickle
+watchfiles
+python-json-logger
+pybase64
+setproctitle
+
+# Python 3.12+ only (transitive needs)
+six>=1.16.0; python_version > '3.11'
+setuptools>=77.0.3,<81.0.0; python_version > '3.11'
+
+# ── Agent / tool-calling deps ───────────────────────────────────────
+openai-harmony>=0.0.3
+anthropic>=0.71.0
+model-hosting-container-standards>=0.1.13,<1.0.0
+mcp
+
+# ── Observability (newly required in v0.19) ─────────────────────────
+opentelemetry-sdk>=1.27.0
+opentelemetry-api>=1.27.0
+opentelemetry-exporter-otlp>=1.27.0
+opentelemetry-semantic-conventions-ai>=0.4.1

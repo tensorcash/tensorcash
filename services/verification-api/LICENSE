@@ -1,0 +1,17 @@
+TensorCash Verification API
+Copyright 2026 The TensorCash developers
+
+SPDX-License-Identifier: Apache-2.0
+
+This component — the proof verifier and its statistical proof-of-inference
+verification procedures — is licensed under the Apache License, Version 2.0.
+The full license text is in the repository root LICENSE; see also ../../LICENSING.md
+and ../../NOTICE.
+
+Apache-2.0 is used here deliberately for its explicit patent grant (§3) and its
+patent-retaliation clause. Together with the public, version-control-dated
+release of these methods, it supports a prior-art defense and is intended to
+help prevent others from fencing off or claiming the verification math. Note:
+Apache-2.0 grants patents only from contributors and does not immunize against
+unrelated third-party patents — this is defensive publication plus a contributor
+patent grant, not a total patent shield.
