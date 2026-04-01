@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  kyc-prover:
+    build: .
+    container_name: kyc-prover
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount keys (generate first with setup command)
+      - ./proving_key.bin:/app/proving_key.bin:ro
+      - ./verification_key.bin:/app/verification_key.bin:ro
+    environment:
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Test client (optional, for development)
+  test-client:
+    image: python:3.11-slim
+    container_name: kyc-prover-test-client
+    volumes:
+      - ./pkg/client/python:/app
+      - ./scripts:/scripts
+    working_dir: /app
+    command: python kyc_prover.py
+    depends_on:
+      - kyc-prover
+    profiles:
+      - test

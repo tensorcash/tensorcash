@@ -1,0 +1,40 @@
+# Binaries (in root only)
+/kyc-prover
+/gentest
+*.exe
+
+# Go
+vendor/
+*.mod.backup
+
+# Keys (NEVER commit these - except in vectors/ for testing)
+/proving_key.bin
+/verification_key.bin
+/*.key
+/*.pem
+
+# Test artifacts (except golden vectors)
+/test_vectors.json
+*.test
+*.out
+
+# BUT keep golden vectors for testing
+!vectors/
+
+# Large proving keys are tracked via Git LFS (see .gitattributes), NOT ignored.
+/gentest_hd
+/gentest_hd_v1
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.env

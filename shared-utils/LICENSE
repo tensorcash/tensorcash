@@ -1,0 +1,22 @@
+TensorCash shared utilities
+Copyright 2026 The TensorCash developers
+
+SPDX-License-Identifier: Apache-2.0
+
+The first-party code in this directory is licensed under the Apache License,
+Version 2.0 (full text in the repository root LICENSE; see also ../LICENSING.md
+and ../NOTICE). Apache-2.0 is used deliberately for its explicit patent grant
+and patent-retaliation clause.
+
+This covers:
+  - kyc-prover/   (ZK compliance prover)
+  - pow-utils/    (proof-of-work / proof assembly helpers)
+  - fb-schemas/   (FlatBuffer schemas)
+  - ipfs/         (model-distribution helpers)
+  - config/
+
+The following subdirectories are third-party components under their own
+licenses and are NOT covered by the above:
+  - secp256k1-zkp/  (git submodule; MIT — upstream)
+  - liboqs/         (git submodule; MIT — upstream)
+  - chiavdf/        (vendored; Apache-2.0 — upstream; see chiavdf/LICENSE)

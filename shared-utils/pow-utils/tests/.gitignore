@@ -1,0 +1,24 @@
+# Test build artifacts
+build/
+flatbuffers/
+*.so
+*.o
+*.a
+*_generated.h
+
+# Test environment
+.test_venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Test outputs
+test_output.log
+*.log
+.coverage
+htmlcov/
+
+# Temporary test files
+tmp/
+temp/
+*.tmp

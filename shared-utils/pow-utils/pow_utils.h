@@ -1,0 +1,332 @@
+// SPDX-License-Identifier: Apache-2.0
+#ifndef POW_UTILS_H
+#define POW_UTILS_H
+
+
+#include <vector>
+#include <unordered_map>
+#include <string>
+#include <cstdint>
+#include <memory>
+#include <deque>
+#include <chrono>
+#include <optional>
+#include <functional>
+#include <any>
+#include <tuple>
+#include <atomic>
+
+#include "pow_zmq_writer.h"    // for MiningResponseSubmitter
+#include <flatbuffers/flatbuffers.h>
+#include "proof_generated.h"
+#include "blockheader_generated.h"
+
+// If using ggml, uncomment this:
+// #include "ggml.h"
+
+constexpr size_t POW_WINDOW_SIZE = 256;
+
+// Utility function to get environment variable with default
+inline std::string get_env_var(const std::string& name, const std::string& default_value) {
+    const char* value = std::getenv(name.c_str());
+    return value ? std::string(value) : default_value;
+}
+
+// Data structures
+struct SequenceCache {
+    std::vector<int> archive;  // full prompt + generations
+    std::vector<int32_t> ring; // circular buffer of size POW_WINDOW_SIZE
+    int ring_pos = 0;
+    
+    SequenceCache() : ring(POW_WINDOW_SIZE, 0) {}
+};
+
+struct PowState {
+    // Immutable
+    std::vector<uint8_t> target;        // 32 bytes - 256-bit target
+    std::vector<uint8_t> h_b;          // 32 bytes - block hash (legacy)
+    std::vector<uint8_t> v;            // 32 bytes - VDF
+    int T;                             // tick
+    std::vector<uint8_t> header_prefix; // 76 bytes - block header prefix (optional)
+    
+    // Rolling 256-step ring buffers
+    std::vector<std::vector<std::vector<float>>> topk_logits;    // [256][B][50]
+    std::vector<std::vector<std::vector<int32_t>>> topk_indices; // [256][B][50]
+    std::vector<std::vector<float>> chosen_probs;                // [256][B]
+    std::vector<std::vector<int64_t>> chosen_tokens;            // [256][B]
+    std::vector<std::vector<bool>> attention_mask;              // [256][B]
+    std::vector<int32_t> steps;                                 // [B]
+    int window_pos = 0;
+    
+    // For probability reconstruction
+    std::vector<std::vector<float>> sampling_u;                 // [256][B]
+    
+    // Per-sequence parameters
+    std::unordered_map<int, float> temperature_by_seq;
+    std::unordered_map<int, float> top_p_by_seq;
+    std::unordered_map<int, int> top_k_by_seq;
+    std::unordered_map<int, float> rep_penalty_by_seq;
+    std::vector<std::vector<float>> softmax_normalizers;        // [256][B]
+    std::unordered_map<int, SequenceCache> seq_cache;
+    
+    // Additional field for logsumexp stats
+    std::vector<std::vector<std::vector<float>>> logsumexp_stats; // [256][B][6]
+    
+    PowState() {
+        target.resize(32, 0);
+        h_b.resize(32, 0);
+        v.resize(32, 0);
+        T = 0;
+    }
+};
+
+// Logger class
+class Logger {
+private:
+    std::string log_file_path;
+    
+public:
+    Logger(const std::string& log_dir = "");
+    void log(const std::string& message, const std::string& level = "INFO");
+};
+
+// Row manager for efficient buffer management
+class RowManager {
+private:
+    int max_rows;
+    std::unordered_map<int, int> seqid_to_row;
+    std::deque<int> free_rows;
+    std::unordered_map<int, int> allocation_order;
+    int next_allocation_id = 0;
+    
+public:
+    RowManager(int max_rows);
+    std::optional<int> get_row(int seq_id);
+    std::optional<int> allocate_row(int seq_id);
+    std::optional<int> free_row(int seq_id);
+    std::pair<std::optional<int>, std::optional<int>> get_oldest_sequence(const std::vector<int32_t>& steps);
+};
+
+// Ring buffer manager
+class RingBuffers {
+private:
+    int window_size;
+    int max_rows;
+    
+public:
+    std::vector<std::vector<std::vector<float>>> topk_logits;    // [window_size][max_rows][70]
+    std::vector<std::vector<std::vector<int32_t>>> topk_indices; // [window_size][max_rows][70]
+    std::vector<std::vector<float>> chosen_probs;                // [window_size][max_rows]
+    std::vector<std::vector<int64_t>> chosen_tokens;            // [window_size][max_rows]
+    std::vector<std::vector<bool>> attention_mask;              // [window_size][max_rows]
+    std::vector<std::vector<float>> sampling_u;                 // [window_size][max_rows]
+    std::vector<std::vector<float>> softmax_normalizers;        // [window_size][max_rows]
+    std::vector<int32_t> steps;                                  // [max_rows]
+    std::vector<std::vector<std::vector<float>>> logsumexp_stats; // [window_size][max_rows][6]
+    
+    RingBuffers(int window_size, int max_rows);
+    std::vector<int> get_positions(const std::vector<int>& rows);
+    std::vector<std::vector<uint8_t>> get_window_digests(int row);
+    void clear_row(int row);
+    void clear_rows(const std::vector<int>& rows);
+    void write_batch(const std::vector<int>& positions, 
+                     const std::vector<int>& rows,
+                     const std::unordered_map<std::string, std::any>& values_dict);
+    void increment_steps(const std::vector<int>& rows);
+    std::unordered_map<std::string, std::any> get_window(int row);
+    std::vector<std::vector<std::vector<uint8_t>>> digest_buffer;
+};
+
+// PoW Hasher
+class PowHasher {
+private:
+    std::vector<uint8_t> h_b;
+    std::vector<uint8_t> v;
+    std::vector<uint8_t> target;
+    // Slice 11.4 — model-adjusted share target (broker-derived).
+    // Empty when the broker isn't in share-mode for this lease, in
+    // which case check_share_solution returns all-false and
+    // emission behaviour matches the pre-slice-11 path.
+    std::vector<uint8_t> share_target;
+    std::vector<uint8_t> header_prefix;
+    int tick;
+    std::string ipfs_cid;
+    int request_id;
+    float difficulty;
+    float temperature = 1.0f;
+    float top_p = 1.0f;
+    int top_k = 50;
+    float repetition_penalty = 1.0f;
+    std::string model_config_diff = "{}";
+    std::string  compute_precision;
+    std::string  model_identifier;
+
+public:
+    PowHasher();
+    void update_from_payload(const std::unordered_map<std::string, std::string>& payload);
+    std::tuple<std::vector<int64_t>, std::vector<float>, std::vector<std::vector<uint8_t>>> 
+        batch_sample_tokens(const std::vector<std::vector<int64_t>>& contexts,
+                           const std::vector<int32_t>& steps,
+                           const std::vector<std::vector<float>>& cdfs,
+                           const std::string& compute_precision);
+    std::tuple<int64_t, float, std::vector<uint8_t>> 
+        sample_token(const std::vector<int64_t>& context,
+                    int32_t step,
+                    const std::vector<float>& cdf);
+    std::vector<bool> check_solution(const std::vector<std::vector<uint8_t>>& digests);
+    // Slice 11.4 — companion gate on the model-adjusted SHARE target
+    // (numerically larger / easier than ``target``). Returns
+    // all-false when ``share_target`` is empty, preserving the
+    // pre-slice-11 block-only behaviour.
+    std::vector<bool> check_share_solution(const std::vector<std::vector<uint8_t>>& digests);
+};
+
+// Proof Writer
+class ProofWriter {
+private:
+    std::string output_dir;
+    std::function<void(const std::string&)> submit_callback;
+    std::string model_identifier;
+    std::string compute_precision;
+    std::string model_config_diff;
+    std::string sampling_params_diff;
+    std::string ipfs_cid;
+    
+public:
+    ProofWriter(const std::string& output_dir = "/data/pow_proofs");
+    void set_callback(std::function<void(const std::string&)> callback);
+    void set_model_identifier(const std::string& model_identifier);
+    void set_ipfs_cid(const std::string& ipfs_cid);
+    void set_model_config_diff(const std::string& model_config_diff);
+    void set_sampling_params_diff(const std::string& sampling_params_diff);
+    void set_compute_precision(const std::string& precision);
+
+    // Getters for accessing metadata fields
+    std::string get_model_identifier() const { return model_identifier; }
+    std::string get_compute_precision() const { return compute_precision; }
+    std::string get_model_config_diff() const { return model_config_diff; }
+    std::string get_ipfs_cid() const { return ipfs_cid; }
+    std::pair<std::vector<uint8_t>, std::unordered_map<std::string, std::any>> 
+        write_proof(int seq_id, int step_num,
+                   const std::unordered_map<std::string, std::any>& window_data,
+                   const std::vector<uint8_t>& digest,
+                   bool is_solution,
+                   const std::unordered_map<std::string, std::string>& pow_params,
+                   const std::unordered_map<std::string, std::any>& seq_info);
+};
+
+// Utility functions
+std::vector<uint8_t> sha256_single(const std::vector<uint8_t>& msg);
+std::vector<std::vector<uint8_t>> sha256_many(const std::vector<std::vector<uint8_t>>& messages);
+std::vector<bool> check_hash_against_target(const std::vector<std::vector<uint8_t>>& digests,
+                                           const std::vector<uint8_t>& target);
+std::vector<uint8_t> hex_to_bytes(const std::string& hex_str);
+std::string bytes_to_hex(const std::vector<uint8_t>& bytes);
+std::vector<uint8_t> nbits_to_target(int nbits);
+
+// Helper functions for byte conversions
+std::vector<uint8_t> tok_le_bytes(const std::vector<int64_t>& tokens);
+std::vector<uint8_t> u32le(uint32_t value);
+std::vector<uint8_t> str_bytes(const std::string& s);
+std::vector<uint8_t> build_msg(const std::vector<uint8_t>& header_prefix,
+                               const std::vector<uint8_t>& v,
+                               const std::vector<uint8_t>& T8,
+                               const std::vector<uint8_t>& j4,
+                               const std::vector<uint8_t>& ctx_bytes,
+                               const std::vector<uint8_t>& precision);
+float digest_to_u(const std::vector<uint8_t>& digest);
+
+class PowSamplingCoordinator {
+private:
+    std::unique_ptr<Logger> logger;
+    std::unique_ptr<RowManager> row_manager;  
+    std::unique_ptr<RingBuffers> ring_buffers;
+    std::unique_ptr<PowHasher> hasher;
+    std::unique_ptr<ProofWriter> proof_writer;
+    std::unique_ptr<MiningResponseSubmitter> submitter_;
+    std::unordered_map<std::string,std::string> current_pow_params;
+    std::unordered_map<int, std::unordered_map<std::string, std::string>> seq_pow_params_map;
+    std::optional<int> active_pow_seq_id;
+    std::unordered_map<std::string,std::any>    current_sequence_info;    
+    std::unordered_map<int, std::unordered_map<std::string, std::any>> sequence_info_map;
+
+    int window_size;
+    int max_concurrency;
+    // --- reusable buffers (preallocated) ---
+    std::vector<float> logits_;     // size n_vocab
+    std::vector<float> probs_;      // size n_vocab
+    std::vector<float> cdf_;        // size n_vocab
+
+    // full-vocab telemetry sort in the effective precision domain (desc)
+    std::vector<std::pair<float,int32_t>> pretemp_desc_;
+
+    // survivor mask after top-k
+    std::vector<uint8_t> keep_;     // size n_vocab
+
+    // survivors for top-p (m ≤ k)
+    std::vector<std::pair<float,int32_t>> cand_;     // (logit, idx)
+    std::vector<float> cand_exp_;                    // exp(logit - max)
+    std::atomic<int64_t> cooldown_until_ms_{0};
+    int64_t cooldown_duration_ms_ = 10 * 60 * 1000;
+
+    void apply_pow_params(const std::unordered_map<std::string, std::string>& pow_params);
+    bool activate_sequence_params(int seq_id);
+    static int64_t now_ms_();
+
+public:
+    PowSamplingCoordinator(int window_size = 256, int max_concurrency = 1024);
+    
+    void initialize(const std::string& log_dir = "/tmp/llama_pow_logs", 
+                   const std::string& proof_dir = "");
+    
+    void update_pow_params(const std::unordered_map<std::string, std::string>& pow_params);
+    void update_pow_params_for_sequence(int seq_id, const std::unordered_map<std::string, std::string>& pow_params);
+    
+    void ensure_sequences(const std::vector<int>& seq_ids, 
+                         const std::unordered_map<int, std::vector<int64_t>>& prompt_mapping);
+    
+    bool is_pow_sequence(int seq_id) const;
+
+    // Complete sampling with all state tracking
+    struct SamplingResult {
+        int64_t token_id;
+        float token_prob;
+        float u_value;
+        std::vector<uint8_t> digest;
+        float logsumexp_full;
+        float softmax_log_z;
+        std::vector<float> logsumexp_stats;  // 6 elements
+        std::vector<float> topk_logits;      // 71 elements  
+        std::vector<int32_t> topk_indices;   // 71 elements
+    };
+
+    void ensure_capacity_(int n_vocab, int top_k);
+
+    SamplingResult sample_token_complete(
+        int seq_id,
+        const float* raw_logits, 
+        int n_vocab,
+        float temperature,
+        int top_k,
+        float top_p,
+        const std::vector<int64_t>& context,
+        const std::string& compute_precision 
+    );
+
+    void set_prompt_tokens(int seq_id, const std::vector<int32_t>& tokens);
+
+    void set_completion_id(int seq_id, const std::string& completion_id);
+
+    void activate_solution_cooldown();
+    bool is_cooldown_active() const;
+    double cooldown_remaining_seconds() const;
+    
+    void record_complete_step(int seq_id, const SamplingResult& result, bool is_valid = true);
+    
+    void cleanup_sequence(int seq_id);
+
+    void check_solutions(const std::vector<int>& seq_ids);
+
+};
+
+#endif // POW_UTILS_H
