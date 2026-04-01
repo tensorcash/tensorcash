@@ -1,0 +1,76 @@
+# --- Virtual Environments ---
+# Common names: venv/, env/, .env/, .venv/
+venv/
+env/
+.env/
+.env
+.venv/
+.venv311/
+*/.venv311/
+.test_venv/
+*/.test_venv/
+out/
+
+# --- Python binaries/symlinks ---
+python
+python3
+python3.*
+
+# --- Byte-compiled / cache files ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Distribution / packaging ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Installer logs ---
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Unit test / coverage reports ---
+.coverage
+.coverage.*
+.pytest_cache/
+htmlcov/
+.tox/
+.pyc
+
+# --- IDE / editor folders ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# --- OS-generated files ---
+.DS_Store
+Thumbs.db
+
+# --- Swift Package Manager ---
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj
+xcuserdata/
+DerivedData/
+*.swiftmodule
+*.swiftinterface
+*.swiftsourceinfo
+
+# --- Desktop app build artifacts ---
+deployments/desktop-app/build/
+deployments/desktop-app/.build/
+deployments/desktop-app/scripts/*_generated.h
+
+# --- llama.cpp build ---
+services/miner-api/llama.cpp/build/
+
+# --- Logs and temp files ---
+*.log
+*.tmp
+*.tar.gz
+.claude/
+.vscode

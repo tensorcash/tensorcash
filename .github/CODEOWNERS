@@ -1,0 +1,6 @@
+# Default owner for everything in the repo.
+* @takakuni
+
+# CI/CD and release plumbing — changes here can expose secrets or alter
+# what runs on self-hosted runners, so they require maintainer review.
+/.github/ @takakuni

@@ -1,0 +1,211 @@
+# Runs bcore unit + functional tests on self-hosted runners.
+name: BCore Tests (Unit + Functional)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_functional:
+        description: 'Run functional tests (slow)'
+        type: boolean
+        default: true
+      functional_jobs:
+        description: 'Parallel functional test workers'
+        type: number
+        default: 10
+  push:
+    branches: [main, develop, test_*, merge/*]
+    paths:
+      - 'services/core-node/bcore/**'
+      - 'services/core-node/cosign-bridge/**'
+      - 'shared-utils/chiavdf/**'
+      - 'shared-utils/secp256k1-zkp/**'
+      - 'shared-utils/liboqs/**'
+      - 'shared-utils/kyc-prover/**'
+      - 'shared-utils/fb-schemas/**'
+      - '.github/workflows/bcore-tests.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'services/core-node/bcore/**'
+      - 'services/core-node/cosign-bridge/**'
+      - 'shared-utils/chiavdf/**'
+      - 'shared-utils/secp256k1-zkp/**'
+      - 'shared-utils/liboqs/**'
+      - 'shared-utils/kyc-prover/**'
+      - 'shared-utils/fb-schemas/**'
+
+concurrency:
+  group: bcore-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ============================================================================
+  # Build the tensorcash-tests Docker image (heavy C++ compilation)
+  # ============================================================================
+  build-test-image:
+    name: Build Test Image
+    runs-on: [self-hosted, linux, x64, docker]
+    timeout-minutes: 60
+    steps:
+      - name: Fix workspace ownership
+        run: sudo /bin/chown -R github-runner:github-runner "$GITHUB_WORKSPACE" 2>/dev/null || true
+
+      - name: Install git-lfs
+        run: |
+          if ! command -v git-lfs &>/dev/null; then
+            curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
+            sudo apt-get install -y git-lfs
+          fi
+          git lfs install
+
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - name: Init required submodules
+        run: |
+          git submodule update --init --force --recursive \
+            services/core-node/bcore \
+            shared-utils/secp256k1-zkp \
+            shared-utils/liboqs
+
+      - name: Build tensorcash-tests image
+        run: |
+          docker build --no-cache \
+            -f services/core-node/bcore/test-runner/Dockerfile \
+            -t tensorcash-tests:${{ github.sha }} \
+            -t tensorcash-tests:latest \
+            .
+
+  # ============================================================================
+  # Unit tests — fast feedback (~10-15 min)
+  # ============================================================================
+  unit-tests:
+    name: Unit Tests
+    needs: build-test-image
+    runs-on: [self-hosted, linux, x64, docker]
+    timeout-minutes: 45
+    steps:
+      - name: Run unit tests
+        run: |
+          # Run the boost suites in parallel via ctest (each suite is registered as its own
+          # ctest test). The previous single serial `test_bitcoin` process ran every suite
+          # back-to-back and exceeded the 30m cap; ctest -j brings wall-clock down to roughly
+          # the slowest single suite. --timeout isolates any one hanging suite instead of
+          # stalling the whole job.
+          # ctest registers every test target; -E restricts the run to the test_bitcoin boost
+          # suites only, matching the scope of the previous single `test_bitcoin` invocation.
+          # Excluded:
+          #   test_bitcoin-qt    - Qt GUI tests, abort headless (no X display) in CI
+          #   bench_sanity_check - runs the benchmark binary (~10 min); not a unit test
+          #   util_test_runner   - bitcoin-util CLI test (functional-style)
+          #   univalue           - vendored-lib tests; executables aren't built in this image
+          docker run --rm \
+            tensorcash-tests:${{ github.sha }} \
+            bash -lc 'ctest --test-dir /build/bcore/build -j"$(nproc)" --output-on-failure --timeout 900 -E "test_bitcoin-qt|bench_sanity_check|util_test_runner|univalue"'
+
+  # ============================================================================
+  # Functional tests — comprehensive integration suite (1-3 hrs)
+  # ============================================================================
+  functional-tests:
+    name: Functional Tests
+    needs: build-test-image
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.run_functional == 'true'
+    runs-on: [self-hosted, linux, x64, docker]
+    timeout-minutes: 180
+    steps:
+      - name: Run functional tests
+        id: functional
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/tensorcash-test-output-${{ github.run_id }}
+          docker run --rm \
+            -e JOBS=${{ github.event.inputs.functional_jobs || '10' }} \
+            -e TC_TMPDIR=/test_output \
+            -e KEEP_BITCOIND=1 \
+            -v /tmp/tensorcash-test-output-${{ github.run_id }}:/test_output \
+            tensorcash-tests:${{ github.sha }} \
+            /run_functional.sh
+
+      - name: Retry failed tests
+        id: retry
+        if: steps.functional.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          OUTDIR="/tmp/tensorcash-test-output-${{ github.run_id }}"
+          FAILED=$(find "$OUTDIR" -name 'test_framework.log' -path '*/*/test_framework.log' \
+            -exec grep -l 'Test failed' {} + 2>/dev/null \
+            | sed 's|.*/\([^/]*/[^/]*\)/test_framework.log|\1|' \
+            | sed 's|_[0-9]*$||' \
+            | sort -u || true)
+          if [ -z "$FAILED" ]; then
+            echo "Could not determine failed tests, skipping retry"
+            exit 1
+          fi
+          echo "Retrying failed tests: $FAILED"
+          docker run --rm \
+            -e JOBS=1 \
+            -e TC_TMPDIR=/test_output \
+            -e KEEP_BITCOIND=1 \
+            -v "$OUTDIR":/test_output \
+            tensorcash-tests:${{ github.sha }} \
+            /run_functional.sh $FAILED
+
+      - name: Fail if tests did not pass
+        if: steps.functional.outcome == 'failure' && steps.retry.outcome != 'success'
+        run: |
+          echo "Functional tests failed and retry did not fix them"
+          exit 1
+
+      - name: Upload test output on failure
+        if: steps.functional.outcome == 'failure' && steps.retry.outcome != 'success'
+        continue-on-error: true
+        run: |
+          OUTDIR="/tmp/tensorcash-test-output-${{ github.run_id }}"
+          docker run --rm -v "$OUTDIR":/fix alpine chmod -R a+rX /fix || true
+      - uses: actions/upload-artifact@v7
+        if: steps.functional.outcome == 'failure' && steps.retry.outcome != 'success'
+        continue-on-error: true
+        with:
+          name: functional-test-output
+          path: /tmp/tensorcash-test-output-${{ github.run_id }}/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        continue-on-error: true
+        run: |
+          OUTDIR="/tmp/tensorcash-test-output-${{ github.run_id }}"
+          docker run --rm -v "$OUTDIR":/cleanup alpine rm -rf /cleanup/* || true
+          rm -rf "$OUTDIR" || true
+
+  # ============================================================================
+  # Summary gate for branch protection
+  # ============================================================================
+  bcore-tests-success:
+    name: BCore Tests
+    if: always()
+    needs: [unit-tests, functional-tests]
+    runs-on: [self-hosted, linux, x64, docker]
+    steps:
+      - name: Check results
+        run: |
+          echo "Unit tests: ${{ needs.unit-tests.result }}"
+          echo "Functional tests: ${{ needs.functional-tests.result }}"
+
+          if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
+            echo "Unit tests did not succeed"
+            exit 1
+          fi
+
+          if [[ "${{ needs.functional-tests.result }}" != "success" ]]; then
+            echo "Functional tests did not succeed"
+            exit 1
+          fi
+
+          echo "All BCore tests passed"

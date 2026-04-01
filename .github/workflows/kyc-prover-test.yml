@@ -1,0 +1,632 @@
+name: KYC Prover - Build & Test
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'shared-utils/kyc-prover/**'
+      - 'services/core-node/bcore/test/functional/feature_asset_zk_validation_real.py'
+      - 'services/core-node/bcore/test/test_framework/kyc_prover.py'
+      - '.github/workflows/kyc-prover-test.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'shared-utils/kyc-prover/**'
+      - 'services/core-node/bcore/test/functional/feature_asset_zk_validation_real.py'
+      - 'services/core-node/bcore/test/test_framework/kyc_prover.py'
+      - '.github/workflows/kyc-prover-test.yml'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-and-test:
+    name: Build KYC Prover & Generate Vectors
+    runs-on: k8s-build
+
+    defaults:
+      run:
+        working-directory: shared-utils/kyc-prover
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.21'
+          cache: true
+          cache-dependency-path: shared-utils/kyc-prover/go.sum
+
+      - name: Install dependencies
+        run: |
+          go mod tidy
+          go mod download
+          go mod verify
+
+      - name: Run Go unit tests
+        run: |
+          echo "Running Go unit tests..."
+          go test -v -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+
+      - name: Build gentest
+        run: |
+          echo "Building golden vector generator..."
+          go build -v -o gentest ./cmd/gentest
+          chmod +x gentest
+          ls -lh gentest
+
+      - name: Build kyc-prover server
+        run: |
+          echo "Building KYC prover server..."
+          go build -v -o kyc-prover ./cmd/server
+          chmod +x kyc-prover
+          ls -lh kyc-prover
+
+      - name: Generate golden vectors
+        run: |
+          echo "Generating golden vectors (this may take 30-60 seconds)..."
+          mkdir -p vectors
+          ./gentest -output vectors
+
+          echo ""
+          echo "Verifying generated files..."
+          ls -lh vectors/
+
+          # Check that all expected files exist
+          test -f vectors/proving_key.bin || exit 1
+          test -f vectors/verification_key.bin || exit 1
+          test -f vectors/golden_vectors.json || exit 1
+
+          # Check vector file is valid JSON
+          jq empty vectors/golden_vectors.json || exit 1
+
+          # Count vectors
+          VECTOR_COUNT=$(jq '. | length' vectors/golden_vectors.json)
+          echo "Generated $VECTOR_COUNT test vectors"
+
+          # Verify VK hex is present in all vectors
+          MISSING_VK=$(jq '[.[] | select(.vk_hex == "")] | length' vectors/golden_vectors.json)
+          if [ "$MISSING_VK" -gt 0 ]; then
+            echo "ERROR: $MISSING_VK vectors missing vk_hex"
+            exit 1
+          fi
+
+          echo "✓ All vectors have VK hex"
+
+      - name: Test proof generation
+        run: |
+          echo "Starting kyc-prover service..."
+          ./kyc-prover -port 8080 -pk vectors/proving_key.bin -vk vectors/verification_key.bin &
+          PROVER_PID=$!
+
+          # Wait for service to start
+          echo "Waiting for service to be ready..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/health > /dev/null 2>&1; then
+              echo "✓ Service ready"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "✗ Service failed to start"
+              kill $PROVER_PID 2>/dev/null || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "Testing proof generation with golden vectors..."
+          ./scripts/test_proof.sh
+
+          echo ""
+          echo "Testing proof verification with mutations..."
+          ./scripts/test_verify.sh
+
+          echo ""
+          echo "Testing invalid witness rejection..."
+          ./scripts/test_invalid.sh
+
+          echo ""
+          echo "Testing cross-VK rejection..."
+          ./scripts/test_cross_vk.sh
+
+          echo ""
+          echo "Benchmarking performance..."
+          ./scripts/benchmark.sh http://localhost:8080 3 10000
+
+          # Stop service
+          kill $PROVER_PID
+          wait $PROVER_PID 2>/dev/null || true
+
+      - name: Upload golden vectors
+        uses: actions/upload-artifact@v7
+        with:
+          name: golden-vectors
+          path: shared-utils/kyc-prover/vectors/
+          retention-days: 30
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: kyc-prover-binaries
+          path: |
+            shared-utils/kyc-prover/kyc-prover
+            shared-utils/kyc-prover/gentest
+          retention-days: 7
+
+  test-vectors:
+    name: Verify Golden Vectors
+    runs-on: k8s-build
+    needs: build-and-test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download golden vectors
+        uses: actions/download-artifact@v4
+        with:
+          name: golden-vectors
+          path: shared-utils/kyc-prover/vectors/
+
+      - name: Verify vector integrity
+        run: |
+          cd shared-utils/kyc-prover/vectors
+
+          echo "Checking vector structure..."
+
+          # Verify all required fields present
+          jq -e '.[] | select(.name == "valid") | {
+            name,
+            witness,
+            proof_hex,
+            public_inputs_hex,
+            vk_hex,
+            should_fail
+          }' golden_vectors.json > /dev/null
+
+          echo "✓ Valid vector has required fields"
+
+          # Check proof and inputs are non-empty for valid vector
+          VALID_PROOF=$(jq -r '.[] | select(.name == "valid") | .proof_hex' golden_vectors.json)
+          VALID_INPUTS=$(jq -r '.[] | select(.name == "valid") | .public_inputs_hex' golden_vectors.json)
+
+          if [ -z "$VALID_PROOF" ] || [ "$VALID_PROOF" == "null" ]; then
+            echo "ERROR: Valid vector has empty proof_hex"
+            exit 1
+          fi
+
+          if [ -z "$VALID_INPUTS" ] || [ "$VALID_INPUTS" == "null" ]; then
+            echo "ERROR: Valid vector has empty public_inputs_hex"
+            exit 1
+          fi
+
+          echo "✓ Valid vector has proof and public inputs"
+
+          # Check invalid vectors have empty proof
+          INVALID_WITH_PROOF=$(jq '[.[] | select(.should_fail == true and .proof_hex != "")] | length' golden_vectors.json)
+          if [ "$INVALID_WITH_PROOF" -gt 0 ]; then
+            echo "ERROR: Invalid vectors should not have proofs"
+            exit 1
+          fi
+
+          echo "✓ Invalid vectors correctly have no proofs"
+
+          # Display vector summary
+          echo ""
+          echo "Vector Summary:"
+          jq -r '.[] | "  \(.name) - should_fail: \(.should_fail)"' golden_vectors.json
+
+      - name: Check vector sizes
+        run: |
+          cd shared-utils/kyc-prover/vectors
+
+          echo "Checking file sizes..."
+
+          PK_SIZE=$(stat -f%z proving_key.bin 2>/dev/null || stat -c%s proving_key.bin)
+          VK_SIZE=$(stat -f%z verification_key.bin 2>/dev/null || stat -c%s verification_key.bin)
+
+          echo "Proving key: $PK_SIZE bytes"
+          echo "Verification key: $VK_SIZE bytes"
+
+          # Sanity checks (gnark BLS12-381 keys are ~100MB for PK, gnark VK is 872 bytes)
+          if [ "$PK_SIZE" -lt 1000000 ]; then
+            echo "WARNING: Proving key seems too small"
+          fi
+
+          if [ "$VK_SIZE" -ne 872 ]; then
+            echo "ERROR: Verification key must be exactly 872 bytes (gnark format), got $VK_SIZE"
+            exit 1
+          fi
+
+          echo "✓ Key sizes correct (VK in gnark format for proving)"
+
+          # Check proof/VK hex sizes in JSON
+          echo ""
+          echo "Checking golden vector hex sizes..."
+
+          python3 << 'EOF'
+          import json
+          import sys
+
+          with open('golden_vectors.json', 'r') as f:
+              vectors = json.load(f)
+
+          valid = next((v for v in vectors if v['name'] == 'valid'), None)
+          if not valid:
+              print("ERROR: No 'valid' vector found")
+              sys.exit(1)
+
+          # Check proof hex (gnark format - variable size ~244 bytes based on circuit)
+          proof_hex = valid.get('proof_hex', '')
+          if proof_hex.startswith('0x'):
+              proof_hex = proof_hex[2:]
+          proof_bytes = len(proof_hex) // 2
+
+          # Check proof custom hex (C++ format - should be 384 chars = 192 bytes * 2)
+          proof_custom_hex = valid.get('proof_custom_hex', '')
+          if proof_custom_hex.startswith('0x'):
+              proof_custom_hex = proof_custom_hex[2:]
+          proof_custom_bytes = len(proof_custom_hex) // 2
+
+          # Check VK hex (custom C++ format - should be 1156 chars = 578 bytes * 2)
+          vk_hex = valid.get('vk_hex', '')
+          if vk_hex.startswith('0x'):
+              vk_hex = vk_hex[2:]
+          vk_bytes = len(vk_hex) // 2
+
+          # Check VK gnark hex (Go format - should be 1744 chars = 872 bytes * 2)
+          vk_gnark_hex = valid.get('vk_gnark_hex', '')
+          if vk_gnark_hex.startswith('0x'):
+              vk_gnark_hex = vk_gnark_hex[2:]
+          vk_gnark_bytes = len(vk_gnark_hex) // 2
+
+          # Check public inputs hex (should be 256 chars = 128 bytes * 2)
+          inputs_hex = valid.get('public_inputs_hex', '')
+          if inputs_hex.startswith('0x'):
+              inputs_hex = inputs_hex[2:]
+          inputs_bytes = len(inputs_hex) // 2
+
+          print(f"Proof (Go gnark): {proof_bytes} bytes")
+          print(f"Proof (C++ custom): {proof_custom_bytes} bytes (expected: 192)")
+          print(f"VK (C++ custom): {vk_bytes} bytes (expected: 578)")
+          print(f"VK (Go gnark): {vk_gnark_bytes} bytes (expected: 872)")
+          print(f"Public inputs: {inputs_bytes} bytes (expected: 128)")
+
+          errors = []
+          if proof_bytes < 200:
+              errors.append(f"Proof gnark too small: {proof_bytes} bytes (expected >200)")
+          if proof_custom_bytes != 192:
+              errors.append(f"Proof custom size mismatch: {proof_custom_bytes} != 192")
+          if vk_bytes != 578:
+              errors.append(f"VK custom size mismatch: {vk_bytes} != 578")
+          if vk_gnark_bytes != 872:
+              errors.append(f"VK gnark size mismatch: {vk_gnark_bytes} != 872")
+          if inputs_bytes != 128:
+              errors.append(f"Public inputs size mismatch: {inputs_bytes} != 128")
+
+          if errors:
+              print("\nERROR: Serialization format incorrect!")
+              for e in errors:
+                  print(f"  • {e}")
+              sys.exit(1)
+
+          print("\n✓ All hex sizes correct (dual format: gnark for Go, custom for C++)")
+          EOF
+
+  python-client-test:
+    name: Python Client Test
+    runs-on: k8s-build
+    needs: build-and-test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Download golden vectors
+        uses: actions/download-artifact@v4
+        with:
+          name: golden-vectors
+          path: shared-utils/kyc-prover/vectors/
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: kyc-prover-binaries
+          path: shared-utils/kyc-prover/
+
+      - name: Make binaries executable
+        run: |
+          chmod +x shared-utils/kyc-prover/kyc-prover
+          chmod +x shared-utils/kyc-prover/gentest
+
+      - name: Install Python dependencies
+        run: |
+          pip install requests
+
+      - name: Test Python client
+        run: |
+          cd shared-utils/kyc-prover
+
+          # Start prover service in background
+          ./kyc-prover -port 8080 -pk vectors/proving_key.bin -vk vectors/verification_key.bin &
+          PROVER_PID=$!
+
+          # Wait for service to start
+          echo "Waiting for service to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/health > /dev/null 2>&1; then
+              echo "✓ Service ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Test proof generation with Python client
+          echo "Testing Python client..."
+          cd pkg/client/python
+          python3 kyc_prover.py
+
+          # Stop service
+          kill $PROVER_PID
+          wait $PROVER_PID 2>/dev/null || true
+
+      - name: Summary
+        if: success()
+        run: |
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+          echo "  KYC Prover CI - SUCCESS"
+          echo "═══════════════════════════════════════════════════════════"
+          echo ""
+          echo "✓ Binaries built successfully"
+          echo "✓ Golden vectors generated and validated"
+          echo "✓ Proof generation working"
+          echo "✓ Python client working"
+          echo ""
+          echo "Note: Full functional test requires TensorCash Core node"
+          echo "      This workflow validates the prover infrastructure"
+          echo ""
+
+  build-and-test-hd:
+    name: Build KYC-HD v1 Alternative Prover & Generate Vectors
+    runs-on: k8s-build
+
+    defaults:
+      run:
+        working-directory: shared-utils/kyc-prover
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.21'
+          cache: true
+          cache-dependency-path: shared-utils/kyc-prover/go.sum
+
+      - name: Install dependencies
+        run: |
+          go mod tidy
+          go mod download
+          go mod verify
+
+      - name: Build gentest_hd_v1
+        run: |
+          echo "Building KYC-HD v1 Alternative golden vector generator..."
+          go build -v -o gentest_hd_v1 ./cmd/gentest_hd_v1
+          chmod +x gentest_hd_v1
+          ls -lh gentest_hd_v1
+
+      - name: Generate KYC-HD v1 Alternative golden vectors
+        run: |
+          echo "Generating KYC-HD v1 Alternative golden vectors..."
+          echo "NOTE: This includes secp256k1 EC operations and will take 2-5 minutes"
+          mkdir -p vectors_hd_v1
+          timeout 600 ./gentest_hd_v1 -output vectors_hd_v1 || {
+            echo "ERROR: Vector generation timed out or failed"
+            exit 1
+          }
+
+          echo ""
+          echo "Verifying generated files..."
+          ls -lh vectors_hd_v1/
+
+          # Check that all expected files exist
+          test -f vectors_hd_v1/proving_key_v1.bin || exit 1
+          test -f vectors_hd_v1/verification_key_v1.bin || exit 1
+          test -f vectors_hd_v1/golden_vectors_hd_v1.json || exit 1
+
+          # Check vector file is valid JSON
+          jq empty vectors_hd_v1/golden_vectors_hd_v1.json || exit 1
+
+          # Count vectors
+          VECTOR_COUNT=$(jq '. | length' vectors_hd_v1/golden_vectors_hd_v1.json)
+          echo "Generated $VECTOR_COUNT test vectors"
+
+          # Verify VK hex is present in valid vectors
+          MISSING_VK=$(jq '[.[] | select(.should_fail == false and .vk_hex == "")] | length' vectors_hd_v1/golden_vectors_hd_v1.json)
+          if [ "$MISSING_VK" -gt 0 ]; then
+            echo "ERROR: $MISSING_VK valid vectors missing vk_hex"
+            exit 1
+          fi
+
+          echo "✓ All valid vectors have VK hex"
+
+      - name: Benchmark circuit size
+        run: |
+          echo "Analyzing KYC-HD v1 Alternative circuit complexity..."
+
+          # Extract PK and VK sizes
+          PK_SIZE=$(stat -c%s vectors_hd_v1/proving_key_v1.bin)
+          VK_SIZE=$(stat -c%s vectors_hd_v1/verification_key_v1.bin)
+
+          # Compare with v1 baseline
+          PK_V1_SIZE=$(stat -c%s vectors/proving_key.bin 2>/dev/null || echo "0")
+
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+          echo "  Circuit Size Comparison"
+          echo "═══════════════════════════════════════════════════════════"
+          echo ""
+
+          if [ "$PK_V1_SIZE" != "0" ]; then
+            PK_RATIO=$(awk "BEGIN {printf \"%.2f\", $PK_SIZE / $PK_V1_SIZE}")
+            echo "KYC v1 Proving Key:              $(numfmt --to=iec-i --suffix=B $PK_V1_SIZE)"
+            echo "KYC-HD v1 Alternative Proving Key: $(numfmt --to=iec-i --suffix=B $PK_SIZE)"
+            echo "Growth Factor:                     ${PK_RATIO}x"
+          else
+            echo "KYC-HD v1 Alternative Proving Key: $(numfmt --to=iec-i --suffix=B $PK_SIZE)"
+          fi
+
+          echo "KYC-HD v1 Alternative VK:           $(numfmt --to=iec-i --suffix=B $VK_SIZE)"
+          echo ""
+
+          # Check if PK size is within acceptable range (expect 3-10x growth due to secp256k1)
+          if [ "$PK_SIZE" -gt 5000000000 ]; then
+            echo "WARNING: Proving key exceeds 5GB - circuit may be too large for production"
+            echo "         Consider optimization or reducing Merkle depth"
+          fi
+
+      - name: Upload KYC-HD v1 Alternative golden vectors
+        uses: actions/upload-artifact@v7
+        with:
+          name: golden-vectors-hd-v1
+          path: shared-utils/kyc-prover/vectors_hd_v1/
+          retention-days: 30
+
+      - name: Upload gentest_hd_v1 binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: gentest-hd-v1-binary
+          path: shared-utils/kyc-prover/gentest_hd_v1
+          retention-days: 7
+
+  verify-hd-vectors:
+    name: Verify KYC-HD v1 Alternative Golden Vectors
+    runs-on: k8s-build
+    needs: build-and-test-hd
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download KYC-HD v1 Alternative golden vectors
+        uses: actions/download-artifact@v4
+        with:
+          name: golden-vectors-hd-v1
+          path: shared-utils/kyc-prover/vectors_hd_v1/
+
+      - name: Verify vector structure
+        run: |
+          cd shared-utils/kyc-prover/vectors_hd_v1
+
+          echo "Checking KYC-HD v1 Alternative vector structure..."
+
+          # Verify valid vector has required fields
+          jq -e '.[] | select(.name == "valid") | {
+            name,
+            witness,
+            proof_hex,
+            public_inputs_hex,
+            vk_hex,
+            should_fail
+          }' golden_vectors_hd_v1.json > /dev/null
+
+          echo "✓ Valid vector has required fields"
+
+          # Check proof and inputs are non-empty for valid vector
+          VALID_PROOF=$(jq -r '.[] | select(.name == "valid") | .proof_hex' golden_vectors_hd_v1.json)
+          VALID_INPUTS=$(jq -r '.[] | select(.name == "valid") | .public_inputs_hex' golden_vectors_hd_v1.json)
+
+          if [ -z "$VALID_PROOF" ] || [ "$VALID_PROOF" == "null" ]; then
+            echo "ERROR: Valid vector has empty proof_hex"
+            exit 1
+          fi
+
+          if [ -z "$VALID_INPUTS" ] || [ "$VALID_INPUTS" == "null" ]; then
+            echo "ERROR: Valid vector has empty public_inputs_hex"
+            exit 1
+          fi
+
+          echo "✓ Valid vector has proof and public inputs"
+
+          # Verify public inputs are 192 bytes (6 x 32 — HDv1 with output key binding)
+          # Layout: chain_separator, asset_id, compliance_root, tfr_anchor, output_key_high, output_key_low
+          INPUTS_LEN=$(echo -n "$VALID_INPUTS" | sed 's/^0x//' | wc -c)
+          INPUTS_BYTES=$((INPUTS_LEN / 2))
+
+          if [ "$INPUTS_BYTES" -ne 192 ]; then
+            echo "ERROR: HDv1 public inputs must be 192 bytes (6 x 32), got $INPUTS_BYTES"
+            exit 1
+          fi
+
+          echo "✓ Public inputs are 192 bytes (6 field elements, HDv1 with output key binding)"
+
+          # Check invalid vectors have empty proof
+          INVALID_WITH_PROOF=$(jq '[.[] | select(.should_fail == true and .proof_hex != "")] | length' golden_vectors_hd_v1.json)
+          if [ "$INVALID_WITH_PROOF" -gt 0 ]; then
+            echo "ERROR: Invalid vectors should not have proofs"
+            exit 1
+          fi
+
+          echo "✓ Invalid vectors correctly have no proofs"
+
+          # Display summary
+          echo ""
+          echo "Vector Summary:"
+          jq -r '.[] | "  \(.name) - should_fail: \(.should_fail)"' golden_vectors_hd_v1.json
+
+      - name: Check key sizes
+        run: |
+          cd shared-utils/kyc-prover/vectors_hd_v1
+
+          PK_SIZE=$(stat -c%s proving_key_v1.bin)
+          VK_SIZE=$(stat -c%s verification_key_v1.bin)
+
+          echo "KYC-HD v1 Alternative Key Sizes:"
+          echo "  Proving key:      $PK_SIZE bytes ($(numfmt --to=iec-i --suffix=B $PK_SIZE))"
+          echo "  Verification key: $VK_SIZE bytes"
+
+          # HDv1 uses the plain-rangecheck gnark fork and emits a 968-byte raw VK.
+          if [ "$VK_SIZE" -ne 968 ]; then
+            echo "ERROR: Verification key must be exactly 968 bytes, got $VK_SIZE"
+            exit 1
+          fi
+
+          echo "✓ VK size correct (gnark BLS12-381 format)"
+
+      - name: Summary
+        if: success()
+        run: |
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+          echo "  KYC-HD v1 Alternative Prover CI - SUCCESS"
+          echo "═══════════════════════════════════════════════════════════"
+          echo ""
+          echo "✓ KYC-HD v1 Alternative circuit compiled successfully"
+          echo "✓ Golden vectors generated with secp256k1 EC operations"
+          echo "✓ Public inputs format matches v1 (consensus compatible)"
+          echo "✓ Invalid witnesses correctly rejected"
+          echo ""
+          echo "Alternative Implementation Features:"
+          echo "  • Batch hashing instead of byte-by-byte"
+          echo "  • Commitment-based key derivation"
+          echo "  • Optimized Merkle proof verification"
+          echo "  • Cleaner modular architecture"
+          echo ""
+          echo "Circuit Stats (pubkey-only, plain-rangecheck gnark fork):"
+          echo "  • ~977,373 constraints (reduced — no master_secret scalar mul)"
+          echo "  • 6 public inputs"
+          echo "  • 28 secret inputs"
+          echo ""

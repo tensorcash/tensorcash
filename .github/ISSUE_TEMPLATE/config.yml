@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/tensorcash/tensorcash/blob/main/SECURITY.md
+    about: Do NOT open a public issue. Follow coordinated disclosure (security@tensorcash.org).
+  - name: Protocol change (TIP)
+    url: https://github.com/tensorcash/tensorcash/blob/main/tips/README.md
+    about: Consensus/protocol/economic changes go through the TIP process.

@@ -1,0 +1,2314 @@
+name: Build Desktop Apps
+
+on:
+  push:
+    tags: ["v*.*.*"]
+    branches: [main, develop]
+    # Bare paths (no /**) catch submodule-pointer bumps, which appear as a
+    # gitlink change on the submodule's own path rather than as files inside it.
+    # Without these, a parent commit that only updates `services/core-node/bcore`
+    # will not trigger the build.
+    paths:
+      - 'services/core-node/bcore'
+      - 'services/core-node/bcore/**'
+      - 'services/core-node/cosign-bridge'
+      - 'services/core-node/cosign-bridge/**'
+      - 'shared-utils/liboqs'
+      - 'shared-utils/liboqs/**'
+      - 'shared-utils/secp256k1-zkp'
+      - 'shared-utils/secp256k1-zkp/**'
+      - 'shared-utils/fb-schemas'
+      - 'shared-utils/fb-schemas/**'
+      - 'packaging/**'
+      - '.github/workflows/build-desktop.yml'
+  pull_request:
+    paths:
+      - 'services/core-node/bcore'
+      - 'services/core-node/bcore/**'
+      - 'packaging/**'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+      platforms:
+        description: 'Platforms to build'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - macos-only
+          - windows-only
+          - linux-only
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # actions/upload-artifact (toolkit#1774) cut the per-chunk upload timeout to 30s,
+  # which self-hosted runners routinely exceed at blob-upload init -> "Upload progress
+  # stalled". Restore a generous timeout (default was 5min) via the env var exposed in
+  # upload-artifact v4.6.0+ (#662).
+  ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS: "1200000"
+  ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY: "4"
+  # Chain type matrix values used throughout the workflow.
+  # "tensor" = mainnet (TensorCash), "tensor-test" = testnet (TensorCash Testnet).
+  # Each chain type produces a separate app with distinct bundle ID, data dir, and network.
+
+jobs:
+  # ============================================================================
+  # Validate packaging scripts first
+  # ============================================================================
+  validate:
+    name: Validate Packaging Scripts
+    runs-on: [self-hosted, linux, x64, docker]
+    steps:
+      - name: Clean workspace (fix docker root-owned files)
+        run: |
+          # Try sudo first, fall back to fresh checkout path
+          if sudo -n true 2>/dev/null; then
+            sudo rm -rf "$GITHUB_WORKSPACE/.git/modules" || true
+            sudo chown -R $(whoami) "$GITHUB_WORKSPACE" 2>/dev/null || true
+          else
+            # No passwordless sudo — nuke the workspace dir and recreate
+            rm -rf "$GITHUB_WORKSPACE/validate-src" 2>/dev/null || true
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          path: validate-src
+
+      - name: Validate shell scripts
+        run: |
+          echo "Checking shell script syntax..."
+          for script in validate-src/packaging/macos/*.sh validate-src/packaging/windows/*.sh; do
+            if [[ -f "$script" ]]; then
+              echo "Checking $script..."
+              bash -n "$script"
+              if command -v shellcheck &>/dev/null; then
+                shellcheck -S warning "$script" || true
+              fi
+            fi
+          done
+
+      - name: Validate Dockerfile syntax
+        run: |
+          echo "Checking Dockerfile syntax..."
+          docker run --rm -i hadolint/hadolint < validate-src/services/core-node/tor_prod.Dockerfile || true
+
+      - name: Validate JSON configs
+        run: |
+          python3 -m json.tool validate-src/packaging/common/validator-config.json > /dev/null
+          echo "✓ validator-config.json is valid"
+
+  # ============================================================================
+  # macOS Build (native on Apple Silicon runner)
+  # ============================================================================
+  build-macos:
+    name: macOS (${{ matrix.arch }}, ${{ matrix.chain_type }})
+    runs-on: ${{ matrix.runner }}
+    # Apple signing/notarization secrets gated behind an admin-approved environment.
+    environment: release
+    needs: validate
+    if: github.event.inputs.platforms != 'windows-only' && github.event.inputs.platforms != 'linux-only'
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            chain_type: tensor
+            runner: [self-hosted, macOS, ARM64, builder]
+            rust_target: aarch64-apple-darwin
+            is_cross: false
+          - arch: arm64
+            chain_type: tensor-test
+            runner: [self-hosted, macOS, ARM64, builder]
+            rust_target: aarch64-apple-darwin
+            is_cross: false
+          - arch: x86_64
+            chain_type: tensor
+            runner: [self-hosted, macOS, ARM64, builder]
+            rust_target: x86_64-apple-darwin
+            depends_host: x86_64-apple-darwin
+            is_cross: true
+          - arch: x86_64
+            chain_type: tensor-test
+            runner: [self-hosted, macOS, ARM64, builder]
+            rust_target: x86_64-apple-darwin
+            depends_host: x86_64-apple-darwin
+            is_cross: true
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize and update submodules
+        run: |
+
+          # Initialize all submodules
+          git submodule init
+
+          # Update each submodule individually
+          for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
+            echo "Updating submodule: $submodule"
+            git submodule update --init --recursive "$submodule" || {
+              echo "Warning: Failed to update $submodule, continuing..."
+            }
+          done
+
+      - name: Copy external dependencies into bcore
+        run: |
+          # Clean stale files from previous self-hosted runner builds
+          rm -rf services/core-node/bcore/src/external
+          mkdir -p services/core-node/bcore/src/external
+          cp -r shared-utils/liboqs services/core-node/bcore/src/external/
+          cp -r shared-utils/secp256k1-zkp services/core-node/bcore/src/external/
+          cp -r shared-utils/chiavdf services/core-node/bcore/src/external/ || true
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v5
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: ${{ runner.os }}-${{ matrix.arch }}-brew-downloads-${{ hashFiles('.github/workflows/build-desktop.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.arch }}-brew-downloads-
+
+      - name: Install Homebrew dependencies
+        run: |
+          brew_ensure() {
+            local formula
+            for formula in "$@"; do
+              if ! brew list --versions "$formula" >/dev/null 2>&1; then
+                brew install "$formula"
+              fi
+            done
+          }
+
+          if [[ "${{ matrix.is_cross }}" == "true" ]]; then
+            # Cross-compile: need host build tools + Qt6 for linguist tools (lrelease)
+            # cppzmq is header-only and arch-independent — needed for zmq.hpp
+            brew_ensure cmake ninja pkg-config autoconf automake libtool qt@6 cppzmq tor
+          else
+            # Native build: full dependency list via Homebrew
+            brew_ensure \
+              cmake ninja pkg-config \
+              qt@6 dbus \
+              zeromq cppzmq boost gmp flint sqlite \
+              autoconf automake libtool \
+              qrencode \
+              libevent \
+              zstd \
+              openssl@3 \
+              tor
+
+            # Debug: Show Qt installation details
+            echo "=== Qt6 location ==="
+            brew --prefix qt@6
+            echo "=== Qt6 frameworks ==="
+            ls -la "$(brew --prefix qt@6)/lib/" | grep -E "Qt.*framework" | head -20
+            echo "=== QtDBus check ==="
+            ls -la "$(brew --prefix qt@6)/lib/QtDBus.framework" 2>/dev/null || echo "QtDBus.framework not found in Qt6"
+          fi
+
+      - name: Cache depends (x86_64 cross-compile)
+        if: matrix.is_cross
+        uses: actions/cache@v5
+        with:
+          path: |
+            services/core-node/bcore/depends/built
+            services/core-node/bcore/depends/sources
+          key: ${{ runner.os }}-depends-${{ matrix.depends_host }}-${{ hashFiles('services/core-node/bcore/depends/packages/*.mk') }}
+          restore-keys: |
+            ${{ runner.os }}-depends-${{ matrix.depends_host }}-
+
+      - name: Build depends (x86_64 cross-compile)
+        if: matrix.is_cross
+        working-directory: services/core-node/bcore/depends
+        run: |
+          # .NOTPARALLEL Makefile — sub-builds (cmake/ninja) auto-detect cores
+          make HOST=${{ matrix.depends_host }} NO_USDT=1
+
+      - name: Build FlatBuffers v25.2.10 from source
+        run: |
+          # Match Dockerfile: build exact same version
+          # Build in runner.temp (per-job, isolated) — /tmp is shared across
+          # parallel matrix jobs on the same self-hosted mac and races on rm -rf.
+          FB_DIR="${{ runner.temp }}/flatbuffers"
+          rm -rf "$FB_DIR"
+          git clone --depth 1 --branch v25.2.10 https://github.com/google/flatbuffers.git "$FB_DIR"
+          mkdir -p "$FB_DIR/build"
+          cd "$FB_DIR/build"
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(sysctl -n hw.ncpu)
+          sudo make install
+          # For cross-compile: copy headers to depends prefix so toolchain can find them
+          if [[ "${{ matrix.is_cross }}" == "true" ]]; then
+            DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+            cp -r /usr/local/include/flatbuffers "${DEPENDS_PREFIX}/include/"
+          fi
+          rm -rf "$FB_DIR"
+
+      - name: Build GMP (x86_64 cross-compile)
+        if: matrix.is_cross
+        run: |
+          DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+          # Use RUNNER_TEMP — /tmp is shared between matrix jobs on the same self-hosted mac.
+          GMP_DIR="${RUNNER_TEMP}/gmp-build"
+          rm -rf "${GMP_DIR}" "${RUNNER_TEMP}/gmp-6.3.0"
+          curl -sL https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz | tar xJ -C "${RUNNER_TEMP}"
+          mv "${RUNNER_TEMP}/gmp-6.3.0" "${GMP_DIR}"
+          cd "${GMP_DIR}"
+          export MACOSX_DEPLOYMENT_TARGET=13.0
+          ./configure \
+            --host=x86_64-apple-darwin \
+            --prefix="${DEPENDS_PREFIX}" \
+            --enable-cxx \
+            --disable-shared \
+            --disable-assembly \
+            CC="cc -arch x86_64" \
+            CXX="c++ -arch x86_64" \
+            CFLAGS="-mmacosx-version-min=13.0" \
+            CXXFLAGS="-mmacosx-version-min=13.0"
+          make -j$(sysctl -n hw.ncpu)
+          make install
+          rm -rf "${GMP_DIR}"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.85
+          target: ${{ matrix.rust_target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            services/core-node/cosign-bridge/target/
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('services/core-node/cosign-bridge/Cargo.lock') }}
+
+      - name: Cache CMake build
+        uses: actions/cache@v5
+        with:
+          path: |
+            services/core-node/bcore/build-macos-${{ matrix.arch }}-${{ matrix.chain_type }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-${{ matrix.chain_type }}-cmake-${{ hashFiles('services/core-node/bcore/CMakeLists.txt', 'services/core-node/bcore/src/**/CMakeLists.txt') }}
+
+      # --- Build external dependencies ---
+      - name: Build OpenSSL (x86_64 cross-compile)
+        if: matrix.is_cross
+        run: |
+          DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+          OSSL_DIR="${RUNNER_TEMP}/openssl-build"
+          rm -rf "${OSSL_DIR}" "${RUNNER_TEMP}/openssl-3.3.2"
+          curl -sL https://github.com/openssl/openssl/releases/download/openssl-3.3.2/openssl-3.3.2.tar.gz | tar xz -C "${RUNNER_TEMP}"
+          mv "${RUNNER_TEMP}/openssl-3.3.2" "${OSSL_DIR}"
+          cd "${OSSL_DIR}"
+          ./Configure darwin64-x86_64-cc \
+            --prefix="${DEPENDS_PREFIX}" \
+            no-tests no-apps no-docs \
+            -mmacosx-version-min=11.0
+          make -j$(sysctl -n hw.ncpu)
+          make install_sw
+          rm -rf "${OSSL_DIR}"
+
+      - name: Build zstd (x86_64 cross-compile)
+        if: matrix.is_cross
+        run: |
+          DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+          ZSTD_DIR="${RUNNER_TEMP}/zstd-build"
+          rm -rf "${ZSTD_DIR}" "${RUNNER_TEMP}/zstd-1.5.6"
+          curl -sL https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz | tar xz -C "${RUNNER_TEMP}"
+          mv "${RUNNER_TEMP}/zstd-1.5.6" "${ZSTD_DIR}"
+          cd "${ZSTD_DIR}"
+          make CC="cc -arch x86_64" lib-release -j$(sysctl -n hw.ncpu)
+          mkdir -p "${DEPENDS_PREFIX}/lib" "${DEPENDS_PREFIX}/include"
+          cp lib/libzstd.a "${DEPENDS_PREFIX}/lib/"
+          cp lib/zstd.h lib/zstd_errors.h lib/zdict.h "${DEPENDS_PREFIX}/include/"
+          rm -rf "${ZSTD_DIR}"
+
+      - name: Build Boost locale+thread (x86_64 cross-compile)
+        if: matrix.is_cross
+        run: |
+          DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+          # Must match depends boost version (1.81.0)
+          BOOST_VER="1.81.0"
+          BOOST_DIR="boost_$(echo $BOOST_VER | tr . _)"
+          BOOST_BUILD="${RUNNER_TEMP}/boost-build"
+          rm -rf "${BOOST_BUILD}" "${RUNNER_TEMP}/${BOOST_DIR}"
+          curl -sL "https://archives.boost.io/release/${BOOST_VER}/source/${BOOST_DIR}.tar.gz" | tar xz -C "${RUNNER_TEMP}"
+          mv "${RUNNER_TEMP}/${BOOST_DIR}" "${BOOST_BUILD}"
+          cd "${BOOST_BUILD}"
+          # Bootstrap b2 (runs natively on host)
+          ./bootstrap.sh --with-libraries=locale,thread,chrono,atomic,date_time,system \
+            --prefix="${DEPENDS_PREFIX}"
+          # Cross-compile for x86_64 — don't reinstall headers (depends already has them)
+          cat > user-config.jam <<'JAM'
+          using darwin : : cc -arch x86_64 : <compileflags>"-arch x86_64" <linkflags>"-arch x86_64" ;
+          JAM
+          ./b2 --user-config=user-config.jam \
+            toolset=darwin architecture=x86 address-model=64 \
+            link=static threading=multi variant=release \
+            --prefix="${DEPENDS_PREFIX}" --no-cmake-config \
+            -j$(sysctl -n hw.ncpu) stage
+          # Copy only the built libraries (not headers, those come from depends)
+          cp stage/lib/libboost_*.a "${DEPENDS_PREFIX}/lib/"
+          rm -rf "${BOOST_BUILD}"
+
+      - name: Build blst library
+        run: |
+          BLST_DIR="${RUNNER_TEMP}/blst"
+          rm -rf "${BLST_DIR}"
+          git clone --depth 1 --branch v0.3.11 https://github.com/supranational/blst.git "${BLST_DIR}"
+          cd "${BLST_DIR}"
+          if [[ "${{ matrix.is_cross }}" == "true" ]]; then
+            DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+            export MACOSX_DEPLOYMENT_TARGET=13.0
+            CC="cc -arch x86_64 -mmacosx-version-min=13.0" ./build.sh -O3
+            mkdir -p "${DEPENDS_PREFIX}/lib" "${DEPENDS_PREFIX}/include"
+            cp libblst.a "${DEPENDS_PREFIX}/lib/"
+            cp bindings/*.h "${DEPENDS_PREFIX}/include/"
+            cp bindings/*.hpp "${DEPENDS_PREFIX}/include/" 2>/dev/null || true
+          else
+            ./build.sh -O3
+            sudo mkdir -p /usr/local/lib /usr/local/bindings
+            sudo cp libblst.a /usr/local/lib/
+            sudo cp bindings/*.h /usr/local/bindings/
+            sudo cp bindings/*.hpp /usr/local/bindings/ 2>/dev/null || true
+          fi
+          rm -rf "${BLST_DIR}"
+
+      - name: Build liboqs
+        working-directory: services/core-node/bcore/src/external/liboqs
+        run: |
+          if [[ "${{ matrix.is_cross }}" == "true" ]]; then
+            DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+            # Create a mini toolchain file to force cross-compile mode.
+            # Setting CMAKE_SYSTEM_NAME in a toolchain file makes CMake set
+            # CMAKE_CROSSCOMPILING=TRUE, which prevents project() from
+            # overriding CMAKE_SYSTEM_PROCESSOR with the host arch.
+            cat > "${RUNNER_TEMP}/x86_64-darwin-toolchain.cmake" <<'TOOLCHAIN'
+          set(CMAKE_SYSTEM_NAME Darwin)
+          set(CMAKE_SYSTEM_PROCESSOR x86_64)
+          set(CMAKE_C_COMPILER_TARGET x86_64-apple-darwin)
+          set(CMAKE_ASM_COMPILER_TARGET x86_64-apple-darwin)
+          set(CMAKE_C_FLAGS_INIT "-arch x86_64")
+          set(CMAKE_ASM_FLAGS_INIT "-arch x86_64")
+          TOOLCHAIN
+            cmake -S . -B build \
+              --toolchain "${RUNNER_TEMP}/x86_64-darwin-toolchain.cmake" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX="${DEPENDS_PREFIX}" \
+              -DBUILD_SHARED_LIBS=ON \
+              -DOQS_USE_OPENSSL=OFF \
+              -DOQS_BUILD_ONLY_LIB=ON \
+              -DOQS_MINIMAL_BUILD="SIG_ml_dsa_44;SIG_ml_dsa_65;SIG_ml_dsa_87" \
+              -DOQS_ENABLE_TEST_CONSTANT_TIME=ON \
+              -DOQS_DIST_BUILD=ON \
+              -DOQS_USE_AES_INSTRUCTIONS=OFF \
+              -DOQS_USE_SHA2_INSTRUCTIONS=OFF
+            cmake --build build -j$(sysctl -n hw.ncpu)
+            cmake --install build
+          else
+            cmake -S . -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=/usr/local \
+              -DBUILD_SHARED_LIBS=ON \
+              -DOQS_USE_OPENSSL=OFF \
+              -DOQS_BUILD_ONLY_LIB=ON \
+              -DOQS_MINIMAL_BUILD="SIG_ml_dsa_44;SIG_ml_dsa_65;SIG_ml_dsa_87" \
+              -DOQS_ENABLE_TEST_CONSTANT_TIME=ON
+            cmake --build build -j$(sysctl -n hw.ncpu)
+            sudo cmake --install build
+          fi
+          # Verify installation
+          ls -la /usr/local/lib/liboqs* 2>/dev/null || true
+          if [[ "${{ matrix.is_cross }}" == "true" ]]; then
+            ls -la "${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}/lib/liboqs"* || echo "WARNING: liboqs not found in depends prefix"
+          fi
+
+      - name: Build secp256k1-zkp
+        working-directory: services/core-node/bcore/src/external/secp256k1-zkp
+        run: |
+          ./autogen.sh
+          if [[ "${{ matrix.is_cross }}" == "true" ]]; then
+            DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+            CC="cc -arch x86_64" CXX="c++ -arch x86_64" \
+            ./configure --prefix="${DEPENDS_PREFIX}" \
+              --host=x86_64-apple-darwin \
+              --disable-shared --enable-static \
+              --enable-experimental \
+              --enable-module-ecdh \
+              --enable-module-extrakeys \
+              --enable-module-schnorrsig \
+              --enable-module-musig \
+              --enable-module-ellswift \
+              --enable-module-ecdsa-adaptor \
+              --enable-module-recovery
+            make -j$(sysctl -n hw.ncpu)
+            make install
+          else
+            ./configure --prefix=/usr/local \
+              --disable-shared --enable-static \
+              --enable-experimental \
+              --enable-module-ecdh \
+              --enable-module-extrakeys \
+              --enable-module-schnorrsig \
+              --enable-module-musig \
+              --enable-module-ellswift \
+              --enable-module-ecdsa-adaptor \
+              --enable-module-recovery
+            make -j$(sysctl -n hw.ncpu)
+            sudo make install
+          fi
+          # Verify installation
+          ls -la /usr/local/lib/libsecp256k1* 2>/dev/null || true
+          ls -la /usr/local/include/secp256k1* 2>/dev/null || true
+          if [[ "${{ matrix.is_cross }}" == "true" ]]; then
+            ls -la "${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}/lib/libsecp256k1"* || echo "WARNING: libsecp256k1 not found in depends prefix"
+          fi
+
+      # --- Build cosign-bridge ---
+      - name: Build cosign-bridge
+        working-directory: services/core-node/cosign-bridge
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }}
+          strip target/${{ matrix.rust_target }}/release/cosign-bridge
+          # Sign immediately after strip to avoid codesign issues on Intel
+          codesign --force --sign - target/${{ matrix.rust_target }}/release/cosign-bridge
+
+      # --- Generate FlatBuffers ---
+      - name: Generate FlatBuffers headers
+        run: |
+          flatc --cpp -o services/core-node/bcore/src/rpc \
+            shared-utils/fb-schemas/proof.fbs \
+            shared-utils/fb-schemas/blockheader.fbs \
+            shared-utils/fb-schemas/validation.fbs
+
+      # Copy cppzmq headers to depends prefix (header-only, not in depends system)
+      - name: Install cppzmq headers (x86_64 cross-compile)
+        if: matrix.is_cross
+        run: |
+          DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+          # cppzmq is header-only — copy from Homebrew (arch-independent headers)
+          cp "$(brew --prefix cppzmq)/include/zmq.hpp" "${DEPENDS_PREFIX}/include/"
+          cp "$(brew --prefix cppzmq)/include/zmq_addon.hpp" "${DEPENDS_PREFIX}/include/"
+
+      # --- Build TensorCash desktop (bitcoin-qt target) ---
+      - name: Verify dependencies before cmake
+        run: |
+          if [[ "${{ matrix.is_cross }}" == "true" ]]; then
+            DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+            echo "=== Verifying depends prefix ==="
+            ls -la "${DEPENDS_PREFIX}/lib/" | grep -E "(blst|secp256k1|oqs)" || true
+            ls -la "${DEPENDS_PREFIX}/include/" | head -20 || true
+          else
+            echo "=== Verifying /usr/local/lib ==="
+            ls -la /usr/local/lib/ | grep -E "(blst|secp256k1|oqs)" || true
+            echo "=== Verifying /usr/local/include ==="
+            ls -la /usr/local/include/ | head -20 || true
+            echo "=== Verifying secp256k1 headers ==="
+            ls -la /usr/local/include/secp256k1* 2>/dev/null || echo "No secp256k1 headers in /usr/local/include"
+          fi
+          ls -la services/core-node/bcore/src/external/secp256k1-zkp/include/ || true
+
+      - name: Clean stale build directory
+        working-directory: services/core-node/bcore
+        run: |
+          # Self-hosted runners persist working directories between runs.
+          # bcore is a submodule so the parent's `git clean -ffdx` does NOT
+          # enter its worktree — stale build dirs survive across jobs.
+          # A stale build dir causes CMake incremental reconfigure to miss
+          # new AUTOMOC targets (new Q_OBJECT headers).
+          BUILD_DIR="build-macos-${{ matrix.arch }}-${{ matrix.chain_type }}"
+          if [ -d "${BUILD_DIR}" ]; then
+            echo "Removing stale build directory: ${BUILD_DIR}"
+            rm -rf "${BUILD_DIR}"
+          fi
+
+      - name: Configure TensorCash desktop
+        working-directory: services/core-node/bcore
+        run: |
+          if [[ "${{ matrix.is_cross }}" == "true" ]]; then
+            DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+
+            # Cross-compile: use depends toolchain (includes Qt, boost, zmq, etc.)
+            # Use Homebrew's native Qt6 linguist tools (lrelease runs on host, output is arch-independent)
+            QT6_BREW="$(brew --prefix qt@6)"
+            # Point to native Qt6 linguist tools from depends (or fall back to Homebrew)
+            # depends build_prefix = $(host_prefix)/native, so native tools are inside the host prefix
+            NATIVE_QT_DIR="${DEPENDS_PREFIX}/native/lib/cmake/Qt6LinguistTools"
+            if [[ ! -d "${NATIVE_QT_DIR}" ]]; then
+              NATIVE_QT_DIR="${QT6_BREW}/lib/cmake/Qt6LinguistTools"
+            fi
+            # Keep cross-builds on the depends Boost tree. The failure mode here
+            # is host Homebrew headers combined with depends static libraries.
+            unset BOOST_ROOT BOOST_INCLUDEDIR BOOST_LIBRARYDIR \
+              CPATH CPLUS_INCLUDE_PATH C_INCLUDE_PATH OBJC_INCLUDE_PATH OBJCPLUS_INCLUDE_PATH \
+              SDKROOT PKG_CONFIG_PATH PKG_CONFIG_LIBDIR \
+              CMAKE_PREFIX_PATH CMAKE_INCLUDE_PATH CMAKE_LIBRARY_PATH 2>/dev/null || true
+            cmake -S . -B build-macos-${{ matrix.arch }}-${{ matrix.chain_type }} \
+              --toolchain depends/${{ matrix.depends_host }}/toolchain.cmake \
+              -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+              -DCMAKE_C_FLAGS="-I${DEPENDS_PREFIX}/include" \
+              -DCMAKE_CXX_FLAGS="-I${DEPENDS_PREFIX}/include" \
+              -DCMAKE_OBJCXX_FLAGS="-I${DEPENDS_PREFIX}/include" \
+              -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+              -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+              -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
+              -DCMAKE_EXE_LINKER_FLAGS="-L${DEPENDS_PREFIX}/lib -liconv" \
+              -DSECP256K1_INCLUDE_DIR="${DEPENDS_PREFIX}/include" \
+              -DSECP256K1_LIBRARY="${DEPENDS_PREFIX}/lib/libsecp256k1.a" \
+              -DQt6LinguistTools_DIR="${NATIVE_QT_DIR}" \
+              -DBoost_NO_SYSTEM_PATHS=ON \
+              -DBoost_NO_BOOST_CMAKE=ON \
+              -DBOOST_ROOT="${DEPENDS_PREFIX}" \
+              -DBOOST_INCLUDEDIR="${DEPENDS_PREFIX}/include" \
+              -DBOOST_LIBRARYDIR="${DEPENDS_PREFIX}/lib" \
+              -DBoost_INCLUDE_DIR="${DEPENDS_PREFIX}/include" \
+              -DBoost_LIBRARY_DIR_RELEASE="${DEPENDS_PREFIX}/lib" \
+              -DDEFAULT_CHAIN_TYPE=${{ matrix.chain_type }} \
+              -DBUILD_DAEMON=OFF \
+              -DBUILD_CLI=ON \
+              -DBUILD_TESTS=OFF \
+              -DBUILD_BENCH=OFF
+          else
+            # Native build: use Homebrew packages
+            QT_DIR="$(brew --prefix qt@6)"
+            HOMEBREW_PREFIX="$(brew --prefix)"
+            cmake -S . -B build-macos-${{ matrix.arch }}-${{ matrix.chain_type }} \
+              -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+              -DCMAKE_PREFIX_PATH="${QT_DIR};${HOMEBREW_PREFIX}" \
+              -DCMAKE_INCLUDE_PATH="${HOMEBREW_PREFIX}/include" \
+              -DCMAKE_LIBRARY_PATH="${HOMEBREW_PREFIX}/lib" \
+              -DCMAKE_EXE_LINKER_FLAGS="-L${HOMEBREW_PREFIX}/lib" \
+              -DDEFAULT_CHAIN_TYPE=${{ matrix.chain_type }} \
+              -DBUILD_DAEMON=OFF \
+              -DBUILD_CLI=ON \
+              -DBUILD_GUI=ON \
+              -DWITH_GUI=qt6 \
+              -DBUILD_TESTS=OFF \
+              -DBUILD_BENCH=OFF \
+              -DWITH_ZMQ=ON \
+              -DENABLE_WALLET=ON \
+              -DWITH_QRENCODE=ON
+          fi
+
+      - name: Debug macOS x86_64 link inputs
+        if: matrix.is_cross && matrix.arch == 'x86_64'
+        working-directory: services/core-node/bcore
+        run: |
+          BUILD_DIR="build-macos-${{ matrix.arch }}-${{ matrix.chain_type }}"
+          DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+
+          echo "=== Host include env ==="
+          env | grep -E '^(BOOST_|CPATH|CPLUS_INCLUDE_PATH|C_INCLUDE_PATH|OBJC_INCLUDE_PATH|OBJCPLUS_INCLUDE_PATH|SDKROOT|PKG_CONFIG_PATH|PKG_CONFIG_LIBDIR|CMAKE_(PREFIX|INCLUDE|LIBRARY)_PATH)=' || true
+
+          echo "=== CMake cache: Boost / root-path / chain settings ==="
+          grep -E '^(Boost_|BOOST_|CMAKE_FIND_ROOT_PATH|CMAKE_PREFIX_PATH|DEFAULT_CHAIN_TYPE:|Qt6LinguistTools_DIR:)' "${BUILD_DIR}/CMakeCache.txt" || true
+
+          echo "=== Compile flags: bitcoin_common ==="
+          cat "${BUILD_DIR}/src/CMakeFiles/bitcoin_common.dir/flags.make" || true
+
+          echo "=== Compile flags: bitcoin_wallet ==="
+          cat "${BUILD_DIR}/src/wallet/CMakeFiles/bitcoin_wallet.dir/flags.make" || true
+
+          echo "=== Final link command: bitcoin-qt ==="
+          cat "${BUILD_DIR}/src/qt/CMakeFiles/bitcoin-qt.dir/link.txt" || true
+
+          echo "=== Final link command: bitcoin-cli ==="
+          cat "${BUILD_DIR}/src/CMakeFiles/bitcoin-cli.dir/link.txt" || true
+
+          echo "=== boost_locale symbol probe ==="
+          nm -gU "${DEPENDS_PREFIX}/lib/libboost_locale.a" 2>/dev/null | c++filt | grep -E 'boost::locale::detail::facet_id<.*boost::locale::converter<char>.*>::id|boost::locale::converter<char>' || true
+
+          echo "=== boost_locale archive members ==="
+          ar -t "${DEPENDS_PREFIX}/lib/libboost_locale.a" 2>/dev/null | grep -E 'codepage|converter|locale' || true
+
+      - name: Build TensorCash desktop
+        working-directory: services/core-node/bcore
+        run: |
+          if [[ "${{ matrix.is_cross }}" == "true" ]]; then
+            unset BOOST_ROOT BOOST_INCLUDEDIR BOOST_LIBRARYDIR \
+              CPATH CPLUS_INCLUDE_PATH C_INCLUDE_PATH OBJC_INCLUDE_PATH OBJCPLUS_INCLUDE_PATH \
+              SDKROOT PKG_CONFIG_PATH PKG_CONFIG_LIBDIR \
+              CMAKE_PREFIX_PATH CMAKE_INCLUDE_PATH CMAKE_LIBRARY_PATH 2>/dev/null || true
+          fi
+          cmake --build build-macos-${{ matrix.arch }}-${{ matrix.chain_type }} --target bitcoin-qt bitcoin-cli -j$(sysctl -n hw.ncpu)
+          # Ad-hoc sign binaries immediately after build
+          codesign --force --sign - build-macos-${{ matrix.arch }}-${{ matrix.chain_type }}/bin/bitcoin-qt
+          codesign --force --sign - build-macos-${{ matrix.arch }}-${{ matrix.chain_type }}/bin/bitcoin-cli
+
+      - name: Debug macOS x86_64 link failure
+        if: failure() && matrix.is_cross && matrix.arch == 'x86_64'
+        working-directory: services/core-node/bcore
+        run: |
+          BUILD_DIR="build-macos-${{ matrix.arch }}-${{ matrix.chain_type }}"
+
+          echo "=== Undefined Boost refs in libbitcoin_common.a ==="
+          nm -u "${BUILD_DIR}/lib/libbitcoin_common.a" 2>/dev/null | c++filt | grep -E 'boost::locale|converter<char>|facet_id' || true
+
+          echo "=== libbitcoin_common archive members ==="
+          ar -t "${BUILD_DIR}/lib/libbitcoin_common.a" 2>/dev/null | grep -E 'args|icu_payload' || true
+
+      # --- Create app bundle ---
+      - name: Create app bundle
+        env:
+          APP_ARCH: ${{ matrix.arch }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          CHAIN_TYPE: ${{ matrix.chain_type }}
+        run: |
+          APP_VERSION=$(grep 'CLIENT_VERSION_MAJOR' services/core-node/bcore/CMakeLists.txt | head -1 | grep -oE '[0-9]+')
+          APP_VERSION+=".$(grep 'CLIENT_VERSION_MINOR' services/core-node/bcore/CMakeLists.txt | head -1 | grep -oE '[0-9]+')"
+
+          # Derive app name and bundle ID from chain type
+          if [[ "$CHAIN_TYPE" == "tensor-test" ]]; then
+            APP_NAME="TensorCash Testnet"
+            APP_EXEC="TensorCash-Testnet"
+            BUNDLE_ID="io.tensorcash.wallet.testnet"
+          else
+            APP_NAME="TensorCash"
+            APP_EXEC="TensorCash"
+            BUNDLE_ID="io.tensorcash.wallet"
+          fi
+          # Export for subsequent steps
+          echo "APP_EXEC=${APP_EXEC}" >> $GITHUB_ENV
+          echo "BUNDLE_ID=${BUNDLE_ID}" >> $GITHUB_ENV
+          echo "APP_DISPLAY_NAME=${APP_NAME}" >> $GITHUB_ENV
+
+          BUNDLE="dist/${APP_EXEC}.app"
+          mkdir -p "${BUNDLE}/Contents/MacOS" "${BUNDLE}/Contents/Resources" "${BUNDLE}/Contents/Frameworks"
+
+          # Copy executables
+          cp services/core-node/bcore/build-macos-${APP_ARCH}-${CHAIN_TYPE}/bin/bitcoin-qt "${BUNDLE}/Contents/MacOS/${APP_EXEC}"
+          cp services/core-node/bcore/build-macos-${APP_ARCH}-${CHAIN_TYPE}/bin/bitcoin-cli "${BUNDLE}/Contents/MacOS/"
+          cp services/core-node/cosign-bridge/target/${RUST_TARGET}/release/cosign-bridge "${BUNDLE}/Contents/MacOS/"
+
+          # Create Info.plist
+          cat > "${BUNDLE}/Contents/Info.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>${APP_EXEC}</string>
+            <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
+            <key>CFBundleName</key><string>${APP_NAME}</string>
+            <key>CFBundleVersion</key><string>${APP_VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${APP_VERSION}</string>
+            <key>CFBundleIconFile</key><string>TensorCash</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          # Copy validator config
+          mkdir -p "${BUNDLE}/Contents/Resources/defaults"
+          cp packaging/common/validator-config.json "${BUNDLE}/Contents/Resources/defaults/"
+          cp packaging/common/default-bitcoin.conf "${BUNDLE}/Contents/Resources/defaults/bitcoin.conf"
+
+          # Bundle Tor binary and its dylib dependencies for onion peer discovery
+          TOR_BIN="$(command -v tor 2>/dev/null || true)"
+          if [ -n "${TOR_BIN}" ] && [ -x "${TOR_BIN}" ]; then
+            echo "Bundling Tor binary from ${TOR_BIN}..."
+            cp "${TOR_BIN}" "${BUNDLE}/Contents/MacOS/tor"
+            chmod +x "${BUNDLE}/Contents/MacOS/tor"
+            for dylib in $(otool -L "${BUNDLE}/Contents/MacOS/tor" | awk 'NR>1{print $1}' | grep -v '/usr/lib\|/System' | grep -v '^@'); do
+              dylib_name="$(basename "${dylib}")"
+              if [ ! -f "${BUNDLE}/Contents/Frameworks/${dylib_name}" ]; then
+                echo "  Bundling Tor dependency: ${dylib_name}"
+                cp "${dylib}" "${BUNDLE}/Contents/Frameworks/${dylib_name}"
+                chmod 644 "${BUNDLE}/Contents/Frameworks/${dylib_name}"
+              fi
+              install_name_tool -change "${dylib}" "@executable_path/../Frameworks/${dylib_name}" \
+                "${BUNDLE}/Contents/MacOS/tor" 2>/dev/null || true
+            done
+          else
+            echo "ERROR: Tor binary not found. Install tor (brew install tor) to bundle it."
+            exit 1
+          fi
+
+          # Copy app icon
+          ICON_SRC="services/core-node/bcore/src/qt/res/icons/bitcoin.icns"
+          if [ -f "$ICON_SRC" ]; then
+            cp "$ICON_SRC" "${BUNDLE}/Contents/Resources/TensorCash.icns"
+          else
+            echo "WARNING: Icon source ${ICON_SRC} not found, app will use default icon"
+          fi
+
+      - name: Bundle dependencies (x86_64 cross-compile)
+        if: matrix.is_cross
+        run: |
+          BUNDLE="dist/${APP_EXEC}.app"
+          DEPENDS_PREFIX="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/${{ matrix.depends_host }}"
+
+          # Depends builds static Qt/boost/zmq — only liboqs is shared
+          LIBOQS_DYLIB=$(ls "${DEPENDS_PREFIX}/lib/liboqs."*.dylib 2>/dev/null | head -1)
+          if [ -n "$LIBOQS_DYLIB" ]; then
+            LIBOQS_NAME=$(basename "$LIBOQS_DYLIB")
+            cp "$LIBOQS_DYLIB" "${BUNDLE}/Contents/Frameworks/${LIBOQS_NAME}"
+            install_name_tool -id "@executable_path/../Frameworks/${LIBOQS_NAME}" "${BUNDLE}/Contents/Frameworks/${LIBOQS_NAME}"
+            install_name_tool -change "@rpath/${LIBOQS_NAME}" "@executable_path/../Frameworks/${LIBOQS_NAME}" "${BUNDLE}/Contents/MacOS/${APP_EXEC}" 2>/dev/null || true
+            install_name_tool -change "${DEPENDS_PREFIX}/lib/${LIBOQS_NAME}" "@executable_path/../Frameworks/${LIBOQS_NAME}" "${BUNDLE}/Contents/MacOS/${APP_EXEC}" 2>/dev/null || true
+            install_name_tool -change "@rpath/${LIBOQS_NAME}" "@executable_path/../Frameworks/${LIBOQS_NAME}" "${BUNDLE}/Contents/MacOS/bitcoin-cli" 2>/dev/null || true
+          fi
+
+          chmod -R u+w "${BUNDLE}/Contents" || true
+
+          echo "Checking for unresolved dependencies..."
+          find "${BUNDLE}/Contents" -type f \( -perm -111 -o -name "*.dylib" \) | while read f; do
+            if otool -L "$f" 2>/dev/null | grep -q "not found"; then
+              echo "Missing dependency in $f"
+              otool -L "$f" | grep "not found"
+              exit 1
+            fi
+          done
+
+      - name: Bundle Homebrew dependencies (arm64 native)
+        if: ${{ !matrix.is_cross }}
+        run: |
+          BUNDLE="dist/${APP_EXEC}.app"
+          QT_DIR="$(brew --prefix qt@6)"
+          HOMEBREW_PREFIX="$(brew --prefix)"
+
+          # Deploy Qt frameworks
+          "${QT_DIR}/bin/macdeployqt" "${BUNDLE}" -verbose=1 \
+            -libpath="${QT_DIR}/lib" \
+            -libpath="${HOMEBREW_PREFIX}/lib" \
+            -libpath="/usr/local/lib"
+
+          # Copy liboqs
+          cp /usr/local/lib/liboqs.6.dylib "${BUNDLE}/Contents/Frameworks/"
+          install_name_tool -id "@executable_path/../Frameworks/liboqs.6.dylib" "${BUNDLE}/Contents/Frameworks/liboqs.6.dylib"
+          chmod -R u+w "${BUNDLE}/Contents/Frameworks" "${BUNDLE}/Contents/MacOS" "${BUNDLE}/Contents/Resources" || true
+
+          # Copy QtDBus framework
+          QTDBUS_FOUND_PATH=""
+          for qtdbus_path in \
+            "${QT_DIR}/lib/QtDBus.framework" \
+            "${HOMEBREW_PREFIX}/lib/QtDBus.framework" \
+            "${HOMEBREW_PREFIX}/opt/qt@6/lib/QtDBus.framework" \
+            "/opt/homebrew/opt/qt@6/lib/QtDBus.framework" \
+            "/usr/local/opt/qt@6/lib/QtDBus.framework"; do
+            if [ -d "$qtdbus_path" ]; then
+              QTDBUS_FOUND_PATH="$qtdbus_path"
+              break
+            fi
+          done
+          if [ -z "$QTDBUS_FOUND_PATH" ]; then
+            echo "ERROR: QtDBus.framework not found"; exit 1
+          fi
+          ditto "$QTDBUS_FOUND_PATH" "${BUNDLE}/Contents/Frameworks/QtDBus.framework"
+          install_name_tool -id "@executable_path/../Frameworks/QtDBus.framework/Versions/A/QtDBus" "${BUNDLE}/Contents/Frameworks/QtDBus.framework/Versions/A/QtDBus"
+          for qtfw in QtGui QtWidgets QtNetwork QtQml QtQuick; do
+            install_name_tool -change "@rpath/QtDBus.framework/Versions/A/QtDBus" "@executable_path/../Frameworks/QtDBus.framework/Versions/A/QtDBus" "${BUNDLE}/Contents/Frameworks/${qtfw}.framework/Versions/A/${qtfw}" 2>/dev/null || true
+          done
+
+          # Bundle libdbus
+          DBUS_LIB_SRC=$(ls "${HOMEBREW_PREFIX}/opt/dbus/lib/libdbus-1."*.dylib 2>/dev/null | head -1)
+          [ -z "$DBUS_LIB_SRC" ] && DBUS_LIB_SRC=$(ls "${HOMEBREW_PREFIX}/lib/libdbus-1."*.dylib 2>/dev/null | head -1)
+          if [ -z "$DBUS_LIB_SRC" ]; then echo "ERROR: libdbus-1 not found"; exit 1; fi
+          DBUS_LIB_NAME=$(basename "$DBUS_LIB_SRC")
+          cp "$DBUS_LIB_SRC" "${BUNDLE}/Contents/Frameworks/${DBUS_LIB_NAME}"
+          install_name_tool -id "@executable_path/../Frameworks/${DBUS_LIB_NAME}" "${BUNDLE}/Contents/Frameworks/${DBUS_LIB_NAME}"
+          install_name_tool -change "/opt/homebrew/opt/dbus/lib/${DBUS_LIB_NAME}" "@executable_path/../Frameworks/${DBUS_LIB_NAME}" "${BUNDLE}/Contents/Frameworks/QtDBus.framework/Versions/A/QtDBus" 2>/dev/null || true
+
+          # Copy all boost shared libs
+          chmod -R u+w "${BUNDLE}/Contents/Frameworks" || true
+          for boostlib in "${HOMEBREW_PREFIX}"/lib/libboost_*.dylib; do
+            [ -f "$boostlib" ] || continue
+            base=$(basename "$boostlib")
+            cp -f "$boostlib" "${BUNDLE}/Contents/Frameworks/${base}"
+            install_name_tool -id "@executable_path/../Frameworks/${base}" "${BUNDLE}/Contents/Frameworks/${base}" 2>/dev/null || true
+          done
+
+          # Copy brotli common
+          if [ -f "${HOMEBREW_PREFIX}/lib/libbrotlicommon.1.dylib" ]; then
+            cp "${HOMEBREW_PREFIX}/lib/libbrotlicommon.1.dylib" "${BUNDLE}/Contents/Frameworks/"
+            install_name_tool -id "@executable_path/../Frameworks/libbrotlicommon.1.dylib" "${BUNDLE}/Contents/Frameworks/libbrotlicommon.1.dylib"
+          fi
+
+          # Bundle ICU dylibs
+          ICU_LIB_DIR="${HOMEBREW_PREFIX}/opt/icu4c/lib"
+          for iculib in "${ICU_LIB_DIR}"/libicu*.dylib; do
+            [ -f "$iculib" ] || continue
+            base=$(basename "$iculib")
+            cp -f "$iculib" "${BUNDLE}/Contents/Frameworks/${base}"
+            install_name_tool -id "@executable_path/../Frameworks/${base}" "${BUNDLE}/Contents/Frameworks/${base}" 2>/dev/null || true
+          done
+
+      - name: Fix library references (arm64 native)
+        if: ${{ !matrix.is_cross }}
+        run: |
+          BUNDLE="dist/${APP_EXEC}.app"
+          HOMEBREW_PREFIX="$(brew --prefix)"
+
+          # Determine DBUS_LIB_NAME for fixups
+          DBUS_LIB_SRC=$(ls "${HOMEBREW_PREFIX}/opt/dbus/lib/libdbus-1."*.dylib 2>/dev/null | head -1)
+          [ -z "$DBUS_LIB_SRC" ] && DBUS_LIB_SRC=$(ls "${HOMEBREW_PREFIX}/lib/libdbus-1."*.dylib 2>/dev/null | head -1)
+          DBUS_LIB_NAME=$(basename "$DBUS_LIB_SRC")
+
+          rewrite_icu_refs() {
+            target="$1"
+            otool -L "$target" | grep -E "libicu(uc|i18n|data)" | awk '{print $1}' | while read dep; do
+              [ -z "$dep" ] && continue
+              depbase=$(basename "$dep")
+              install_name_tool -change "$dep" "@executable_path/../Frameworks/${depbase}" "$target" 2>/dev/null || true
+            done
+          }
+
+          # Fix references in dylibs
+          for lib in "${BUNDLE}/Contents/Frameworks/"*.dylib; do
+            [ -f "$lib" ] || continue
+            for qtfw in QtCore QtGui QtWidgets QtNetwork QtDBus QtQml QtQuick QtOpenGL; do
+              install_name_tool -change "@rpath/${qtfw}.framework/Versions/A/${qtfw}" "@executable_path/../Frameworks/${qtfw}.framework/Versions/A/${qtfw}" "$lib" 2>/dev/null || true
+            done
+            install_name_tool -change "@rpath/liboqs.6.dylib" "@executable_path/../Frameworks/liboqs.6.dylib" "$lib" 2>/dev/null || true
+            install_name_tool -change "/opt/homebrew/opt/dbus/lib/${DBUS_LIB_NAME}" "@executable_path/../Frameworks/${DBUS_LIB_NAME}" "$lib" 2>/dev/null || true
+            for ref in libbrotlicommon.1.dylib libboost_atomic.dylib libboost_container.dylib libboost_chrono.dylib; do
+              install_name_tool -change "@rpath/${ref}" "@executable_path/../Frameworks/${ref}" "$lib" 2>/dev/null || true
+              install_name_tool -change "@loader_path/${ref}" "@executable_path/../Frameworks/${ref}" "$lib" 2>/dev/null || true
+            done
+            # Fix boost inter-library references
+            for boostbase in $(ls "${BUNDLE}/Contents/Frameworks/libboost_"*.dylib 2>/dev/null | xargs -I{} basename {}); do
+              install_name_tool -change "@loader_path/${boostbase}" "@executable_path/../Frameworks/${boostbase}" "$lib" 2>/dev/null || true
+              install_name_tool -change "${HOMEBREW_PREFIX}/lib/${boostbase}" "@executable_path/../Frameworks/${boostbase}" "$lib" 2>/dev/null || true
+            done
+            rewrite_icu_refs "$lib"
+          done
+
+          # Fix references in Qt framework binaries
+          for fwbin in "${BUNDLE}/Contents/Frameworks/"*.framework/Versions/A/*; do
+            [ -f "$fwbin" ] || continue
+            for qtfw in QtCore QtGui QtWidgets QtNetwork QtDBus QtQml QtQuick QtOpenGL; do
+              install_name_tool -change "@rpath/${qtfw}.framework/Versions/A/${qtfw}" "@executable_path/../Frameworks/${qtfw}.framework/Versions/A/${qtfw}" "$fwbin" 2>/dev/null || true
+            done
+            install_name_tool -change "@rpath/liboqs.6.dylib" "@executable_path/../Frameworks/liboqs.6.dylib" "$fwbin" 2>/dev/null || true
+            install_name_tool -change "/opt/homebrew/opt/dbus/lib/${DBUS_LIB_NAME}" "@executable_path/../Frameworks/${DBUS_LIB_NAME}" "$fwbin" 2>/dev/null || true
+            for ref in libbrotlicommon.1.dylib libboost_atomic.dylib libboost_container.dylib libboost_chrono.dylib; do
+              install_name_tool -change "@rpath/${ref}" "@executable_path/../Frameworks/${ref}" "$fwbin" 2>/dev/null || true
+              install_name_tool -change "@loader_path/${ref}" "@executable_path/../Frameworks/${ref}" "$fwbin" 2>/dev/null || true
+            done
+            rewrite_icu_refs "$fwbin"
+          done
+
+          # Fix references in main executables
+          for exe in "${APP_EXEC}" bitcoin-cli; do
+            [ -f "${BUNDLE}/Contents/MacOS/${exe}" ] || continue
+            install_name_tool -change "@rpath/liboqs.6.dylib" "@executable_path/../Frameworks/liboqs.6.dylib" "${BUNDLE}/Contents/MacOS/${exe}" 2>/dev/null || true
+            install_name_tool -change "/opt/homebrew/opt/dbus/lib/${DBUS_LIB_NAME}" "@executable_path/../Frameworks/${DBUS_LIB_NAME}" "${BUNDLE}/Contents/MacOS/${exe}" 2>/dev/null || true
+            for ref in libbrotlicommon.1.dylib libboost_atomic.dylib libboost_container.dylib libboost_chrono.dylib; do
+              install_name_tool -change "@rpath/${ref}" "@executable_path/../Frameworks/${ref}" "${BUNDLE}/Contents/MacOS/${exe}" 2>/dev/null || true
+              install_name_tool -change "@loader_path/${ref}" "@executable_path/../Frameworks/${ref}" "${BUNDLE}/Contents/MacOS/${exe}" 2>/dev/null || true
+            done
+            rewrite_icu_refs "${BUNDLE}/Contents/MacOS/${exe}"
+          done
+
+          # Verify no unresolved deps (pre-sweep sanity check)
+          echo "Pre-sweep check complete, running generic dependency sweep next..."
+
+      - name: Bundle remaining Homebrew dependencies (arm64 native)
+        if: ${{ !matrix.is_cross }}
+        run: |
+          BUNDLE="dist/${APP_EXEC}.app"
+          FRAMEWORKS_DIR="${BUNDLE}/Contents/Frameworks"
+
+          # Generic recursive sweep: find ALL non-system dylib references pointing
+          # to /opt/homebrew or /usr/local, copy them into Frameworks, and rewrite
+          # the load paths. Repeat until no new deps are discovered (transitive).
+          max_passes=5
+          pass=0
+          while [ $pass -lt $max_passes ]; do
+            pass=$((pass + 1))
+            found_new=false
+
+            for f in "${BUNDLE}/Contents/MacOS/"* "${FRAMEWORKS_DIR}/"*.dylib; do
+              [ -f "$f" ] || continue
+              for dep in $(otool -L "$f" 2>/dev/null | awk 'NR>1{print $1}' | grep -E '^(/opt/homebrew|/usr/local)/' | grep -v '^/usr/lib'); do
+                dep_name="$(basename "$dep")"
+                # Copy if not already in Frameworks
+                if [ ! -f "${FRAMEWORKS_DIR}/${dep_name}" ]; then
+                  if [ -f "$dep" ]; then
+                    echo "  [pass ${pass}] Bundling missing dependency: ${dep_name} (needed by $(basename "$f"))"
+                    cp "$dep" "${FRAMEWORKS_DIR}/${dep_name}"
+                    chmod 644 "${FRAMEWORKS_DIR}/${dep_name}"
+                    install_name_tool -id "@executable_path/../Frameworks/${dep_name}" \
+                      "${FRAMEWORKS_DIR}/${dep_name}" 2>/dev/null || true
+                    found_new=true
+                  else
+                    echo "WARNING: dependency ${dep} referenced by $(basename "$f") not found on disk"
+                  fi
+                fi
+                # Rewrite reference regardless (might already be copied but ref not yet fixed)
+                install_name_tool -change "$dep" "@executable_path/../Frameworks/${dep_name}" "$f" 2>/dev/null || true
+              done
+            done
+
+            # Also sweep Qt framework binaries — only rewrite references, do NOT
+            # copy framework binaries as bare files (they belong in .framework bundles
+            # which macdeployqt already handles).
+            for f in "${FRAMEWORKS_DIR}/"*.framework/Versions/A/*; do
+              [ -f "$f" ] || continue
+              for dep in $(otool -L "$f" 2>/dev/null | awk 'NR>1{print $1}' | grep -E '^(/opt/homebrew|/usr/local)/' | grep -v '^/usr/lib'); do
+                dep_name="$(basename "$dep")"
+                # Skip if this is a Qt framework reference (already bundled as .framework)
+                if [ -d "${FRAMEWORKS_DIR}/${dep_name}.framework" ]; then
+                  # Rewrite to the framework path
+                  install_name_tool -change "$dep" \
+                    "@executable_path/../Frameworks/${dep_name}.framework/Versions/A/${dep_name}" "$f" 2>/dev/null || true
+                  continue
+                fi
+                # For regular dylibs, copy if missing
+                if [ ! -f "${FRAMEWORKS_DIR}/${dep_name}" ]; then
+                  if [ -f "$dep" ]; then
+                    echo "  [pass ${pass}] Bundling missing dependency: ${dep_name} (needed by $(basename "$f"))"
+                    cp "$dep" "${FRAMEWORKS_DIR}/${dep_name}"
+                    chmod 644 "${FRAMEWORKS_DIR}/${dep_name}"
+                    install_name_tool -id "@executable_path/../Frameworks/${dep_name}" \
+                      "${FRAMEWORKS_DIR}/${dep_name}" 2>/dev/null || true
+                    found_new=true
+                  fi
+                fi
+                install_name_tool -change "$dep" "@executable_path/../Frameworks/${dep_name}" "$f" 2>/dev/null || true
+              done
+            done
+
+            if [ "$found_new" = false ]; then
+              echo "  No new dependencies found in pass ${pass}, sweep complete."
+              break
+            fi
+            echo "  Pass ${pass} found new dependencies, scanning again for transitive deps..."
+          done
+
+          # Also fix install names (self-references) for any dylib still pointing to Homebrew
+          for lib in "${FRAMEWORKS_DIR}/"*.dylib; do
+            [ -f "$lib" ] || continue
+            current_id=$(otool -D "$lib" 2>/dev/null | tail -1)
+            if echo "$current_id" | grep -qE '^(/opt/homebrew|/usr/local)/'; then
+              lib_name="$(basename "$lib")"
+              install_name_tool -id "@executable_path/../Frameworks/${lib_name}" "$lib" 2>/dev/null || true
+            fi
+          done
+
+          # Final verification: fail if ANY Homebrew references remain
+          echo "=== Final verification ==="
+          fail=false
+          find "${BUNDLE}/Contents" -type f \( -perm -111 -o -name "*.dylib" \) | while read f; do
+            if otool -L "$f" 2>/dev/null | grep -q "not found"; then
+              echo "FAIL: Missing dependency in $(basename "$f")"
+              otool -L "$f" | grep "not found"
+              exit 1
+            fi
+            homebrew_refs=$(otool -L "$f" 2>/dev/null | awk 'NR>1{print $1}' | grep -E '^(/opt/homebrew|/usr/local)/' | grep -v '^/usr/lib' || true)
+            if [ -n "$homebrew_refs" ]; then
+              echo "FAIL: Unrewritten Homebrew reference in $(basename "$f"):"
+              echo "$homebrew_refs"
+              exit 1
+            fi
+          done
+          echo "All dependencies properly bundled."
+
+      - name: Ad-hoc sign app bundle
+        run: |
+          BUNDLE="dist/${APP_EXEC}.app"
+          # Sign inside-out: dylibs, frameworks, plugins, executables, bundle
+          find "${BUNDLE}/Contents/Frameworks" -name "*.dylib" -exec codesign --force --sign - {} \; 2>/dev/null || true
+          for fw in "${BUNDLE}/Contents/Frameworks/"*.framework; do
+            if [ -d "$fw" ]; then
+              fw_name=$(basename "$fw" .framework)
+              codesign --force --sign - "$fw/Versions/A/${fw_name}" 2>/dev/null || true
+              codesign --force --sign - "$fw"
+            fi
+          done
+          find "${BUNDLE}/Contents/PlugIns" -name "*.dylib" -exec codesign --force --sign - {} \; 2>/dev/null || true
+          for exe in "${BUNDLE}/Contents/MacOS/"*; do codesign --force --sign - "$exe"; done
+          codesign --force --sign - "${BUNDLE}"
+          codesign --verify --verbose "${BUNDLE}" && echo "Signature OK" || echo "Signature verification had issues"
+
+      - name: Verify app bundle
+        run: |
+          BUNDLE="dist/${APP_EXEC}.app"
+
+          echo "=== Checking bundle structure ==="
+          ls -la "${BUNDLE}/Contents/Frameworks/" 2>/dev/null | head -20 || echo "(no Frameworks — static build)"
+
+          echo "=== Verifying library references ==="
+          otool -L "${BUNDLE}/Contents/MacOS/${APP_EXEC}" | head -30
+
+          echo "=== Checking for unresolved @rpath references ==="
+          if otool -L "${BUNDLE}/Contents/MacOS/${APP_EXEC}" | grep -q "@rpath"; then
+            echo "WARNING: Found @rpath references that may not resolve:"
+            otool -L "${BUNDLE}/Contents/MacOS/${APP_EXEC}" | grep "@rpath"
+
+            if [[ "${{ matrix.is_cross }}" != "true" ]]; then
+              QT_DIR="$(brew --prefix qt@6)"
+              HOMEBREW_PREFIX="$(brew --prefix)"
+              echo "Attempting to fix remaining @rpath references..."
+              for lib in $(otool -L "${BUNDLE}/Contents/MacOS/${APP_EXEC}" | grep "@rpath" | awk '{print $1}'); do
+                libname=$(basename "$lib")
+                for searchpath in "${HOMEBREW_PREFIX}/lib" "${QT_DIR}/lib" "/usr/local/lib"; do
+                  if [ -f "${searchpath}/${libname}" ]; then
+                    echo "Found $libname in ${searchpath}, copying..."
+                    cp "${searchpath}/${libname}" "${BUNDLE}/Contents/Frameworks/"
+                    install_name_tool -change "$lib" "@executable_path/../Frameworks/${libname}" "${BUNDLE}/Contents/MacOS/${APP_EXEC}"
+                    break
+                  fi
+                done
+              done
+            fi
+          fi
+
+          echo "=== Architecture check ==="
+          file "${BUNDLE}/Contents/MacOS/${APP_EXEC}"
+
+          echo "=== Final library check ==="
+          otool -L "${BUNDLE}/Contents/MacOS/${APP_EXEC}"
+
+      - name: Import signing certificate
+        if: env.APPLE_CERTIFICATE_P12 != ''
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          # Globally unique keychain path. Even with per-runner RUNNER_TEMP,
+          # adding run-id + attempt + pid prevents any cross-job collision
+          # if a runner ever reuses a temp dir or N runners share a UID.
+          KEYCHAIN_PATH="${RUNNER_TEMP}/app-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$$.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+
+          # Filesystem-only cleanup. Do NOT use `security delete-keychain`:
+          # it mutates the user-domain keychain search list, which is process-
+          # shared across concurrent runners on the same UID and races to
+          # corrupt state.
+          rm -f "${KEYCHAIN_PATH}"
+
+          # Serialize the security operations themselves. securityd's ACL DB
+          # and chain-validation cache are process-shared on macOS; concurrent
+          # set-key-partition-list / find-identity calls have produced empty
+          # find-identity output even when `security import` succeeded.
+          # mkdir is atomic across processes — no external `flock` needed.
+          LOCK_DIR="/tmp/tensorcash-keychain-setup.lock"
+          LOCK_TIMEOUT=600
+          LOCK_WAITED=0
+          while ! mkdir "${LOCK_DIR}" 2>/dev/null; do
+            sleep 5
+            LOCK_WAITED=$((LOCK_WAITED + 5))
+            if [[ ${LOCK_WAITED} -ge ${LOCK_TIMEOUT} ]]; then
+              echo "::error::Timed out waiting for keychain lock after ${LOCK_TIMEOUT}s"
+              ls -la "${LOCK_DIR}" 2>&1 || true
+              exit 1
+            fi
+          done
+          # Release lock on any exit, including failure.
+          trap 'rmdir "${LOCK_DIR}" 2>/dev/null || true' EXIT
+
+          # Workaround for macOS Tahoe (26.x): trustd accumulates bad chain-
+          # validation state over uptime. Symptom: codesign reports "unable
+          # to build chain to self-signed root for signer" + errSecInternalComponent
+          # for a Developer ID cert that the chain is in fact valid for —
+          # `security find-identity -v -p codesigning` and `security verify-cert -p codeSign`
+          # both pass on the same cert. Killing trustd lets launchd respawn
+          # it with fresh state. Cheap (~100ms) and idempotent. Done under
+          # the lock so concurrent codesigns aren't disrupted mid-sign.
+          # See: macOS 26.3 codesign trust regression notes.
+          sudo killall -9 trustd 2>/dev/null || true
+          sleep 1
+
+          # Create temporary keychain
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          # Import certificate
+          echo "${APPLE_CERTIFICATE_P12}" | base64 --decode > "${RUNNER_TEMP}/certificate.p12"
+          security import "${RUNNER_TEMP}/certificate.p12" \
+            -P "${APPLE_CERTIFICATE_PASSWORD}" \
+            -A -t cert -f pkcs12 \
+            -k "${KEYCHAIN_PATH}"
+          rm -f "${RUNNER_TEMP}/certificate.p12"
+
+          # Allow codesign to access the keychain.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          # Import Apple intermediate cert (Developer ID Certification Authority G2).
+          curl -sL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o "${RUNNER_TEMP}/DeveloperIDG2CA.cer"
+          security import "${RUNNER_TEMP}/DeveloperIDG2CA.cer" -k "${KEYCHAIN_PATH}" -T /usr/bin/codesign 2>/dev/null || true
+
+          # NOTE: We deliberately do NOT import Apple Root CA into the temp
+          # keychain. The URL apple.com/certificateauthority/AppleIncRootCertificate.cer
+          # currently 404s and returns HTML (silently swallowed by `|| true`),
+          # AND the root is already in /System/Library/Keychains/SystemRootCertificates.keychain
+          # so it's reachable via system roots. The earlier theory that codesign
+          # couldn't reach system roots was wrong — it CAN once trustd state
+          # is fresh. The `sudo killall -9 trustd` above is the actual fix.
+
+          # Add the temp keychain to the user-domain search list. macOS chain
+          # validation walks the user search list (+ system roots) to look up
+          # the issuer of the leaf — passing `-k <keychain>` to find-identity
+          # only limits where IDENTITIES are found, NOT where the chain-builder
+          # looks up intermediates. Without this line, find-identity -v reports
+          # CSSMERR_TP_NOT_TRUSTED on macOS 26 / Tahoe even though the
+          # intermediate is sitting in our keychain. This matches Apple's and
+          # GitHub's official recipes.
+          # The user search list is process-shared state; the mkdir lock above
+          # serializes the read-modify-write across concurrent runners. The
+          # cleanup step (also under the lock) reads the CURRENT list and
+          # removes only our entry, so concurrent jobs that interleave their
+          # setup don't evict each other.
+          ORIGINAL_USER_LIST=$(security list-keychain -d user | tr -d '"' | xargs)
+          security list-keychain -d user -s "${KEYCHAIN_PATH}" $ORIGINAL_USER_LIST
+
+          # Diagnostic: surface what's actually in the keychain. With the temp
+          # keychain in the user list above, find-identity -v should now see
+          # the cert as valid.
+          echo "=== All identities in temp keychain ==="
+          security find-identity "${KEYCHAIN_PATH}" || true
+          echo "=== Codesigning-valid identities (chain via user search list) ==="
+          security find-identity -v -p codesigning "${KEYCHAIN_PATH}" || true
+
+          # Discover the Developer ID identity. We extract BOTH the SHA1
+          # fingerprint and the friendly name so the sign step can pass the
+          # fingerprint to codesign (unambiguous; defends against other
+          # identical-name certs in login.keychain on the runner Mac).
+          # `|| true` keeps `set -euo pipefail` from killing the script when
+          # grep finds nothing — the empty-string check below handles that.
+          IDENTITY_HASH=$(security find-identity -v -p codesigning "${KEYCHAIN_PATH}" | grep "Developer ID" | head -1 | awk '{print $2}' || true)
+          IDENTITY_NAME=$(security find-identity -v -p codesigning "${KEYCHAIN_PATH}" | grep "Developer ID" | head -1 | sed 's/.*"\(.*\)".*/\1/' || true)
+          if [[ -z "$IDENTITY_HASH" ]]; then
+            echo "::warning::No Developer ID identity found in certificate — falling back to ad-hoc"
+          else
+            echo "Found signing identity: ${IDENTITY_NAME} (SHA1=${IDENTITY_HASH})"
+            # Use the SHA1 hash for codesign --sign so the cert is unambiguously
+            # selected via the user search list (no need for --keychain).
+            echo "SIGNING_IDENTITY=${IDENTITY_HASH}" >> "$GITHUB_ENV"
+          fi
+
+          # Export for subsequent steps
+          echo "SIGNING_KEYCHAIN=${KEYCHAIN_PATH}" >> "$GITHUB_ENV"
+          echo "HAS_SIGNING_CERT=true" >> "$GITHUB_ENV"
+
+      - name: Sign app bundle (Developer ID)
+        if: env.HAS_SIGNING_CERT == 'true' && env.SIGNING_IDENTITY != ''
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          # Trim trailing whitespace/newlines from secrets (GitHub UI paste artifact)
+          APPLE_APP_PASSWORD="${APPLE_APP_PASSWORD%"${APPLE_APP_PASSWORD##*[![:space:]]}"}"
+
+          # Refresh trustd before this codesign-heavy step. trustd accumulates
+          # bad chain-validation state on macOS Tahoe (26.x); the keychain
+          # setup step kills it once but the dozens of codesign calls below
+          # (per dylib + per framework + main binary + app bundle) can re-poison
+          # state mid-run. Kill again here to start fresh. See setup step
+          # comment for full rationale.
+          sudo killall -9 trustd 2>/dev/null || true
+          sleep 1
+
+          chmod +x packaging/macos/sign-and-notarize.sh
+          # Do NOT pass --keychain. `man codesign`: "--keychain filename — During
+          # signing, only the named keychain will be searched for the signing
+          # identity, AND any indirectly required certificates." That blocks
+          # codesign from reaching Apple Root CA in /System/Library/Keychains/
+          # SystemRootCertificates.keychain, breaking chain validation with
+          # "unable to build chain to self-signed root".
+          # Without --keychain, codesign uses the user search list (which now
+          # includes our temp keychain) plus system roots — full chain works.
+          # SIGNING_IDENTITY is the SHA1 hash, so identity selection is
+          # unambiguous even with multiple matching keychains.
+          packaging/macos/sign-and-notarize.sh \
+            --identity "${SIGNING_IDENTITY}" \
+            --team-id "${APPLE_TEAM_ID}" \
+            --apple-id "${APPLE_ID}" \
+            --password "${APPLE_APP_PASSWORD}" \
+            "dist/${APP_EXEC}.app"
+
+      - name: Create DMG
+        run: |
+          APP_VERSION=$(grep 'CLIENT_VERSION_MAJOR' services/core-node/bcore/CMakeLists.txt | head -1 | grep -oE '[0-9]+')
+          APP_VERSION+=".$(grep 'CLIENT_VERSION_MINOR' services/core-node/bcore/CMakeLists.txt | head -1 | grep -oE '[0-9]+')"
+
+          DMG_NAME="${APP_EXEC}-${APP_VERSION}-macos-${{ matrix.arch }}.dmg"
+          hdiutil create -volname "${APP_DISPLAY_NAME}" \
+            -srcfolder "dist/${APP_EXEC}.app" \
+            -ov -format UDZO \
+            "dist/${DMG_NAME}"
+
+          echo "DMG_NAME=${DMG_NAME}" >> $GITHUB_ENV
+
+      - name: Sign and notarize DMG
+        if: env.HAS_SIGNING_CERT == 'true' && env.SIGNING_IDENTITY != ''
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          # Trim trailing whitespace/newlines from secrets (GitHub UI paste artifact)
+          APPLE_APP_PASSWORD="${APPLE_APP_PASSWORD%"${APPLE_APP_PASSWORD##*[![:space:]]}"}"
+
+          # Refresh trustd again before the DMG sign — see setup step comment.
+          # The .app sign loop above does many codesigns, which on Tahoe can
+          # re-poison trustd state. Without this, the DMG sign sometimes fails
+          # with errSecInternalComponent even after the .app sign succeeded.
+          sudo killall -9 trustd 2>/dev/null || true
+          sleep 1
+
+          # Same reason as in the .app sign step: --keychain would block
+          # chain lookup from reaching Apple Root CA in system roots.
+          codesign --force --sign "${SIGNING_IDENTITY}" \
+            --timestamp \
+            "dist/${DMG_NAME}"
+
+          xcrun notarytool submit "dist/${DMG_NAME}" \
+            --apple-id "${APPLE_ID}" \
+            --password "${APPLE_APP_PASSWORD}" \
+            --team-id "${APPLE_TEAM_ID}" \
+            --wait
+
+          xcrun stapler staple "dist/${DMG_NAME}"
+
+      - name: Cleanup signing keychain
+        if: always() && env.SIGNING_KEYCHAIN != ''
+        run: |
+          set -uo pipefail
+
+          # Re-acquire the lock so removing our entry from the shared user
+          # keychain search list is race-free against concurrent runners that
+          # may also be reading or writing the list right now. We don't use
+          # `security delete-keychain` because it does its own non-atomic
+          # search-list mutation as a side effect.
+          LOCK_DIR="/tmp/tensorcash-keychain-setup.lock"
+          LOCK_TIMEOUT=120
+          LOCK_WAITED=0
+          while ! mkdir "${LOCK_DIR}" 2>/dev/null; do
+            sleep 2
+            LOCK_WAITED=$((LOCK_WAITED + 2))
+            if [[ ${LOCK_WAITED} -ge ${LOCK_TIMEOUT} ]]; then
+              echo "::warning::Cleanup couldn't acquire keychain lock in ${LOCK_TIMEOUT}s; skipping user-list update"
+              break
+            fi
+          done
+          trap 'rmdir "${LOCK_DIR}" 2>/dev/null || true' EXIT
+
+          # Read the CURRENT list (not a saved ORIGINAL) and drop only our
+          # entry. This way concurrent jobs that added themselves while we
+          # were running keep their entries.
+          NEW_LIST=$(security list-keychain -d user | tr -d '"' | grep -vF "${SIGNING_KEYCHAIN}" | xargs || true)
+          if [[ -n "$NEW_LIST" ]]; then
+            security list-keychain -d user -s $NEW_LIST 2>/dev/null || true
+          fi
+
+          rm -f "${SIGNING_KEYCHAIN}"
+
+      # Attach the DMG to the Release FIRST (uploads.github.com path) — this is what
+      # the S3 publish pipeline consumes, so it must not depend on the flaky
+      # Actions artifact-storage upload below.
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.dmg
+
+      # Best-effort: Actions artifact storage (Azure blob) periodically stalls on
+      # self-hosted runners. It only feeds the cross-platform checksum job, so a
+      # stall must never fail the build.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: tensorcash-macos-${{ matrix.arch }}-${{ matrix.chain_type }}
+          path: dist/*.dmg
+
+  # ============================================================================
+  # Linux Build (native, Ubuntu + CentOS containers)
+  # Consistent with macOS: uses system packages + builds external deps from source
+  # ============================================================================
+  build-linux:
+    name: Linux (${{ matrix.distro }}, ${{ matrix.chain_type }})
+    runs-on: [self-hosted, linux, x64, docker]
+    container: ${{ matrix.container }}
+    needs: validate
+    if: github.event.inputs.platforms != 'macos-only' && github.event.inputs.platforms != 'windows-only'
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        chain_type: [tensor, tensor-test]
+        distro: [ubuntu, centos]
+        include:
+          - distro: ubuntu
+            container: ubuntu:22.04
+            pkg_install: |
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                git ca-certificates curl build-essential bash \
+                cmake ninja-build pkg-config \
+                autoconf automake libtool \
+                qt6-base-dev qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools libqt6svg6-dev \
+                libevent-dev libboost-all-dev libzmq3-dev libczmq-dev libqrencode-dev libsqlite3-dev \
+                libssl-dev libdbus-1-dev libzstd-dev \
+                libgl1-mesa-dev libglu1-mesa-dev \
+                libxkbcommon-dev libvulkan-dev \
+                libgmp-dev \
+                patchelf file \
+                bzip2 xz-utils python3 tor
+          - distro: centos
+            container: quay.io/centos/centos:stream9
+            pkg_install: |
+              dnf -y install epel-release
+              dnf -y install dnf-plugins-core
+              dnf config-manager --set-enabled crb || true
+              dnf -y swap curl-minimal curl --allowerasing || true
+              dnf -y install \
+                git ca-certificates gcc gcc-c++ make bash \
+                cmake ninja-build pkgconf-pkg-config \
+                autoconf automake libtool \
+                qt6-qtbase-devel qt6-qttools-devel qt6-qtsvg-devel \
+                libevent-devel boost-devel zeromq-devel cppzmq-devel qrencode-devel sqlite-devel openssl-devel \
+                dbus-devel mesa-libGL-devel mesa-libGLU-devel libzstd-devel \
+                libxkbcommon-devel vulkan-headers \
+                gmp-devel \
+                patchelf file \
+                bzip2 xz python3 tor
+
+    steps:
+      - name: Install git and bash in container
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update && apt-get install -y git git-lfs ca-certificates bash
+          elif command -v dnf >/dev/null 2>&1; then
+            dnf -y install git git-lfs ca-certificates bash
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize and update submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config --global --add safe.directory '*'
+
+          git submodule init
+
+          for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
+
+            echo "Updating submodule: $submodule"
+            git submodule update --init --recursive "$submodule"
+          done
+
+          REQUIRED_SUBMODULES=(
+            services/core-node/bcore
+            shared-utils/liboqs
+            shared-utils/secp256k1-zkp
+          )
+
+          missing=()
+          for required in "${REQUIRED_SUBMODULES[@]}"; do
+            if [[ ! -d "$required/.git" && ! -f "$required/.git" ]]; then
+              missing+=("$required")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "Required submodules missing (likely a submodule fetch or permissions error): ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Copy external dependencies into bcore
+        shell: bash
+        run: |
+          rm -rf services/core-node/bcore/src/external
+          mkdir -p services/core-node/bcore/src/external
+          cp -r shared-utils/liboqs services/core-node/bcore/src/external/
+          cp -r shared-utils/secp256k1-zkp services/core-node/bcore/src/external/
+          cp -r shared-utils/chiavdf services/core-node/bcore/src/external/ || true
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ matrix.pkg_install }}
+
+      - name: Build FlatBuffers v25.2.10 from source
+        shell: bash
+        run: |
+          FB_DIR="${{ runner.temp }}/flatbuffers"
+          rm -rf "$FB_DIR"
+          git clone --depth 1 --branch v25.2.10 https://github.com/google/flatbuffers.git "$FB_DIR"
+          cmake -S "$FB_DIR" -B "$FB_DIR/build" -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_TESTS=OFF
+          cmake --build "$FB_DIR/build" -j"$(nproc)"
+          cmake --install "$FB_DIR/build"
+          rm -rf "$FB_DIR"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.85
+          target: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            services/core-node/cosign-bridge/target/
+          key: ${{ runner.os }}-${{ matrix.distro }}-cargo-${{ hashFiles('services/core-node/cosign-bridge/Cargo.lock') }}
+
+      # --- Build external dependencies (same as macOS) ---
+      - name: Build blst library
+        shell: bash
+        run: |
+          git clone --depth 1 --branch v0.3.11 https://github.com/supranational/blst.git /tmp/blst
+          cd /tmp/blst
+          ./build.sh -O3
+          mkdir -p /usr/local/lib /usr/local/include
+          cp libblst.a /usr/local/lib/
+          # Copy headers directly to include dir (not subdirectory) for CMake to find
+          cp bindings/blst.h /usr/local/include/
+          cp bindings/blst_aux.h /usr/local/include/
+          cp bindings/*.hpp /usr/local/include/ 2>/dev/null || true
+          rm -rf /tmp/blst
+          # Verify installation
+          ls -la /usr/local/lib/libblst.a
+          ls -la /usr/local/include/blst.h
+
+      - name: Build liboqs
+        shell: bash
+        working-directory: services/core-node/bcore/src/external/liboqs
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DBUILD_SHARED_LIBS=ON \
+            -DOQS_USE_OPENSSL=OFF \
+            -DOQS_BUILD_ONLY_LIB=ON \
+            -DOQS_MINIMAL_BUILD="SIG_ml_dsa_44;SIG_ml_dsa_65;SIG_ml_dsa_87" \
+            -DOQS_ENABLE_TEST_CONSTANT_TIME=ON
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+          ldconfig || true
+          # Verify installation (may be in lib or lib64 depending on distro)
+          ls -la /usr/local/lib/liboqs* /usr/local/lib64/liboqs* 2>/dev/null || echo "WARNING: liboqs not found"
+
+      - name: Build secp256k1-zkp
+        shell: bash
+        working-directory: services/core-node/bcore/src/external/secp256k1-zkp
+        run: |
+          ./autogen.sh
+          ./configure --prefix=/usr/local \
+            --disable-shared --enable-static \
+            --with-pic \
+            --enable-experimental \
+            --enable-module-ecdh \
+            --enable-module-extrakeys \
+            --enable-module-schnorrsig \
+            --enable-module-musig \
+            --enable-module-ellswift \
+            --enable-module-ecdsa-adaptor \
+            --enable-module-recovery
+          make -j"$(nproc)"
+          make install
+          ls -la /usr/local/lib/libsecp256k1* || echo "WARNING: libsecp256k1 not found"
+
+      # --- Build cosign-bridge ---
+      - name: Build cosign-bridge
+        shell: bash
+        run: |
+          cargo build --release --manifest-path services/core-node/cosign-bridge/Cargo.toml
+
+      # --- Generate FlatBuffers ---
+      - name: Generate FlatBuffers headers
+        shell: bash
+        run: |
+          flatc --cpp -o services/core-node/bcore/src/rpc \
+            shared-utils/fb-schemas/proof.fbs \
+            shared-utils/fb-schemas/blockheader.fbs \
+            shared-utils/fb-schemas/validation.fbs
+
+      # --- Build TensorCash desktop (bitcoin-qt target) ---
+      - name: Configure TensorCash desktop
+        shell: bash
+        env:
+          BUILD_DIR: services/core-node/bcore/build-linux-${{ matrix.distro }}-${{ matrix.chain_type }}
+        run: |
+          set -euo pipefail
+          export PATH="/usr/lib/qt6/bin:/usr/lib64/qt6/bin:${PATH}"
+          QT_FLAG=""
+          if command -v qtpaths6 >/dev/null 2>&1; then
+            QT_PREFIX=$(qtpaths6 --install-prefix 2>/dev/null || true)
+            if [ -n "$QT_PREFIX" ]; then
+              if [ -d "${QT_PREFIX}/lib64/cmake" ]; then
+                QT_FLAG="-DCMAKE_PREFIX_PATH=${QT_PREFIX}/lib64/cmake"
+              elif [ -d "${QT_PREFIX}/lib/cmake" ]; then
+                QT_FLAG="-DCMAKE_PREFIX_PATH=${QT_PREFIX}/lib/cmake"
+              fi
+            fi
+          fi
+
+          cmake -S services/core-node/bcore -B "$BUILD_DIR" \
+            -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            -DDEFAULT_CHAIN_TYPE=${{ matrix.chain_type }} \
+            -DBUILD_DAEMON=OFF \
+            -DBUILD_CLI=ON \
+            -DBUILD_GUI=ON \
+            -DWITH_GUI=qt6 \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_BENCH=OFF \
+            -DWITH_ZMQ=ON \
+            -DENABLE_WALLET=ON \
+            -DWITH_QRENCODE=ON \
+            ${QT_FLAG}
+
+      - name: Build TensorCash desktop
+        shell: bash
+        env:
+          BUILD_DIR: services/core-node/bcore/build-linux-${{ matrix.distro }}-${{ matrix.chain_type }}
+        run: |
+          cmake --build "$BUILD_DIR" --target bitcoin-qt bitcoin-cli -j"$(nproc)"
+
+      - name: Package artifacts with linuxdeploy
+        shell: bash
+        env:
+          BUILD_DIR: services/core-node/bcore/build-linux-${{ matrix.distro }}-${{ matrix.chain_type }}
+          DIST_DIR: dist
+          CHAIN_TYPE: ${{ matrix.chain_type }}
+        run: |
+          APP_VERSION=$(grep 'CLIENT_VERSION_MAJOR' services/core-node/bcore/CMakeLists.txt | head -1 | grep -oE '[0-9]+')
+          APP_VERSION+=".$(grep 'CLIENT_VERSION_MINOR' services/core-node/bcore/CMakeLists.txt | head -1 | grep -oE '[0-9]+')"
+          APP_VERSION+=".$(grep 'CLIENT_VERSION_BUILD' services/core-node/bcore/CMakeLists.txt | head -1 | grep -oE '[0-9]+')"
+
+          # Derive names from chain type
+          if [[ "$CHAIN_TYPE" == "tensor-test" ]]; then
+            APP_LABEL="TensorCash-Testnet"
+            DIST_PREFIX="tensorcash-testnet"
+          else
+            APP_LABEL="TensorCash"
+            DIST_PREFIX="tensorcash"
+          fi
+
+          # Download linuxdeploy and Qt plugin
+          echo "Downloading linuxdeploy..."
+          curl -L -o /tmp/linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -L -o /tmp/linuxdeploy-plugin-qt https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x /tmp/linuxdeploy /tmp/linuxdeploy-plugin-qt
+
+          # Extract AppImages (can't run FUSE in container)
+          cd /tmp
+          ./linuxdeploy --appimage-extract
+          mv squashfs-root linuxdeploy-extracted
+          ./linuxdeploy-plugin-qt --appimage-extract
+          mv squashfs-root linuxdeploy-plugin-qt-extracted
+          cd -
+
+          LINUXDEPLOY=/tmp/linuxdeploy-extracted/AppRun
+          LINUXDEPLOY_PLUGIN_QT=/tmp/linuxdeploy-plugin-qt-extracted/AppRun
+
+          # Create AppDir structure
+          APPDIR="${DIST_DIR}/${APP_LABEL}.AppDir"
+          mkdir -p "${APPDIR}/usr/bin" "${APPDIR}/usr/lib" "${APPDIR}/usr/share/applications" "${APPDIR}/usr/share/icons/hicolor/256x256/apps"
+
+          # Copy main executables
+          cp "${BUILD_DIR}/bin/bitcoin-qt" "${APPDIR}/usr/bin/${APP_LABEL}"
+          cp "${BUILD_DIR}/bin/bitcoin-cli" "${APPDIR}/usr/bin/"
+          cp services/core-node/cosign-bridge/target/release/cosign-bridge "${APPDIR}/usr/bin/"
+
+          # Copy liboqs from /usr/local (linuxdeploy won't find it automatically)
+          for libdir in /usr/local/lib64 /usr/local/lib; do
+            if [[ -f "${libdir}/liboqs.so.6" ]]; then
+              cp -P "${libdir}"/liboqs.so* "${APPDIR}/usr/lib/"
+              break
+            fi
+          done
+
+          # Copy OpenGL libraries (linuxdeploy excludes these but target may not have Mesa)
+          echo "Bundling OpenGL libraries..."
+          for lib in libOpenGL.so.0 libGLX.so.0 libGLdispatch.so.0 libEGL.so.1; do
+            for libdir in /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib; do
+              if [[ -f "${libdir}/${lib}" ]]; then
+                cp -P "${libdir}/${lib}"* "${APPDIR}/usr/lib/" 2>/dev/null || true
+                break
+              fi
+            done
+          done
+
+          # Copy XCB libraries needed by Qt xcb platform plugin
+          echo "Bundling XCB libraries..."
+          for lib in libxcb-cursor.so libxcb-icccm.so libxcb-image.so libxcb-keysyms.so \
+                     libxcb-randr.so libxcb-render.so libxcb-render-util.so libxcb-shape.so \
+                     libxcb-shm.so libxcb-sync.so libxcb-xfixes.so libxcb-xkb.so libxcb-util.so \
+                     libxcb-xinput.so libxcb-glx.so libxcb.so libX11-xcb.so libX11.so \
+                     libxkbcommon.so libxkbcommon-x11.so libQt6XcbQpa.so; do
+            for libdir in /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib; do
+              # Copy the library and all its versioned variants
+              for f in "${libdir}/${lib}"*; do
+                if [[ -f "$f" && ! -f "${APPDIR}/usr/lib/$(basename "$f")" ]]; then
+                  cp -P "$f" "${APPDIR}/usr/lib/" 2>/dev/null || true
+                fi
+              done
+            done
+          done
+
+          # Create .desktop file
+          cat > "${APPDIR}/usr/share/applications/tensorcash.desktop" << 'DESKTOP'
+          [Desktop Entry]
+          Name=${APP_LABEL}
+          Exec=${APP_LABEL}
+          Icon=tensorcash
+          Type=Application
+          Categories=Finance;Network;
+          Comment=${APP_LABEL} Wallet
+          DESKTOP
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' "${APPDIR}/usr/share/applications/tensorcash.desktop"
+
+          # Copy icon (TensorCash branded, filename inherited from upstream)
+          ICON_SRC="services/core-node/bcore/src/qt/res/icons/bitcoin.png"
+          if [[ -f "$ICON_SRC" ]]; then
+            cp "$ICON_SRC" "${APPDIR}/usr/share/icons/hicolor/256x256/apps/tensorcash.png"
+          else
+            # Create a simple placeholder icon
+            convert -size 256x256 xc:orange -fill white -gravity center -pointsize 48 -annotate 0 'TC' \
+              "${APPDIR}/usr/share/icons/hicolor/256x256/apps/tensorcash.png" 2>/dev/null || \
+            echo "Warning: Could not create icon, continuing without it"
+          fi
+
+          # Symlinks for AppDir root
+          ln -sf usr/share/applications/tensorcash.desktop "${APPDIR}/tensorcash.desktop"
+          ln -sf usr/share/icons/hicolor/256x256/apps/tensorcash.png "${APPDIR}/tensorcash.png"
+
+          # Find Qt installation path for linuxdeploy-plugin-qt
+          for qtpath in /usr/lib64/qt6 /usr/lib/x86_64-linux-gnu/qt6 /usr/lib/qt6; do
+            if [[ -d "$qtpath" ]]; then
+              export QMAKE="$qtpath/bin/qmake" 2>/dev/null || true
+              export QT_PLUGIN_PATH="$qtpath/plugins"
+              break
+            fi
+          done
+
+          # Add custom library paths for linuxdeploy
+          export LD_LIBRARY_PATH="/usr/local/lib64:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+
+          # Run linuxdeploy with Qt plugin
+          echo "Running linuxdeploy..."
+          $LINUXDEPLOY \
+            --appdir "${APPDIR}" \
+            --executable "${APPDIR}/usr/bin/${APP_LABEL}" \
+            --executable "${APPDIR}/usr/bin/bitcoin-cli" \
+            --desktop-file "${APPDIR}/usr/share/applications/tensorcash.desktop" \
+            --plugin qt \
+            --output appimage || echo "linuxdeploy finished (AppImage creation may have failed, but bundling should be complete)"
+
+          # Create distribution tarball from AppDir
+          DIST_NAME="${DIST_PREFIX}-${APP_VERSION}-linux-${{ matrix.distro }}"
+          mkdir -p "${DIST_DIR}/${DIST_NAME}"
+
+          # Copy AppDir contents to distribution
+          cp -r "${APPDIR}/usr/bin" "${DIST_DIR}/${DIST_NAME}/"
+          cp -r "${APPDIR}/usr/lib" "${DIST_DIR}/${DIST_NAME}/"
+
+          # Find and copy Qt plugins (linuxdeploy may put them in different locations)
+          echo "Looking for Qt plugins in AppDir..."
+          ls -la "${APPDIR}/usr/" || true
+          PLUGINS_COPIED=false
+          for plugindir in "${APPDIR}/usr/plugins" "${APPDIR}/usr/lib/qt6/plugins" "${APPDIR}/usr/lib/plugins"; do
+            if [[ -d "$plugindir" ]]; then
+              echo "Found plugins in: $plugindir"
+              cp -r "$plugindir" "${DIST_DIR}/${DIST_NAME}/"
+              PLUGINS_COPIED=true
+              break
+            fi
+          done
+
+          # If plugins weren't bundled by linuxdeploy, copy them manually
+          if [[ "$PLUGINS_COPIED" != "true" ]] || [[ ! -f "${DIST_DIR}/${DIST_NAME}/plugins/platforms/libqxcb.so" ]]; then
+            echo "Copying Qt plugins manually..."
+            mkdir -p "${DIST_DIR}/${DIST_NAME}/plugins"
+            for qtpluginpath in /usr/lib64/qt6/plugins /usr/lib/x86_64-linux-gnu/qt6/plugins /usr/lib/qt6/plugins; do
+              if [[ -d "${qtpluginpath}/platforms" ]]; then
+                echo "Copying from: $qtpluginpath"
+                cp -r "${qtpluginpath}/platforms" "${DIST_DIR}/${DIST_NAME}/plugins/"
+                cp -r "${qtpluginpath}/platformthemes" "${DIST_DIR}/${DIST_NAME}/plugins/" 2>/dev/null || true
+                cp -r "${qtpluginpath}/imageformats" "${DIST_DIR}/${DIST_NAME}/plugins/" 2>/dev/null || true
+                cp -r "${qtpluginpath}/iconengines" "${DIST_DIR}/${DIST_NAME}/plugins/" 2>/dev/null || true
+                cp -r "${qtpluginpath}/xcbglintegrations" "${DIST_DIR}/${DIST_NAME}/plugins/" 2>/dev/null || true
+                cp -r "${qtpluginpath}/wayland-shell-integration" "${DIST_DIR}/${DIST_NAME}/plugins/" 2>/dev/null || true
+                cp -r "${qtpluginpath}/wayland-decoration-client" "${DIST_DIR}/${DIST_NAME}/plugins/" 2>/dev/null || true
+                cp -r "${qtpluginpath}/wayland-graphics-integration-client" "${DIST_DIR}/${DIST_NAME}/plugins/" 2>/dev/null || true
+                break
+              fi
+            done
+          fi
+
+          echo "Plugins directory contents:"
+          find "${DIST_DIR}/${DIST_NAME}/plugins" -type f -name "*.so" 2>/dev/null | head -20 || echo "No plugins found!"
+
+          # Rename main executable
+          mv "${DIST_DIR}/${DIST_NAME}/bin/${APP_LABEL}" "${DIST_DIR}/${DIST_NAME}/bin/${DIST_PREFIX}" || true
+
+          # Create wrapper scripts
+          cat > "${DIST_DIR}/${DIST_NAME}/${APP_LABEL}" << WRAPPER
+          #!/bin/bash
+          SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="\${SCRIPT_DIR}/lib:\${LD_LIBRARY_PATH}"
+          export QT_PLUGIN_PATH="\${SCRIPT_DIR}/plugins"
+          exec "\${SCRIPT_DIR}/bin/${DIST_PREFIX}" "\$@"
+          WRAPPER
+          sed -i 's/^          //' "${DIST_DIR}/${DIST_NAME}/${APP_LABEL}"
+          chmod +x "${DIST_DIR}/${DIST_NAME}/${APP_LABEL}"
+
+          cat > "${DIST_DIR}/${DIST_NAME}/bitcoin-cli" << 'WRAPPER'
+          #!/bin/bash
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="${SCRIPT_DIR}/lib:${LD_LIBRARY_PATH}"
+          exec "${SCRIPT_DIR}/bin/bitcoin-cli" "$@"
+          WRAPPER
+          sed -i 's/^          //' "${DIST_DIR}/${DIST_NAME}/bitcoin-cli"
+          chmod +x "${DIST_DIR}/${DIST_NAME}/bitcoin-cli"
+
+          # Copy cosign-bridge to top level
+          cp "${APPDIR}/usr/bin/cosign-bridge" "${DIST_DIR}/${DIST_NAME}/"
+
+          # Add defaults
+          mkdir -p "${DIST_DIR}/${DIST_NAME}/defaults"
+          cp packaging/common/validator-config.json "${DIST_DIR}/${DIST_NAME}/defaults/" || true
+          cp packaging/common/default-bitcoin.conf "${DIST_DIR}/${DIST_NAME}/defaults/bitcoin.conf"
+
+          # Bundle Tor binary and its shared library dependencies
+          TOR_BIN="$(command -v tor 2>/dev/null || true)"
+          if [ -n "${TOR_BIN}" ] && [ -x "${TOR_BIN}" ]; then
+            echo "Bundling Tor binary from ${TOR_BIN}..."
+            cp "${TOR_BIN}" "${DIST_DIR}/${DIST_NAME}/bin/tor"
+            chmod +x "${DIST_DIR}/${DIST_NAME}/bin/tor"
+            # Copy non-system shared libs and set rpath to find them in ../lib
+            for so in $(ldd "${TOR_BIN}" 2>/dev/null | awk '/=>/{print $3}' | grep -v '^/lib\|^/usr/lib'); do
+              so_name="$(basename "${so}")"
+              if [ ! -f "${DIST_DIR}/${DIST_NAME}/lib/${so_name}" ]; then
+                echo "  Bundling Tor dependency: ${so_name}"
+                cp "${so}" "${DIST_DIR}/${DIST_NAME}/lib/${so_name}"
+              fi
+            done
+            patchelf --set-rpath '$ORIGIN/../lib' "${DIST_DIR}/${DIST_NAME}/bin/tor" 2>/dev/null || true
+          else
+            echo "ERROR: Tor binary not found. Install tor (apt install tor) to bundle it."
+            exit 1
+          fi
+
+          echo "Bundled libraries:"
+          ls -la "${DIST_DIR}/${DIST_NAME}/lib/" | head -40 || true
+
+          tar -czf "${DIST_DIR}/${DIST_NAME}.tar.gz" -C "${DIST_DIR}" "${DIST_NAME}"
+
+      # Attach the Linux tarball to the Release directly so it no longer depends on
+      # the cross-platform aggregation job (which is the only other place Linux got
+      # published, and which has been failing).
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*linux-${{ matrix.distro }}*.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: tensorcash-linux-${{ matrix.distro }}-${{ matrix.chain_type }}
+          path: dist/*linux-${{ matrix.distro }}*.tar.gz
+
+  # ============================================================================
+  # Windows Build (cross-compile from Linux using Debian Trixie)
+  # Uses Debian Trixie for newer MinGW-w64 with complete D3D12 headers
+  # (mirrors Bitcoin Core's CI cross-compile approach)
+  # ============================================================================
+  prefetch-windows-depends:
+    name: Windows depends prefetch (cacheable)
+    runs-on: k8s-build
+    needs: validate
+    if: github.event.inputs.platforms != 'macos-only' && github.event.inputs.platforms != 'linux-only'
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize and update submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          git submodule init
+          for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
+            git submodule update --init --recursive "$submodule"
+          done
+
+      - name: Restore depends from cache
+        run: |
+          # cache volume mounted at /cache/depends by the self-hosted runner
+          if [[ -d /cache/depends/built ]]; then
+            echo "Restoring cached depends..."
+            cp -r /cache/depends/built services/core-node/bcore/depends/ 2>/dev/null || true
+            cp -r /cache/depends/sources services/core-node/bcore/depends/ 2>/dev/null || true
+          else
+            echo "No cache found, building from scratch"
+          fi
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++ libtool-bin \
+            g++-mingw-w64-x86-64-posix cmake pkg-config \
+            autoconf automake bison
+
+      - name: Build Windows depends
+        run: |
+          cd services/core-node/bcore/depends
+          make -j$(nproc) HOST=x86_64-w64-mingw32
+
+      - name: Save depends to cache
+        if: always()
+        run: |
+          echo "Saving depends to cache..."
+          mkdir -p /cache/depends
+          cp -r services/core-node/bcore/depends/built /cache/depends/ 2>/dev/null || true
+          cp -r services/core-node/bcore/depends/sources /cache/depends/ 2>/dev/null || true
+
+  build-windows:
+    name: Windows (x86_64, ${{ matrix.chain_type }})
+    runs-on: k8s-build
+    needs: [validate, prefetch-windows-depends]
+    if: github.event.inputs.platforms != 'macos-only' && github.event.inputs.platforms != 'linux-only'
+    timeout-minutes: 180
+    env:
+      BUILD_JOBS: 4
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        chain_type: [tensor, tensor-test]
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize and update submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Mark workspace as safe for git (wildcard covers submodule subdirs)
+          git config --global --add safe.directory '*'
+
+
+          # Initialize all submodules
+          git submodule init
+
+          # Update each submodule individually
+          for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
+
+            echo "Updating submodule: $submodule"
+            git submodule update --init --recursive "$submodule"
+          done
+
+          # Ensure required submodules are present; fail fast with a clear message
+          REQUIRED_SUBMODULES=(
+            services/core-node/bcore
+            shared-utils/liboqs
+            shared-utils/secp256k1-zkp
+          )
+
+          missing=()
+          for required in "${REQUIRED_SUBMODULES[@]}"; do
+            if [[ ! -d "$required/.git" && ! -f "$required/.git" ]]; then
+              missing+=("$required")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "Required submodules missing (likely a submodule fetch or permissions error): ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Copy external dependencies into bcore
+        run: |
+          # Clean stale files from previous self-hosted runner builds
+          rm -rf services/core-node/bcore/src/external
+          mkdir -p services/core-node/bcore/src/external
+          cp -r shared-utils/liboqs services/core-node/bcore/src/external/
+          cp -r shared-utils/secp256k1-zkp services/core-node/bcore/src/external/
+          cp -r shared-utils/chiavdf services/core-node/bcore/src/external/ || true
+
+      - name: Restore depends from cache
+        run: |
+          # cache volume mounted at /cache/depends by the self-hosted runner
+          if [[ -d /cache/depends/built ]]; then
+            echo "Restoring cached depends..."
+            cp -r /cache/depends/built services/core-node/bcore/depends/ 2>/dev/null || true
+            cp -r /cache/depends/sources services/core-node/bcore/depends/ 2>/dev/null || true
+          else
+            echo "No cache found, building from scratch"
+          fi
+
+      - name: Install build tools (Windows cross-compile)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++ g++-mingw-w64-x86-64-posix libtool-bin \
+            cmake pkg-config autoconf automake bison \
+            nsis python3 curl
+
+      - name: Install Rust toolchain
+        run: |
+          export RUSTUP_HOME="${HOME}/.rustup"
+          export CARGO_HOME="${HOME}/.cargo"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85
+          source "${CARGO_HOME}/env"
+          rustup target add x86_64-pc-windows-gnu
+          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> $GITHUB_ENV
+          echo "CARGO_HOME=${CARGO_HOME}" >> $GITHUB_ENV
+          echo "${CARGO_HOME}/bin" >> $GITHUB_PATH
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.22'
+          cache-dependency-path: shared-utils/kyc-prover/go.sum
+
+      - name: Build FlatBuffers v25.2.10 from source
+        run: |
+          FB_DIR="${{ runner.temp }}/flatbuffers"
+          rm -rf "$FB_DIR"
+          git clone --depth 1 --branch v25.2.10 https://github.com/google/flatbuffers.git "$FB_DIR"
+          cmake -S "$FB_DIR" -B "$FB_DIR/build" -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_TESTS=OFF
+          cmake --build "$FB_DIR/build" -j"$(nproc)"
+          sudo cmake --install "$FB_DIR/build"
+          rm -rf "$FB_DIR"
+
+      - name: Build zkprover DLL (Windows)
+        run: |
+          set -euo pipefail
+          export GOOS=windows GOARCH=amd64 CGO_ENABLED=1
+          export CC=x86_64-w64-mingw32-gcc-posix
+          export CXX=x86_64-w64-mingw32-g++-posix
+          OUT_DIR="${GITHUB_WORKSPACE}/services/core-node/bcore/depends/x86_64-w64-mingw32/lib"
+          mkdir -p "$OUT_DIR"
+          cd "${GITHUB_WORKSPACE}/shared-utils/kyc-prover/cgo"
+          go build -buildmode=c-shared -o "$PWD/zkprover.dll" .
+          cp zkprover.dll "$OUT_DIR/libzkprover.dll"
+          cp zkprover.h "$OUT_DIR/zkprover.h" || true
+
+      - name: Full Windows build (Qt GUI + cosign-bridge + installer)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x packaging/windows/build-windows.sh
+          echo "=== Host resources before Windows build ==="
+          uname -a
+          nproc
+          free -h || true
+          df -h || true
+
+          (
+            while true; do
+              echo "[heartbeat] $(date -u +%FT%TZ) windows build still running"
+              sleep 60
+            done
+          ) &
+          HEARTBEAT_PID=$!
+          cleanup() { kill "${HEARTBEAT_PID}" 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          # Build full Windows desktop distribution into ./dist (always build deps; cache speeds it up)
+          DEFAULT_CHAIN_TYPE=${{ matrix.chain_type }} \
+            packaging/windows/build-windows.sh --release --arch x86_64 --output dist 2>&1 | tee /tmp/windows-build.log
+
+      - name: Debug Windows build failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "=== Last Windows build log lines ==="
+          tail -n 200 /tmp/windows-build.log || true
+          echo "=== Host resources after failure ==="
+          free -h || true
+          df -h || true
+
+      - name: Save depends to cache
+        if: always()
+        run: |
+          echo "Saving depends to cache..."
+          mkdir -p /cache/depends
+          cp -r services/core-node/bcore/depends/built /cache/depends/ 2>/dev/null || true
+          cp -r services/core-node/bcore/depends/sources /cache/depends/ 2>/dev/null || true
+
+      - name: Upload unsigned Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: tensorcash-windows-x64-${{ matrix.chain_type }}-unsigned
+          path: |
+            dist/*.zip
+            dist/*.exe
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: tensorcash-windows-x64-${{ matrix.chain_type }}
+          path: |
+            dist/*.zip
+            dist/*.exe
+
+  # ============================================================================
+  # Windows Code Signing (runs on USB token node)
+  # ============================================================================
+  sign-windows:
+    name: Sign Windows (${{ matrix.chain_type }})
+    runs-on: k8s-sign
+    needs: build-windows
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        chain_type: [tensor, tensor-test]
+
+    steps:
+      - name: Download unsigned artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: tensorcash-windows-x64-${{ matrix.chain_type }}-unsigned
+          path: dist/
+
+      - name: Sign binaries via signing-service
+        run: |
+          set -euo pipefail
+          SIGN_DIR="/artifacts/${GITHUB_RUN_ID}-${{ matrix.chain_type }}"
+          mkdir -p "$SIGN_DIR"
+          cp dist/*.exe "$SIGN_DIR/" 2>/dev/null || true
+          cp dist/*.dll "$SIGN_DIR/" 2>/dev/null || true
+
+          echo "Files to sign:"
+          ls -la "$SIGN_DIR/"
+
+          HTTP_CODE=$(curl -sS -o /tmp/sign_response.json -w "%{http_code}" --max-time 600 \
+            -X POST "http://signing-service.code-signing.svc.cluster.local:8443/sign" \
+            -H "Content-Type: application/json" \
+            -d "{\"file\": \"${GITHUB_RUN_ID}-${{ matrix.chain_type }}\", \"batch\": true}") || true
+
+          RESPONSE=$(cat /tmp/sign_response.json 2>/dev/null || echo "no response body")
+          echo "HTTP status: ${HTTP_CODE}"
+          echo "Signing response: $RESPONSE"
+
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "::error::Signing service returned HTTP ${HTTP_CODE}: ${RESPONSE}"
+            exit 1
+          fi
+
+          # Copy signed artifacts back
+          cp "$SIGN_DIR"/*.exe dist/ 2>/dev/null || true
+          cp "$SIGN_DIR"/*.dll dist/ 2>/dev/null || true
+          rm -rf "$SIGN_DIR"
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.exe
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: tensorcash-windows-x64-${{ matrix.chain_type }}-signed
+          path: |
+            dist/*.zip
+            dist/*.exe
+
+  # ============================================================================
+  # Docker Production Image
+  # ============================================================================
+  build-docker-prod:
+    name: Docker (tor_prod)
+    runs-on: [self-hosted, linux, x64, docker]
+    needs: validate
+    timeout-minutes: 45
+
+    steps:
+      - name: Clean workspace (fix docker root-owned files)
+        run: |
+          if sudo -n true 2>/dev/null; then
+            sudo rm -rf "$GITHUB_WORKSPACE/.git" || true
+            sudo chown -R $(whoami) "$GITHUB_WORKSPACE" 2>/dev/null || true
+          else
+            # Use Docker to remove root-owned files (Docker is available on this runner)
+            docker run --rm -v "$GITHUB_WORKSPACE:/workspace" alpine sh -c "rm -rf /workspace/.git && chown -R $(id -u):$(id -g) /workspace" 2>/dev/null || true
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize and update submodules
+        run: |
+
+          # Initialize all submodules
+          git submodule init
+
+          # Update each submodule individually
+          for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
+            echo "Updating submodule: $submodule"
+            git submodule update --init --recursive "$submodule" || {
+              echo "Warning: Failed to update $submodule, continuing..."
+            }
+          done
+
+      - name: Copy external dependencies into bcore
+        run: |
+          # Clean stale files from previous self-hosted runner builds
+          rm -rf services/core-node/bcore/src/external
+          mkdir -p services/core-node/bcore/src/external
+          cp -r shared-utils/liboqs services/core-node/bcore/src/external/
+          cp -r shared-utils/secp256k1-zkp services/core-node/bcore/src/external/
+          cp -r shared-utils/chiavdf services/core-node/bcore/src/external/ || true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          name: shared-builder
+          cleanup: false
+
+      - name: Build tor_prod image (test)
+        run: |
+          docker build \
+            -f services/core-node/tor_prod.Dockerfile \
+            -t tensorcash/core-node:ci-test \
+            --target runtime \
+            . 2>&1 | tee build.log
+
+          # Check image size
+          docker images tensorcash/core-node:ci-test --format "{{.Size}}"
+
+      - name: Test container starts
+        run: |
+          # Start container with test config
+          docker run -d \
+            --name test-node \
+            -e VALIDATOR_HOST=localhost \
+            -e TEST_MODE=true \
+            tensorcash/core-node:ci-test || true
+
+          sleep 5
+          docker logs test-node 2>&1 | head -50
+          docker stop test-node || true
+          docker rm test-node || true
+
+  # ============================================================================
+  # Release — upload all platform artifacts to GitHub Release (on tags only)
+  # ============================================================================
+  release-all-platforms:
+    name: Upload All Platform Release Assets
+    runs-on: k8s-build
+    needs: [build-macos, build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: false
+
+      - name: Collect release files
+        run: |
+          mkdir -p dist
+          # macOS DMGs
+          cp release-assets/tensorcash-macos-*/*.dmg dist/ 2>/dev/null || true
+          # Linux tarballs
+          cp release-assets/tensorcash-linux-*/*.tar.gz dist/ 2>/dev/null || true
+          # Windows installers
+          cp release-assets/tensorcash-windows-*/*.exe dist/ 2>/dev/null || true
+          cp release-assets/tensorcash-windows-*/*.zip dist/ 2>/dev/null || true
+          # Generate checksums in a subshell so the cd does not leak into the
+          # commands below (otherwise `ls dist/` runs from inside dist/ -> exit 2).
+          ( cd dist && sha256sum * > SHA256SUMS 2>/dev/null || true )
+          echo "=== Release assets ==="
+          ls -lh dist/
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  # ============================================================================
+  # Summary
+  # ============================================================================
+  summary:
+    name: Build Summary
+    runs-on: k8s-build
+    needs: [build-macos, build-linux, build-windows, build-docker-prod, release-all-platforms]
+    if: always()
+
+    steps:
+      - name: Summary
+        run: |
+          echo "## Desktop Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.build-macos.result }}" == "success" ]; then
+            echo "✅ **macOS**: Build succeeded" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.build-macos.result }}" == "skipped" ]; then
+            echo "⏭️ **macOS**: Skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **macOS**: Build failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.build-windows.result }}" == "success" ]; then
+            echo "✅ **Windows**: Desktop build succeeded" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.build-windows.result }}" == "skipped" ]; then
+            echo "⏭️ **Windows**: Skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Windows**: Build failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.build-linux.result }}" == "success" ]; then
+            echo "✅ **Linux**: Desktop build succeeded" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.build-linux.result }}" == "skipped" ]; then
+            echo "⏭️ **Linux**: Skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Linux**: Build failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.build-docker-prod.result }}" == "success" ]; then
+            echo "✅ **Docker (prod)**: Image built" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Docker (prod)**: Build failed" >> $GITHUB_STEP_SUMMARY
+          fi

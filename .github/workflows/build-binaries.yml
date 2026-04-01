@@ -1,0 +1,753 @@
+name: build-binaries
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      skip_notarization:
+        description: 'Skip notarization (for testing)'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # actions/upload-artifact (toolkit#1774) cut the per-chunk upload timeout to 30s,
+  # which self-hosted runners routinely exceed at blob-upload init -> "Upload progress
+  # stalled". Restore a generous timeout (default was 5min) via the env var exposed in
+  # upload-artifact v4.6.0+ (#662).
+  ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS: "1200000"
+  ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY: "4"
+
+jobs:
+  # ===========================================================================
+  # Build llama-server with static dependencies (no Homebrew runtime deps)
+  # ===========================================================================
+  build-llama:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS / Apple Silicon (Metal)
+          - os: [self-hosted, macOS, ARM64, builder]
+            triplet: darwin-arm64
+            cmake_extra: "-DLLAMA_METAL=ON"
+          # Linux x86_64
+          - os: [self-hosted, linux, x64, docker]
+            triplet: linux-x64
+            cmake_extra: "-DGGML_NATIVE=ON"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize submodules
+        run: |
+          git submodule init
+          for sub in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
+            echo "Updating: $sub"
+            git submodule update --init --recursive "$sub" || echo "Warning: $sub failed"
+          done
+
+      # --- Build dependencies from source (macOS) ---
+      - name: Build dependencies (macOS)
+        if: startsWith(matrix.triplet, 'darwin')
+        run: |
+          set -eux
+          BUILD_DIR="${{ runner.temp }}/deps"
+          mkdir -p "$BUILD_DIR"
+
+          # Build OpenSSL static (avoid Homebrew dynamic linkage)
+          cd "$BUILD_DIR"
+          curl -sL "https://github.com/openssl/openssl/releases/download/openssl-3.4.1/openssl-3.4.1.tar.gz" | tar xz
+          cd openssl-3.4.1
+          ./Configure darwin64-arm64-cc no-shared no-tests \
+            --prefix="$BUILD_DIR/install" \
+            --openssldir="$BUILD_DIR/install/ssl"
+          make -j$(sysctl -n hw.ncpu)
+          make install_sw
+
+          # Build libzmq static
+          cd "$BUILD_DIR"
+          curl -sL "https://github.com/zeromq/libzmq/releases/download/v4.3.5/zeromq-4.3.5.tar.gz" | tar xz
+          cd zeromq-4.3.5
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$BUILD_DIR/install" \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DBUILD_SHARED=OFF \
+            -DBUILD_STATIC=ON \
+            -DWITH_DOCS=OFF \
+            -DWITH_LIBSODIUM=OFF \
+            -DWITH_TLS=OFF \
+            -DENABLE_DRAFTS=OFF \
+            -DCMAKE_OSX_ARCHITECTURES="arm64"
+          cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+          cmake --install .
+
+          # Install cppzmq headers
+          curl -sL "https://raw.githubusercontent.com/zeromq/cppzmq/v4.10.0/zmq.hpp" \
+            -o "$BUILD_DIR/install/include/zmq.hpp"
+          curl -sL "https://raw.githubusercontent.com/zeromq/cppzmq/v4.10.0/zmq_addon.hpp" \
+            -o "$BUILD_DIR/install/include/zmq_addon.hpp"
+
+          # Build flatbuffers
+          cd "$BUILD_DIR"
+          curl -sL "https://github.com/google/flatbuffers/archive/refs/tags/v25.2.10.tar.gz" | tar xz
+          cd flatbuffers-25.2.10
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$BUILD_DIR/install" \
+            -DFLATBUFFERS_BUILD_TESTS=OFF \
+            -DFLATBUFFERS_BUILD_FLATLIB=ON \
+            -DFLATBUFFERS_BUILD_FLATC=ON \
+            -DCMAKE_OSX_ARCHITECTURES="arm64"
+          cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+          cmake --install .
+
+          echo "DEPS_DIR=$BUILD_DIR/install" >> $GITHUB_ENV
+
+      # --- Install deps (Linux) ---
+      - name: Install deps (Linux)
+        if: startsWith(matrix.triplet, 'linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake curl git pkg-config \
+            libcurl4-openssl-dev libssl-dev libomp-dev \
+            libzmq3-dev
+
+          # Install to user-writable prefix (no sudo needed for cp/cmake --install)
+          DEPS_PREFIX="${{ runner.temp }}/deps-install"
+          mkdir -p "$DEPS_PREFIX/include" "$DEPS_PREFIX/lib" "$DEPS_PREFIX/bin"
+
+          # Install cppzmq (header-only) from source
+          CPPZMQ_DIR="${{ runner.temp }}/cppzmq"
+          rm -rf "$CPPZMQ_DIR"
+          git clone --depth=1 https://github.com/zeromq/cppzmq.git "$CPPZMQ_DIR"
+          cp "$CPPZMQ_DIR"/*.hpp "$DEPS_PREFIX/include/"
+
+          # FlatBuffers from source (build in runner.temp to avoid /tmp stale state)
+          FB_DIR="${{ runner.temp }}/flatbuffers"
+          rm -rf "$FB_DIR"
+          git clone --depth=1 --branch v23.5.26 https://github.com/google/flatbuffers.git "$FB_DIR"
+          cmake -S "$FB_DIR" -B "$FB_DIR/build" \
+            -DFLATBUFFERS_BUILD_TESTS=OFF \
+            -DFLATBUFFERS_BUILD_FLATLIB=ON \
+            -DFLATBUFFERS_BUILD_FLATC=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX"
+          cmake --build "$FB_DIR/build" -j$(nproc)
+          cmake --install "$FB_DIR/build"
+
+          echo "DEPS_DIR=$DEPS_PREFIX" >> $GITHUB_ENV
+
+      # --- Copy shared files to llama.cpp ---
+      - name: Prepare shared files
+        run: |
+          set -eux
+          # Copy shared headers and cpp files
+          cp shared-utils/pow-utils/*.h services/miner-api/llama.cpp/tools/server/
+          cp shared-utils/pow-utils/*.cpp services/miner-api/llama.cpp/tools/server/
+
+          # Generate FlatBuffer headers from schemas
+          "$DEPS_DIR/bin/flatc" --cpp shared-utils/fb-schemas/proof.fbs
+          "$DEPS_DIR/bin/flatc" --cpp shared-utils/fb-schemas/blockheader.fbs
+          "$DEPS_DIR/bin/flatc" --cpp shared-utils/fb-schemas/validation.fbs
+
+          # Copy generated headers to server directory
+          cp *_generated.h services/miner-api/llama.cpp/tools/server/
+
+      # --- Build llama-server ---
+      - name: Configure
+        working-directory: services/miner-api/llama.cpp
+        run: |
+          if [[ "${{ matrix.triplet }}" == darwin* ]]; then
+            # Static linking on macOS — force our static openssl, not Homebrew's
+            LINKER_FLAGS="-L$DEPS_DIR/lib -lzmq -framework CoreFoundation -framework Security"
+            EXTRA_FLAGS="-DCMAKE_FIND_LIBRARY_SUFFIXES=.a -DLLAMA_CURL=OFF"
+            EXTRA_FLAGS="$EXTRA_FLAGS -DOPENSSL_ROOT_DIR=$DEPS_DIR"
+            EXTRA_FLAGS="$EXTRA_FLAGS -DOPENSSL_CRYPTO_LIBRARY=$DEPS_DIR/lib/libcrypto.a"
+            EXTRA_FLAGS="$EXTRA_FLAGS -DOPENSSL_SSL_LIBRARY=$DEPS_DIR/lib/libssl.a"
+            EXTRA_FLAGS="$EXTRA_FLAGS -DOPENSSL_INCLUDE_DIR=$DEPS_DIR/include"
+            EXTRA_FLAGS="$EXTRA_FLAGS -DOPENSSL_USE_STATIC_LIBS=ON"
+            PREFIX_PATH="$DEPS_DIR"
+          else
+            # Linux: static linking
+            LINKER_FLAGS="-static-libgcc -static-libstdc++"
+            EXTRA_FLAGS="-DCMAKE_FIND_LIBRARY_SUFFIXES=.a;.so"
+            PREFIX_PATH="$DEPS_DIR;/usr/local"
+          fi
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_SERVER=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_PREFIX_PATH="$PREFIX_PATH" \
+            -DCMAKE_EXE_LINKER_FLAGS="$LINKER_FLAGS" \
+            $EXTRA_FLAGS \
+            ${{ matrix.cmake_extra }}
+
+      - name: Build
+        working-directory: services/miner-api/llama.cpp
+        run: cmake --build build --target llama-server --config Release -j
+
+      - name: Verify no Homebrew deps (macOS)
+        if: startsWith(matrix.triplet, 'darwin')
+        working-directory: services/miner-api/llama.cpp
+        run: |
+          echo "Checking library dependencies..."
+          otool -L build/bin/llama-server
+          if otool -L build/bin/llama-server | grep -q "/opt/homebrew\|/usr/local/Cellar"; then
+            echo "ERROR: Found Homebrew dependencies!"
+            exit 1
+          fi
+          echo "No Homebrew dependencies found"
+
+      - name: Package
+        working-directory: services/miner-api/llama.cpp
+        run: |
+          set -eux
+          mkdir -p dist
+          cp build/bin/llama-server dist/
+          # Preserve runtime dylibs when llama-server references @executable_path/libs
+          if [ -d build/bin/libs ]; then
+            cp -R build/bin/libs dist/libs
+          fi
+          # Bundle canonical chat templates alongside the binary so consumers of
+          # the standalone tarball (outside the repo) can pass
+          # --chat-template-file ./chat-templates/<name>.jinja without having to
+          # source them separately. Worker images and the desktop app pick up
+          # their own copies from the repo path; this tarball is the only
+          # release artifact that ships standalone.
+          if [ -d ../chat-templates ]; then
+            cp -R ../chat-templates dist/chat-templates
+          fi
+          tar czf llama-server-${{ matrix.triplet }}.tar.gz -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-server-${{ matrix.triplet }}
+          path: services/miner-api/llama.cpp/llama-server-${{ matrix.triplet }}.tar.gz
+
+  # ===========================================================================
+  # Bundle miner-proxy with PyInstaller (macOS only for now)
+  # ===========================================================================
+  build-miner-proxy:
+    runs-on: [self-hosted, macOS, ARM64, builder]
+
+    steps:
+      - name: Ensure tool cache directory exists
+        run: |
+          # actions/setup-python's bundled install script hardcodes /Users/runner
+          # in the hostedtoolcache path. On self-hosted runners where the user is
+          # not 'runner', create the directory so the install script can write to it.
+          if [[ ! -d /Users/runner ]]; then
+            sudo mkdir -p /Users/runner
+            sudo chown "$(whoami)" /Users/runner
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize submodules
+        run: |
+          git submodule init
+          for sub in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
+            echo "Updating: $sub"
+            git submodule update --init --recursive "$sub" || echo "Warning: $sub failed"
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip wheel setuptools
+          pip install pyinstaller
+          pip install -r services/miner-api/proxy_requirements.txt
+
+      - name: Build ChiaVDF
+        env:
+          BUILD_VDF_CLIENT: "N"
+          BUILD_VDF_BENCH: "N"
+        run: |
+          cd shared-utils/chiavdf
+          git init
+          git config user.email "build@ci"
+          git config user.name "CI Build"
+          git add .
+          git commit -m "Initial commit" || true
+          git tag -a v1.0.0 -m "Version 1.0.0" || true
+          pip install .
+
+      - name: Build flatbuffers from source
+        run: |
+          cd ${{ runner.temp }}
+          curl -sL "https://github.com/google/flatbuffers/archive/refs/tags/v23.5.26.tar.gz" | tar xz
+          cd flatbuffers-23.5.26
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/flatbuffers-install" \
+            -DFLATBUFFERS_BUILD_TESTS=OFF \
+            -DFLATBUFFERS_BUILD_FLATLIB=ON \
+            -DFLATBUFFERS_BUILD_FLATC=ON \
+            -DCMAKE_OSX_ARCHITECTURES="arm64"
+          cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+          cmake --install .
+          echo "${{ runner.temp }}/flatbuffers-install/bin" >> $GITHUB_PATH
+
+      - name: Prepare source bundle
+        run: |
+          set -eux
+          BUNDLE_SRC="${{ runner.temp }}/miner-proxy-src"
+          mkdir -p "$BUNDLE_SRC"
+
+          # Copy miner-proxy source
+          cp -r services/miner-api/src/* "$BUNDLE_SRC/"
+
+          # Copy shared utils
+          mkdir -p "$BUNDLE_SRC/utils"
+          cp shared-utils/pow-utils/pow_utils.py "$BUNDLE_SRC/utils/"
+          cp shared-utils/pow-utils/uint256_arithmetics.py "$BUNDLE_SRC/utils/"
+
+          mkdir -p "$BUNDLE_SRC/config"
+          cp shared-utils/config/constants.py "$BUNDLE_SRC/config/"
+
+          # Generate FlatBuffer Python files
+          cd "$BUNDLE_SRC"
+          flatc --python "${{ github.workspace }}/shared-utils/fb-schemas/proof.fbs"
+          flatc --python "${{ github.workspace }}/shared-utils/fb-schemas/validation.fbs"
+          flatc --python "${{ github.workspace }}/shared-utils/fb-schemas/blockheader.fbs"
+
+          echo "BUNDLE_SRC=$BUNDLE_SRC" >> $GITHUB_ENV
+
+      - name: Build with PyInstaller
+        run: |
+          cd "$BUNDLE_SRC"
+
+          pyinstaller \
+            --onefile \
+            --name miner-proxy \
+            --paths "$BUNDLE_SRC" \
+            --hidden-import aiohttp \
+            --hidden-import websockets \
+            --hidden-import zmq \
+            --hidden-import httpx \
+            --hidden-import numpy \
+            --hidden-import flatbuffers \
+            --hidden-import chiavdf \
+            --hidden-import mcp \
+            --hidden-import uvicorn \
+            --hidden-import starlette \
+            --hidden-import components.vdf_service \
+            --hidden-import components.zmq_listener \
+            --hidden-import components.proxy \
+            --hidden-import components.proxy_with_priority \
+            --hidden-import components.request_priority_manager \
+            --hidden-import components.proof_cache \
+            --hidden-import components.proof_collector \
+            --hidden-import components.model_synch \
+            --hidden-import components.context \
+            --hidden-import components.constants \
+            --hidden-import worker_client \
+            --add-data "components:components" \
+            --add-data "config:config" \
+            --add-data "utils:utils" \
+            --add-data "proof:proof" \
+            --target-arch arm64 \
+            main.py
+
+          ls -la dist/
+
+      - name: Package
+        run: |
+          mkdir -p ${{ runner.temp }}/output
+          cp "$BUNDLE_SRC/dist/miner-proxy" ${{ runner.temp }}/output/
+          tar czf miner-proxy-darwin-arm64.tar.gz -C ${{ runner.temp }}/output .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: miner-proxy-darwin-arm64
+          path: miner-proxy-darwin-arm64.tar.gz
+
+  # ===========================================================================
+  # Build TensorMiner.app and create signed/notarized DMG
+  # ===========================================================================
+  build-dmg:
+    needs: [build-llama, build-miner-proxy]
+    runs-on: [self-hosted, macOS, ARM64, builder]
+    # Apple signing/notarization secrets gated behind an admin-approved environment.
+    environment: release
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download llama-server
+        uses: actions/download-artifact@v4
+        with:
+          name: llama-server-darwin-arm64
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Download miner-proxy
+        uses: actions/download-artifact@v4
+        with:
+          name: miner-proxy-darwin-arm64
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Extract binaries
+        run: |
+          mkdir -p ${{ runner.temp }}/binaries
+          tar xzf ${{ runner.temp }}/artifacts/llama-server-darwin-arm64.tar.gz -C ${{ runner.temp }}/binaries
+          tar xzf ${{ runner.temp }}/artifacts/miner-proxy-darwin-arm64.tar.gz -C ${{ runner.temp }}/binaries
+          ls -la ${{ runner.temp }}/binaries/
+
+      - name: Import signing certificate
+        if: env.APPLE_CERTIFICATE_P12 != ''
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          # Globally unique keychain path. Even with per-runner RUNNER_TEMP,
+          # adding run-id + attempt + pid prevents any cross-job collision
+          # if a runner reuses a temp dir or N runners share a UID.
+          KEYCHAIN_PATH="${RUNNER_TEMP}/app-signing-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$$.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+
+          # Filesystem-only cleanup. Do NOT use `security delete-keychain`:
+          # it mutates the user-domain keychain search list, which is shared
+          # across concurrent runners on the same UID and races to corrupt state.
+          rm -f "${KEYCHAIN_PATH}"
+
+          # Serialize the security operations. securityd's ACL DB and chain-
+          # validation cache are process-shared; concurrent set-key-partition-list
+          # / find-identity calls have produced empty find-identity output even
+          # when `security import` succeeded. mkdir is atomic across processes.
+          LOCK_DIR="/tmp/tensorcash-keychain-setup.lock"
+          LOCK_TIMEOUT=600
+          LOCK_WAITED=0
+          while ! mkdir "${LOCK_DIR}" 2>/dev/null; do
+            sleep 5
+            LOCK_WAITED=$((LOCK_WAITED + 5))
+            if [[ ${LOCK_WAITED} -ge ${LOCK_TIMEOUT} ]]; then
+              echo "::error::Timed out waiting for keychain lock after ${LOCK_TIMEOUT}s"
+              ls -la "${LOCK_DIR}" 2>&1 || true
+              exit 1
+            fi
+          done
+          trap 'rmdir "${LOCK_DIR}" 2>/dev/null || true' EXIT
+
+          # macOS Tahoe trustd workaround — see build-desktop.yml for full rationale.
+          sudo killall -9 trustd 2>/dev/null || true
+          sleep 1
+
+          # Create temporary keychain
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          # Import certificate
+          echo "${APPLE_CERTIFICATE_P12}" | base64 --decode > "${RUNNER_TEMP}/certificate.p12"
+          security import "${RUNNER_TEMP}/certificate.p12" \
+            -P "${APPLE_CERTIFICATE_PASSWORD}" \
+            -A -t cert -f pkcs12 \
+            -k "${KEYCHAIN_PATH}"
+          rm -f "${RUNNER_TEMP}/certificate.p12"
+
+          # Allow codesign to access the keychain.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          # Apple intermediate (required for Developer ID chain validation).
+          curl -sL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o "${RUNNER_TEMP}/DeveloperIDG2CA.cer"
+          security import "${RUNNER_TEMP}/DeveloperIDG2CA.cer" -k "${KEYCHAIN_PATH}" -T /usr/bin/codesign 2>/dev/null || true
+
+          # NOTE: not importing Apple Root CA — the URL currently returns HTML,
+          # AND the root is in system roots already. See build-desktop.yml.
+
+          # Add temp keychain to user search list. Required so chain validation
+          # can locate the imported intermediate; passing -k to find-identity
+          # only constrains identity lookup, not chain building. Safe under the
+          # mkdir lock above. See build-desktop.yml for the full rationale.
+          ORIGINAL_USER_LIST=$(security list-keychain -d user | tr -d '"' | xargs)
+          security list-keychain -d user -s "${KEYCHAIN_PATH}" $ORIGINAL_USER_LIST
+
+          echo "=== All identities in temp keychain ==="
+          security find-identity "${KEYCHAIN_PATH}" || true
+          echo "=== Codesigning-valid identities (chain via user search list) ==="
+          security find-identity -v -p codesigning "${KEYCHAIN_PATH}" || true
+
+          # Use the SHA1 fingerprint as IDENTITY so codesign unambiguously
+          # selects the right cert from the user search list. See
+          # build-desktop.yml for full rationale.
+          IDENTITY_HASH=$(security find-identity -v -p codesigning "${KEYCHAIN_PATH}" | grep "Developer ID" | head -1 | awk '{print $2}' || true)
+          IDENTITY_NAME=$(security find-identity -v -p codesigning "${KEYCHAIN_PATH}" | grep "Developer ID" | head -1 | sed 's/.*"\(.*\)".*/\1/' || true)
+          if [[ -z "$IDENTITY_HASH" ]]; then
+            echo "::warning::No Developer ID identity found in certificate — falling back to ad-hoc"
+          else
+            echo "Found signing identity: ${IDENTITY_NAME} (SHA1=${IDENTITY_HASH})"
+            echo "SIGNING_IDENTITY=${IDENTITY_HASH}" >> "$GITHUB_ENV"
+          fi
+
+          echo "SIGNING_KEYCHAIN=${KEYCHAIN_PATH}" >> "$GITHUB_ENV"
+          echo "HAS_SIGNING_CERT=true" >> "$GITHUB_ENV"
+
+      - name: Build Swift app
+        run: |
+          set -eux
+          BUILD_DIR="${{ runner.temp }}/build"
+          SWIFT_SRC="deployments/desktop-app/TensorMiner"
+          SWIFT_PKG="$BUILD_DIR/swift-pkg"
+
+          mkdir -p "$SWIFT_PKG/Sources/TensorMiner"
+          cp "$SWIFT_SRC"/*.swift "$SWIFT_PKG/Sources/TensorMiner/"
+
+          # Create Package.swift
+          cat > "$SWIFT_PKG/Package.swift" << 'EOF'
+          // swift-tools-version:5.9
+          import PackageDescription
+
+          let package = Package(
+              name: "TensorMiner",
+              platforms: [.macOS(.v13)],
+              products: [
+                  .executable(name: "TensorMiner", targets: ["TensorMiner"])
+              ],
+              targets: [
+                  .executableTarget(
+                      name: "TensorMiner",
+                      path: "Sources/TensorMiner"
+                  )
+              ]
+          )
+          EOF
+
+          cd "$SWIFT_PKG"
+          swift build -c release --arch arm64
+
+          echo "SWIFT_PKG=$SWIFT_PKG" >> $GITHUB_ENV
+
+      - name: Create app bundle
+        run: |
+          set -eux
+          BUILD_DIR="${{ runner.temp }}/build"
+          APP_DIR="$BUILD_DIR/TensorMiner.app"
+          SWIFT_SRC="deployments/desktop-app/TensorMiner"
+
+          mkdir -p "$APP_DIR/Contents/MacOS"
+          mkdir -p "$APP_DIR/Contents/Resources"
+
+          # Copy executable
+          cp "$SWIFT_PKG/.build/release/TensorMiner" "$APP_DIR/Contents/MacOS/"
+
+          # Copy Info.plist
+          cp "$SWIFT_SRC/Info.plist" "$APP_DIR/Contents/"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier io.tensorcash.TensorMiner" "$APP_DIR/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable TensorMiner" "$APP_DIR/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName TensorMiner" "$APP_DIR/Contents/Info.plist"
+
+          # PkgInfo
+          echo -n "APPL????" > "$APP_DIR/Contents/PkgInfo"
+
+          # Bundle binaries
+          cp ${{ runner.temp }}/binaries/llama-server "$APP_DIR/Contents/Resources/"
+          cp ${{ runner.temp }}/binaries/miner-proxy "$APP_DIR/Contents/Resources/"
+          chmod +x "$APP_DIR/Contents/Resources/"*
+          if [ -d "${{ runner.temp }}/binaries/libs" ]; then
+            mkdir -p "$APP_DIR/Contents/Resources/libs"
+            cp -R "${{ runner.temp }}/binaries/libs/." "$APP_DIR/Contents/Resources/libs/"
+            find "$APP_DIR/Contents/Resources/libs" -type f -name "*.dylib" -exec chmod +x {} \;
+          fi
+
+          # Bundle canonical chat templates. Read by MinerService.swift:
+          # resolveChatTemplateFile() at runtime to pass --chat-template-file to
+          # llama-server for known-broken model families (community Q4 GGUFs
+          # whose embedded chat_template breaks llama.cpp's autoparser and skips
+          # the lazy PEG grammar that constrains tool_call JSON output).
+          # Source-of-truth shared with the Docker workers (llama.Dockerfile
+          # and simple-worker-cpu/Dockerfile copy the same directory).
+          if [ -d services/miner-api/chat-templates ]; then
+            mkdir -p "$APP_DIR/Contents/Resources/chat-templates"
+            cp -R services/miner-api/chat-templates/. "$APP_DIR/Contents/Resources/chat-templates/"
+            echo "Bundled chat-templates"
+          else
+            echo "::warning::services/miner-api/chat-templates not found — model families that need a canonical template override will fall back to GGUF metadata"
+          fi
+
+          echo "APP_DIR=$APP_DIR" >> $GITHUB_ENV
+
+      - name: Sign app bundle
+        run: |
+          set -eux
+          # Refresh trustd before this codesign-heavy step. macOS Tahoe trustd
+          # accumulates bad chain-validation state across many codesign calls.
+          # See build-desktop.yml setup step for full rationale.
+          sudo killall -9 trustd 2>/dev/null || true
+          sleep 1
+          ENTITLEMENTS="deployments/desktop-app/TensorMiner/TensorMiner.entitlements"
+          SIGN_ID="${SIGNING_IDENTITY:--}"  # Use Developer ID if available, otherwise ad-hoc
+
+          if [[ "$SIGN_ID" == "-" ]]; then
+            echo "::warning::No signing identity — using ad-hoc signing"
+            SIGN_OPTS=(--force --sign -)
+          else
+            SIGN_OPTS=(--force --options runtime --sign "$SIGN_ID")
+          fi
+
+          # Sign bundled dylibs first (if present)
+          if [ -d "$APP_DIR/Contents/Resources/libs" ]; then
+            while IFS= read -r dylib; do
+              codesign "${SIGN_OPTS[@]}" "$dylib"
+            done < <(find "$APP_DIR/Contents/Resources/libs" -type f -name "*.dylib" | sort)
+          fi
+
+          # Sign embedded binaries
+          for binary in "$APP_DIR/Contents/Resources/llama-server" "$APP_DIR/Contents/Resources/miner-proxy"; do
+            codesign "${SIGN_OPTS[@]}" --entitlements "$ENTITLEMENTS" "$binary"
+          done
+
+          # Sign main executable
+          codesign "${SIGN_OPTS[@]}" --entitlements "$ENTITLEMENTS" "$APP_DIR/Contents/MacOS/TensorMiner"
+
+          # Sign app bundle
+          codesign "${SIGN_OPTS[@]}" --entitlements "$ENTITLEMENTS" "$APP_DIR"
+
+          # Verify
+          codesign --verify --deep --strict "$APP_DIR" && echo "Signature OK" || echo "Signature verification had issues"
+
+      - name: Create DMG
+        run: |
+          set -eux
+          BUILD_DIR="${{ runner.temp }}/build"
+          VERSION="${GITHUB_REF_NAME:-1.0.0}"
+          VERSION="${VERSION#v}"  # Remove v prefix if present
+          VERSION="${VERSION//\//-}"  # Replace slashes with dashes (branch names)
+          DMG_PATH="$BUILD_DIR/TensorMiner-${VERSION}-arm64.dmg"
+          DMG_TEMP="$BUILD_DIR/dmg-temp"
+
+          mkdir -p "$DMG_TEMP"
+          cp -R "$APP_DIR" "$DMG_TEMP/"
+          ln -s /Applications "$DMG_TEMP/Applications"
+
+          hdiutil create \
+            -volname "TensorMiner" \
+            -srcfolder "$DMG_TEMP" \
+            -ov \
+            -format UDZO \
+            "$DMG_PATH"
+
+          # Sign DMG. Refresh trustd first — the .app sign loop above can
+          # re-poison Tahoe trustd state. See build-desktop.yml.
+          sudo killall -9 trustd 2>/dev/null || true
+          sleep 1
+          SIGN_ID="${SIGNING_IDENTITY:--}"
+          codesign --force --sign "$SIGN_ID" "$DMG_PATH"
+          codesign --verify "$DMG_PATH" && echo "DMG signature OK" || echo "DMG signature verification had issues"
+
+          echo "DMG_PATH=$DMG_PATH" >> $GITHUB_ENV
+
+      - name: Notarize DMG
+        if: env.HAS_SIGNING_CERT == 'true' && env.SIGNING_IDENTITY != '' && startsWith(github.ref, 'refs/tags/') && inputs.skip_notarization != 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -eux
+
+          # Trim trailing whitespace/newlines from secrets (GitHub UI paste artifact)
+          APPLE_APP_PASSWORD="${APPLE_APP_PASSWORD%"${APPLE_APP_PASSWORD##*[![:space:]]}"}"
+
+          xcrun notarytool submit "$DMG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --timeout 30m
+
+          # Staple
+          xcrun stapler staple "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
+
+      - name: Generate checksums
+        run: |
+          cd "$(dirname "$DMG_PATH")"
+          shasum -a 256 "$(basename "$DMG_PATH")" > "$(basename "$DMG_PATH").sha256"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: TensorMiner-dmg
+          path: |
+            ${{ env.DMG_PATH }}
+            ${{ env.DMG_PATH }}.sha256
+
+      - name: Upload release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.DMG_PATH }}
+            ${{ env.DMG_PATH }}.sha256
+
+      - name: Cleanup signing keychain
+        if: always() && env.SIGNING_KEYCHAIN != ''
+        run: |
+          set -uo pipefail
+
+          # Re-acquire the lock to safely remove our entry from the shared
+          # user keychain search list. See build-desktop.yml for full rationale.
+          LOCK_DIR="/tmp/tensorcash-keychain-setup.lock"
+          LOCK_TIMEOUT=120
+          LOCK_WAITED=0
+          while ! mkdir "${LOCK_DIR}" 2>/dev/null; do
+            sleep 2
+            LOCK_WAITED=$((LOCK_WAITED + 2))
+            if [[ ${LOCK_WAITED} -ge ${LOCK_TIMEOUT} ]]; then
+              echo "::warning::Cleanup couldn't acquire keychain lock in ${LOCK_TIMEOUT}s; skipping user-list update"
+              break
+            fi
+          done
+          trap 'rmdir "${LOCK_DIR}" 2>/dev/null || true' EXIT
+
+          NEW_LIST=$(security list-keychain -d user | tr -d '"' | grep -vF "${SIGNING_KEYCHAIN}" | xargs || true)
+          if [[ -n "$NEW_LIST" ]]; then
+            security list-keychain -d user -s $NEW_LIST 2>/dev/null || true
+          fi
+
+          rm -f "${SIGNING_KEYCHAIN}"
+
+  # ===========================================================================
+  # Upload llama-server to release (kept from original)
+  # ===========================================================================
+  release-llama:
+    needs: [build-llama]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: k8s-build
+
+    steps:
+      - name: Download all llama-server artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: llama-server-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*

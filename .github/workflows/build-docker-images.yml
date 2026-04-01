@@ -1,0 +1,673 @@
+name: build-docker-images
+
+on:
+  push:
+    tags: ["v*.*.*"]
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      cuda_versions:
+        description: 'CUDA versions to build (comma-separated). Ignored for CUDA services — CUDA is paired per vLLM version.'
+        required: false
+        default: '12.0.0,12.3.0,12.6.0,12.8.0'
+      vllm_versions:
+        description: 'VLLM versions to build (comma-separated)'
+        required: false
+        default: '0.10.0,0.16.0'
+      push_images:
+        description: 'Push images to registry'
+        required: false
+        default: 'true'
+        type: boolean
+      force_arm_cuda:
+        description: 'Force ARM64 builds for CUDA services (may fail)'
+        required: false
+        default: 'false'
+        type: boolean
+      force_arm_core_node:
+        description: 'Force ARM64 builds for core-node service'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  prepare-matrix:
+    runs-on: k8s-build
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Set up build matrix
+        id: set-matrix
+        run: |
+          # Default versions
+          CUDA_VERSIONS="${{ github.event.inputs.cuda_versions || '12.0.0,12.3.0,12.6.0,12.8.0' }}"
+          VLLM_VERSIONS="${{ github.event.inputs.vllm_versions || '0.10.0,0.16.0' }}"
+
+          # ── Version-aware CUDA pairing ──
+          # Each vLLM version only works with specific CUDA versions.
+          # v0.10: torch 2.7.1 → CUDA 12.3.0, 12.6.0
+          # v0.16: torch 2.9.1 → CUDA 12.8.0
+          cuda_for_vllm() {
+            local vllm="$1"
+            case "$vllm" in
+              0.10.*)  echo "12.3.0 12.6.0" ;;
+              0.16.*)  echo "12.8.0" ;;
+              *)       echo "12.3.0" ;;  # safe fallback
+            esac
+          }
+
+          # ── Version-aware Dockerfile selection ──
+          dockerfile_for_vllm() {
+            local service="$1" vllm="$2"
+            if [[ "$service" == "verification-api" ]]; then
+              echo "services/verification-api/generic.Dockerfile"
+            else
+              case "$vllm" in
+                0.16.*)  echo "services/miner-api/vllm_v016.Dockerfile" ;;
+                *)       echo "services/miner-api/vllm_generic.Dockerfile" ;;
+              esac
+            fi
+          }
+
+          # vLLM versions are pinned as distinct submodules (vllm-v010 / vllm-v016 /
+          # vllm-v019); each Dockerfile COPYs its own fixed path, so there is no
+          # runtime branch switching of a shared submodule.
+
+          # Convert to arrays and create matrix
+          matrix_items=()
+
+          # Services with CUDA/VLLM dependencies
+          cuda_services=("vllm-backend" "verification-api")
+
+          # Services without CUDA/VLLM dependencies
+          simple_services=("miner-proxy" "ipfs-models" "llama-backend")
+
+          # CUDA/VLLM dependent services — only valid CUDA×vLLM pairs
+          for service in "${cuda_services[@]}"; do
+            for vllm in $(echo $VLLM_VERSIONS | tr ',' ' '); do
+              valid_cudas=$(cuda_for_vllm "$vllm")
+              dockerfile=$(dockerfile_for_vllm "$service" "$vllm")
+
+              for cuda in $valid_cudas; do
+                # Build AMD64 always, ARM64 only if forced (vllm compilation often fails on ARM)
+                platforms=("linux/amd64")
+                if [[ "${{ github.event.inputs.force_arm_cuda }}" == "true" ]]; then
+                  platforms+=("linux/arm64")
+                fi
+
+                for platform in "${platforms[@]}"; do
+                  matrix_items+=("{\"service\":\"$service\",\"cuda_version\":\"$cuda\",\"vllm_version\":\"$vllm\",\"platform\":\"$platform\",\"dockerfile\":\"$dockerfile\",\"build_target\":\"\",\"fixed_tag\":\"\"}")
+                done
+              done
+            done
+          done
+          
+          # Core-node service (special handling for ARM64)
+          core_node_platforms=("linux/amd64")
+          if [[ "${{ github.event.inputs.force_arm_core_node }}" == "true" ]]; then
+            core_node_platforms+=("linux/arm64")
+          fi
+          
+          for platform in "${core_node_platforms[@]}"; do
+            dockerfile="services/core-node/tor.Dockerfile"
+            matrix_items+=("{\"service\":\"core-node\",\"cuda_version\":\"\",\"vllm_version\":\"\",\"platform\":\"$platform\",\"dockerfile\":\"$dockerfile\",\"build_target\":\"\",\"fixed_tag\":\"\"}")
+          done
+          
+          # Simple services (no CUDA/VLLM versioning, includes ARM64 by default)
+          for service in "${simple_services[@]}"; do
+            for platform in "linux/amd64" "linux/arm64"; do
+              case $service in
+                "miner-proxy")
+                  dockerfile="services/miner-api/proxy.Dockerfile"
+                  build_target=""
+                  service_cuda_version=""
+                  ;;
+                "ipfs-models")
+                  dockerfile="shared-utils/ipfs/ipfs.Dockerfile"
+                  build_target=""
+                  service_cuda_version=""
+                  ;;
+                "llama-backend")
+                  dockerfile="services/miner-api/llama.Dockerfile"
+                  build_target="llama-cpu"
+                  service_cuda_version="12.3.0"
+                  ;;
+              esac
+              matrix_items+=("{\"service\":\"$service\",\"cuda_version\":\"$service_cuda_version\",\"vllm_version\":\"\",\"platform\":\"$platform\",\"dockerfile\":\"$dockerfile\",\"build_target\":\"$build_target\",\"fixed_tag\":\"\"}")
+            done
+          done
+
+          # Additional llama.cpp variants published under the same repository.
+          matrix_items+=("{\"service\":\"llama-backend\",\"cuda_version\":\"12.3.0\",\"vllm_version\":\"\",\"platform\":\"linux/amd64\",\"dockerfile\":\"services/miner-api/llama.Dockerfile\",\"build_target\":\"model-prep\",\"fixed_tag\":\"model-prep\"}")
+          matrix_items+=("{\"service\":\"llama-backend\",\"cuda_version\":\"12.3.0\",\"vllm_version\":\"\",\"platform\":\"linux/amd64\",\"dockerfile\":\"services/miner-api/llama.Dockerfile\",\"build_target\":\"llama-cuda\",\"fixed_tag\":\"cuda\"}")
+          
+          # Create JSON matrix
+          matrix_json="{\"include\":["
+          for i in "${!matrix_items[@]}"; do
+            if [ $i -gt 0 ]; then
+              matrix_json+=","
+            fi
+            matrix_json+="${matrix_items[$i]}"
+          done
+          matrix_json+="]}"
+          
+          echo "matrix=$matrix_json" >> $GITHUB_OUTPUT
+          echo "Generated matrix: $matrix_json"
+
+  build-images:
+    needs: prepare-matrix
+    runs-on: [self-hosted, linux, x64, docker]
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    
+    permissions:
+      contents: read
+      packages: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          
+      - name: Initialize and update submodules
+        run: |
+          
+          # Initialize all submodules
+          git submodule init
+          
+          # Update each submodule individually
+          for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
+            echo "Updating submodule: $submodule"
+            git submodule update --init --recursive "$submodule" || {
+              echo "Warning: Failed to update $submodule, continuing..."
+            }
+          done
+
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          name: shared-builder
+          cleanup: false
+
+      - name: Free up disk space
+        run: |
+          # Free up disk space — use sudo only if available (self-hosted may not have it)
+          if sudo -n true 2>/dev/null; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          else
+            rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          fi
+          # Only prune dangling (untagged) images — never --all, which kills layers used by concurrent builds
+          docker image prune --force 2>/dev/null || true
+          df -h
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          service="${{ matrix.service }}"
+          platform="${{ matrix.platform }}"
+          cuda_version="${{ matrix.cuda_version }}"
+          vllm_version="${{ matrix.vllm_version }}"
+          dockerfile="${{ matrix.dockerfile }}"
+          build_target="${{ matrix.build_target }}"
+          fixed_tag="${{ matrix.fixed_tag }}"
+          
+          # Convert platform to tag-safe format
+          platform_tag=$(echo $platform | sed 's/linux\///g')
+          
+          # Base image name
+          image_name="${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${service}"
+          
+          # Generate tags based on service type
+          tags=()
+          
+          if [[ -n "$fixed_tag" ]]; then
+            tags+=("${image_name}:${fixed_tag}")
+
+            if [[ "${{ github.ref_type }}" == "tag" ]]; then
+              git_tag="${{ github.ref_name }}"
+              tags+=("${image_name}:${git_tag}-${fixed_tag}")
+            fi
+          elif [[ -n "$cuda_version" && -n "$vllm_version" ]]; then
+            # CUDA/VLLM dependent service
+            base_tag="cuda${cuda_version}-vllm${vllm_version}-${platform_tag}"
+            tags+=("${image_name}:${base_tag}")
+            
+            # Add git-based tags
+            if [[ "${{ github.ref_type }}" == "tag" ]]; then
+              git_tag="${{ github.ref_name }}"
+              tags+=("${image_name}:${git_tag}-${base_tag}")
+            fi
+            
+            if [[ "${{ github.ref_name }}" == "main" ]]; then
+              tags+=("${image_name}:latest-${base_tag}")
+            fi
+            
+          else
+            # Simple service
+            base_tag="${platform_tag}"
+            tags+=("${image_name}:${base_tag}")
+            
+            # Add git-based tags
+            if [[ "${{ github.ref_type }}" == "tag" ]]; then
+              git_tag="${{ github.ref_name }}"
+              tags+=("${image_name}:${git_tag}-${base_tag}")
+            fi
+            
+            if [[ "${{ github.ref_name }}" == "main" ]]; then
+              tags+=("${image_name}:latest-${base_tag}")
+            fi
+          fi
+          
+          # Convert array to comma-separated string
+          tag_string=$(IFS=,; echo "${tags[*]}")
+          
+          # Create unique cache scope to prevent 404 conflicts
+          dockerfile_hash=$(echo "$dockerfile" | sha256sum | cut -d' ' -f1 | head -c8)
+          cache_scope="${service}-${platform_tag}-${build_target:-default}-${cuda_version:-nocuda}-${vllm_version:-novllm}-${dockerfile_hash}"
+          
+          # Build per-platform cache tag (avoids arm64/amd64 race on same cache ref)
+          if [[ -n "$fixed_tag" ]]; then
+            cache_tag="buildcache-${platform_tag}-${fixed_tag}"
+          elif [[ -n "$cuda_version" && -n "$vllm_version" ]]; then
+            cache_tag="buildcache-${platform_tag}-cuda${cuda_version}-vllm${vllm_version}"
+          else
+            cache_tag="buildcache-${platform_tag}-${build_target:-default}"
+          fi
+
+          echo "tags=$tag_string" >> $GITHUB_OUTPUT
+          echo "image_name=$image_name" >> $GITHUB_OUTPUT
+          echo "cache_scope=$cache_scope" >> $GITHUB_OUTPUT
+          echo "cache_tag=$cache_tag" >> $GITHUB_OUTPUT
+          echo "Generated tags: $tag_string"
+          echo "Cache tag: $cache_tag"
+          echo "Cache scope: $cache_scope"
+
+      # First attempt — may fail with "failed to fetch oauth token: denied"
+      # from GHCR under concurrent buildcache writes. We retry once with a
+      # fresh registry token and warm buildkit cache below.
+      - name: Build and push Docker image
+        id: build
+        continue-on-error: true
+        uses: docker/build-push-action@v7
+        with:
+          builder: shared-builder
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          target: ${{ matrix.build_target }}
+          build-args: |
+            CUDA_VERSION=${{ matrix.cuda_version }}
+            VLLM_VERSION=${{ matrix.vllm_version }}
+          push: ${{ github.event.inputs.push_images != 'false' && (github.ref_type == 'tag' || github.ref_name == 'main' || github.event_name == 'workflow_dispatch') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.service }}
+            org.opencontainers.image.description=Mining infrastructure service: ${{ matrix.service }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ steps.meta.outputs.cache_tag }},ignore-error=true
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ steps.meta.outputs.cache_tag }},mode=max,ignore-error=true
+
+      - name: Re-login to GHCR before retry
+        if: steps.build.outcome == 'failure'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pause before retry
+        if: steps.build.outcome == 'failure'
+        run: sleep 30
+
+      - name: Build and push Docker image (retry)
+        if: steps.build.outcome == 'failure'
+        id: build_retry
+        uses: docker/build-push-action@v7
+        with:
+          builder: shared-builder
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          target: ${{ matrix.build_target }}
+          build-args: |
+            CUDA_VERSION=${{ matrix.cuda_version }}
+            VLLM_VERSION=${{ matrix.vllm_version }}
+          push: ${{ github.event.inputs.push_images != 'false' && (github.ref_type == 'tag' || github.ref_name == 'main' || github.event_name == 'workflow_dispatch') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.service }}
+            org.opencontainers.image.description=Mining infrastructure service: ${{ matrix.service }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ steps.meta.outputs.cache_tag }},ignore-error=true
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ steps.meta.outputs.cache_tag }},mode=max,ignore-error=true
+
+      - name: Fail job if retry also failed
+        if: steps.build.outcome == 'failure' && steps.build_retry.outcome == 'failure'
+        run: |
+          echo "::error::Build failed on both attempts — see build_retry step for the final error."
+          exit 1
+
+      - name: Clean up build cache
+        if: always()
+        run: |
+          # Clean up to free space for next builds
+          # Only prune dangling images — never system prune, which kills layers/volumes used by concurrent builds
+          docker image prune --force || true
+          df -h
+
+  create-manifests:
+    needs: [prepare-matrix, build-images]
+    runs-on: [self-hosted, linux, x64, docker]
+    if: github.event.inputs.push_images != 'false' && (github.ref_type == 'tag' || github.ref_name == 'main' || github.event_name == 'workflow_dispatch')
+    
+    permissions:
+      contents: read
+      packages: write
+      
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ["vllm-backend", "verification-api", "core-node", "miner-proxy", "ipfs-models", "llama-backend"]
+    
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-platform manifests
+        run: |
+          service="${{ matrix.service }}"
+          image_base="${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${service}"
+          
+          echo "Processing manifests for service: $service"
+          echo "Image base: $image_base"
+          
+          # Helper function to check if image/manifest exists
+          check_exists() {
+            local tag="$1"
+            if docker manifest inspect "$tag" >/dev/null 2>&1; then
+              return 0
+            else
+              return 1
+            fi
+          }
+          
+          # Determine service type
+          cuda_services=("vllm-backend" "verification-api")
+          is_cuda_service=false
+          for cuda_svc in "${cuda_services[@]}"; do
+            if [[ "$service" == "$cuda_svc" ]]; then
+              is_cuda_service=true
+              break
+            fi
+          done
+          
+          if [[ "$is_cuda_service" == "true" ]]; then
+            echo "🔧 Processing CUDA service: $service"
+            
+            if [[ "${{ github.event.inputs.force_arm_cuda }}" == "true" ]]; then
+              echo "ARM64 CUDA builds forced - processing multi-platform"
+              
+              for cuda in $(echo "${{ github.event.inputs.cuda_versions || '12.0.0,12.3.0,12.6.0,12.8.0' }}" | tr ',' ' '); do
+                for vllm in $(echo "${{ github.event.inputs.vllm_versions || '0.10.0,0.16.0' }}" | tr ',' ' '); do
+                  base_tag="cuda${cuda}-vllm${vllm}"
+                  
+                  # Try to create manifests, but handle failures gracefully
+                  echo "Processing: ${image_base}:${base_tag}"
+                  
+                  # Check what exists
+                  amd64_tag="${image_base}:${base_tag}-amd64"
+                  arm64_tag="${image_base}:${base_tag}-arm64"
+                  target_tag="${image_base}:${base_tag}"
+                  
+                  if check_exists "$amd64_tag" && check_exists "$arm64_tag"; then
+                    echo "Both platforms exist, creating manifest"
+                    docker buildx imagetools create --tag "$target_tag" "$amd64_tag" "$arm64_tag" || {
+                      echo "Manifest creation failed, trying individual copy"
+                      docker buildx imagetools create --tag "$target_tag" "$amd64_tag"
+                    }
+                  elif check_exists "$amd64_tag"; then
+                    echo "Only AMD64 exists, creating copy"
+                    docker buildx imagetools create --tag "$target_tag" "$amd64_tag"
+                  elif check_exists "$arm64_tag"; then
+                    echo "Only ARM64 exists, creating copy"  
+                    docker buildx imagetools create --tag "$target_tag" "$arm64_tag"
+                  else
+                    echo "No images found for $base_tag"
+                  fi
+                  
+                  # Handle git-based tags
+                  if [[ "${{ github.ref_type }}" == "tag" ]]; then
+                    git_tag="${{ github.ref_name }}"
+                    git_amd64="${image_base}:${git_tag}-${base_tag}-amd64"
+                    git_arm64="${image_base}:${git_tag}-${base_tag}-arm64" 
+                    git_target="${image_base}:${git_tag}-${base_tag}"
+                    
+                    if check_exists "$git_amd64" && check_exists "$git_arm64"; then
+                      docker buildx imagetools create --tag "$git_target" "$git_amd64" "$git_arm64" || \
+                      docker buildx imagetools create --tag "$git_target" "$git_amd64"
+                    elif check_exists "$git_amd64"; then
+                      docker buildx imagetools create --tag "$git_target" "$git_amd64"
+                    elif check_exists "$git_arm64"; then
+                      docker buildx imagetools create --tag "$git_target" "$git_arm64"
+                    fi
+                  fi
+                  
+                  if [[ "${{ github.ref_name }}" == "main" ]]; then
+                    latest_amd64="${image_base}:latest-${base_tag}-amd64"
+                    latest_arm64="${image_base}:latest-${base_tag}-arm64"
+                    latest_target="${image_base}:latest-${base_tag}"
+                    
+                    if check_exists "$latest_amd64" && check_exists "$latest_arm64"; then
+                      docker buildx imagetools create --tag "$latest_target" "$latest_amd64" "$latest_arm64" || \
+                      docker buildx imagetools create --tag "$latest_target" "$latest_amd64"
+                    elif check_exists "$latest_amd64"; then
+                      docker buildx imagetools create --tag "$latest_target" "$latest_amd64"
+                    elif check_exists "$latest_arm64"; then
+                      docker buildx imagetools create --tag "$latest_target" "$latest_arm64"
+                    fi
+                  fi
+                done
+              done
+            else
+              echo "AMD64-only CUDA builds - creating direct copies"
+              
+              for cuda in $(echo "${{ github.event.inputs.cuda_versions || '12.0.0,12.3.0,12.6.0,12.8.0' }}" | tr ',' ' '); do
+                for vllm in $(echo "${{ github.event.inputs.vllm_versions || '0.10.0,0.16.0' }}" | tr ',' ' '); do
+                  base_tag="cuda${cuda}-vllm${vllm}"
+                  amd64_tag="${image_base}:${base_tag}-amd64"
+                  target_tag="${image_base}:${base_tag}"
+                  
+                  if check_exists "$amd64_tag"; then
+                    echo "Creating AMD64 copy: $target_tag"
+                    docker buildx imagetools create --tag "$target_tag" "$amd64_tag"
+                    
+                    # Git-based tags
+                    if [[ "${{ github.ref_type }}" == "tag" ]]; then
+                      git_tag="${{ github.ref_name }}"
+                      git_amd64="${image_base}:${git_tag}-${base_tag}-amd64"
+                      git_target="${image_base}:${git_tag}-${base_tag}"
+                      if check_exists "$git_amd64"; then
+                        docker buildx imagetools create --tag "$git_target" "$git_amd64"
+                      fi
+                    fi
+                    
+                    if [[ "${{ github.ref_name }}" == "main" ]]; then
+                      latest_amd64="${image_base}:latest-${base_tag}-amd64"
+                      latest_target="${image_base}:latest-${base_tag}"
+                      if check_exists "$latest_amd64"; then
+                        docker buildx imagetools create --tag "$latest_target" "$latest_amd64"
+                      fi
+                    fi
+                  fi
+                done
+              done
+            fi
+          elif [[ "$service" == "core-node" ]]; then
+            echo "🏗️  Processing core-node service"
+            
+            # Check what platform tags exist for core-node
+            amd64_tag="${image_base}:amd64"
+            arm64_tag="${image_base}:arm64"
+            target_tag="${image_base}:latest"
+            
+            if [[ "${{ github.event.inputs.force_arm_core_node }}" == "true" ]] && check_exists "$amd64_tag" && check_exists "$arm64_tag"; then
+              echo "ARM64 core-node builds forced and both platforms exist, creating multi-platform image"
+              docker buildx imagetools create --tag "$target_tag" "$amd64_tag" "$arm64_tag" || {
+                echo "Multi-platform creation failed, using AMD64 only"
+                docker buildx imagetools create --tag "$target_tag" "$amd64_tag"
+              }
+            elif check_exists "$amd64_tag"; then
+              echo "Using AMD64 only for core-node (default behavior)"
+              docker buildx imagetools create --tag "$target_tag" "$amd64_tag"
+            elif check_exists "$arm64_tag"; then
+              echo "Only ARM64 exists for core-node, creating copy"
+              docker buildx imagetools create --tag "$target_tag" "$arm64_tag"
+            else
+              echo "No platform images found for core-node"
+            fi
+            
+            # Git-based tags for core-node
+            if [[ "${{ github.ref_type }}" == "tag" ]]; then
+              git_tag="${{ github.ref_name }}"
+              git_amd64="${image_base}:${git_tag}-amd64"
+              git_arm64="${image_base}:${git_tag}-arm64"
+              git_target="${image_base}:${git_tag}"
+              
+              if [[ "${{ github.event.inputs.force_arm_core_node }}" == "true" ]] && check_exists "$git_amd64" && check_exists "$git_arm64"; then
+                docker buildx imagetools create --tag "$git_target" "$git_amd64" "$git_arm64" || \
+                docker buildx imagetools create --tag "$git_target" "$git_amd64"
+              elif check_exists "$git_amd64"; then
+                docker buildx imagetools create --tag "$git_target" "$git_amd64"
+              elif check_exists "$git_arm64"; then
+                docker buildx imagetools create --tag "$git_target" "$git_arm64"
+              fi
+            fi
+          else
+            echo "🔨 Processing other simple service: $service"
+            
+            # Check what platform tags exist for other simple services
+            amd64_tag="${image_base}:amd64"
+            arm64_tag="${image_base}:arm64"
+            target_tag="${image_base}:latest"
+            
+            if check_exists "$amd64_tag" && check_exists "$arm64_tag"; then
+              echo "Both platforms exist, creating multi-platform image"
+              docker buildx imagetools create --tag "$target_tag" "$amd64_tag" "$arm64_tag" || {
+                echo "Multi-platform creation failed, using AMD64 only"
+                docker buildx imagetools create --tag "$target_tag" "$amd64_tag"
+              }
+            elif check_exists "$amd64_tag"; then
+              echo "Only AMD64 exists, creating copy"
+              docker buildx imagetools create --tag "$target_tag" "$amd64_tag"
+            elif check_exists "$arm64_tag"; then
+              echo "Only ARM64 exists, creating copy"
+              docker buildx imagetools create --tag "$target_tag" "$arm64_tag"
+            else
+              echo "No platform images found for $service"
+            fi
+            
+            # Git-based tags for other simple services
+            if [[ "${{ github.ref_type }}" == "tag" ]]; then
+              git_tag="${{ github.ref_name }}"
+              git_amd64="${image_base}:${git_tag}-amd64"
+              git_arm64="${image_base}:${git_tag}-arm64"
+              git_target="${image_base}:${git_tag}"
+              
+              if check_exists "$git_amd64" && check_exists "$git_arm64"; then
+                docker buildx imagetools create --tag "$git_target" "$git_amd64" "$git_arm64" || \
+                docker buildx imagetools create --tag "$git_target" "$git_amd64"
+              elif check_exists "$git_amd64"; then
+                docker buildx imagetools create --tag "$git_target" "$git_amd64"
+              elif check_exists "$git_arm64"; then
+                docker buildx imagetools create --tag "$git_target" "$git_arm64"
+              fi
+            fi
+          fi
+          
+          echo "✅ Completed manifest processing for $service"
+
+  summary:
+    needs: [prepare-matrix, build-images, create-manifests]
+    runs-on: k8s-build
+    if: always()
+    
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## Docker Image Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Ref:** ${{ github.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "**SHA:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.build-images.result }}" == "success" ]]; then
+            echo "✅ **Build Status:** SUCCESS" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Build Status:** FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [[ "${{ needs.create-manifests.result }}" == "success" ]]; then
+            echo "✅ **Manifest Status:** SUCCESS" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Manifest Status:** FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**CUDA Versions:** ${{ github.event.inputs.cuda_versions || '12.0.0,12.3.0,12.6.0,12.8.0' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**VLLM Versions:** ${{ github.event.inputs.vllm_versions || '0.10.0,0.16.0' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Built Services:**" >> $GITHUB_STEP_SUMMARY
+          echo "- vllm-backend (CUDA/VLLM versioned)" >> $GITHUB_STEP_SUMMARY
+          echo "- verification-api (CUDA/VLLM versioned)" >> $GITHUB_STEP_SUMMARY  
+          echo "- core-node (ARM64 optional)" >> $GITHUB_STEP_SUMMARY
+          echo "- miner-proxy" >> $GITHUB_STEP_SUMMARY
+          echo "- ipfs-models" >> $GITHUB_STEP_SUMMARY
+          echo "- llama-backend (CPU runtime + model-prep/cuda variant tags)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms:**" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ github.event.inputs.force_arm_cuda }}" == "true" ]]; then
+            echo "- CUDA Services: linux/amd64, linux/arm64 (ARM CUDA forced)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- CUDA Services: linux/amd64 only" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [[ "${{ github.event.inputs.force_arm_core_node }}" == "true" ]]; then
+            echo "- core-node: linux/amd64, linux/arm64 (ARM core-node forced)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- core-node: linux/amd64 only (default)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "- Other Services: linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Cache Fix:** Unique scopes prevent 404 BlobNotFound errors" >> $GITHUB_STEP_SUMMARY

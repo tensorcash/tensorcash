@@ -1,0 +1,84 @@
+{
+  "$schema": "https://tensorcash.io/schemas/validator-config.json",
+  "version": 1,
+  "description": "Default validator endpoints for TensorCash desktop clients",
+
+  "networks": {
+    "mainnet": {
+      "validators": [
+        {
+          "name": "TensorCash Foundation (Primary)",
+          "host": "validator-1.mainnet.tensorcash.io",
+          "pushPort": 6001,
+          "pullPort": 7001,
+          "tls": true,
+          "priority": 1
+        },
+        {
+          "name": "TensorCash Foundation (Backup)",
+          "host": "validator-2.mainnet.tensorcash.io",
+          "pushPort": 6001,
+          "pullPort": 7001,
+          "tls": true,
+          "priority": 2
+        }
+      ],
+      "healthCheck": {
+        "endpoint": "https://status.tensorcash.io/api/validators/mainnet",
+        "intervalSeconds": 300
+      }
+    },
+
+    "testnet": {
+      "validators": [
+        {
+          "name": "TensorCash Testnet Validator",
+          "host": "validator.testnet.tensorcash.io",
+          "pushPort": 16001,
+          "pullPort": 17001,
+          "tls": true,
+          "priority": 1
+        }
+      ],
+      "healthCheck": {
+        "endpoint": "https://status.tensorcash.io/api/validators/testnet",
+        "intervalSeconds": 60
+      }
+    },
+
+    "regtest": {
+      "validators": [
+        {
+          "name": "Local Mock Validator",
+          "host": "127.0.0.1",
+          "pushPort": 6001,
+          "pullPort": 7001,
+          "tls": false,
+          "priority": 1,
+          "note": "Uses -validationapi=mock by default on regtest"
+        }
+      ]
+    }
+  },
+
+  "connectionSettings": {
+    "zmq": {
+      "connectTimeoutMs": 5000,
+      "sendTimeoutMs": 30000,
+      "recvTimeoutMs": 600000,
+      "reconnectIntervalMs": 1000,
+      "maxReconnectIntervalMs": 30000
+    },
+    "tls": {
+      "verifyPeer": true,
+      "caCertBundle": "embedded"
+    }
+  },
+
+  "fallbackBehavior": {
+    "onAllValidatorsUnavailable": "queue_and_retry",
+    "maxQueuedRequests": 1000,
+    "retryIntervalSeconds": 30,
+    "showUserWarningAfterSeconds": 60
+  }
+}

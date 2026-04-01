@@ -1,0 +1,31 @@
+[submodule "services/miner-api/vllm-v010"]
+	path = services/miner-api/vllm-v010
+	url = https://github.com/tensorcash/vllm.git
+	branch = feature/pow-on-v0.10
+[submodule "services/miner-api/vllm-v016"]
+	path = services/miner-api/vllm-v016
+	url = https://github.com/tensorcash/vllm.git
+	branch = feature/pow-on-v0.16
+[submodule "services/miner-api/vllm-v019"]
+	path = services/miner-api/vllm-v019
+	url = https://github.com/tensorcash/vllm.git
+	branch = feature/pow-on-v0.19
+[submodule "services/core-node/bcore"]
+	path = services/core-node/bcore
+	url = https://github.com/tensorcash/bcore.git
+[submodule "services/miner-api/llama.cpp"]
+	path = services/miner-api/llama.cpp
+	url = https://github.com/tensorcash/llama.cpp.git
+	branch = master
+[submodule "deployments/kubernetes/vllm-stack"]
+	path = deployments/kubernetes/vllm-stack
+	url = https://github.com/tensorcash/vllm-production-stack.git
+[submodule "shared-utils/secp256k1-zkp"]
+	path = shared-utils/secp256k1-zkp
+	url = https://github.com/ElementsProject/secp256k1-zkp.git
+[submodule "shared-utils/liboqs"]
+	path = shared-utils/liboqs
+	url = https://github.com/open-quantum-safe/liboqs.git
+[submodule "website"]
+	path = website
+	url = https://github.com/tensorcash/website.git

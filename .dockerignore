@@ -1,0 +1,33 @@
+# Exclude .git at any depth so nested submodule .git dirs/links don't leak
+# into the build context (ChiaVDF + vllm submodules each have their own .git,
+# and the Dockerfile's `git init && git tag v1.0.0` step fails with
+# "tag already exists" when that state leaks through).
+.git
+**/.git
+
+# Build/dev artifacts that shouldn't be shipped
+node_modules
+__pycache__
+*.pyc
+.venv
+venv
+.mypy_cache
+.pytest_cache
+.coverage*
+coverage
+.DS_Store
+
+# Heavy local build artifacts — none of these are needed by ANY of the
+# tensorcash service Dockerfiles (core-node, miner-api, miner-proxy, etc.).
+# Without these excludes the build context balloons to ~6GB and remote
+# build-context uploads over slow links hit TCP keepalive timeouts.
+services/core-node/cosign-bridge/target
+services/core-node/bcore/build
+services/core-node/bcore/build_*
+services/miner-api/target
+services/*/target
+
+# Bundled apps + sites that don't belong in any service image
+deployments/desktop-app
+website
+documentation
