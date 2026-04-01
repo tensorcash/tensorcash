@@ -1,0 +1,153 @@
+services:
+  core-node:
+    # Pre-built image from CI - manifest automatically selects architecture
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-tensorcash}/core-node:${IMAGE_TAG:-latest}
+    # Build config for local development
+    build:
+      context: ../../../
+      dockerfile: services/core-node/tor.Dockerfile
+    volumes:
+      - ${DATA_DIR:-./bcore_data}:/data:rw
+      - ${TOR_DIR:-./tor_data}:/var/lib/tor:rw          
+    environment:
+      # RPC EXPOSURE
+      WALLET_ADDRESS: "${WALLET_ADDRESS}"
+      COOKIE_FILE: "${COOKIE_FILE:-/data/caishtest/.cookie}"
+      RPC_HOST: "${RPC_HOST:-localhost}"
+      RPC_PORT: "${RPC_PORT:-18443}"
+      API_PORT: "${API_PORT:-8050}"
+      MODEL_API_KEY: "${MODEL_API_KEY:-very-secret-key}"
+      REQUIRE_AUTH: "${REQUIRE_AUTH:-true}"
+      NODE_START_FLAGS: "${NODE_START_FLAGS:---http}"
+      VALIDATOR_BASE_URL: "${VALIDATOR_BASE_URL:-http://verification-http-gateway:9000}"
+      VALIDATOR_API_KEY: "${VERIFY_SHARED_API_KEY:-very-secret-key}"
+      VALIDATOR_HTTP_TIMEOUT_MS: "${VALIDATOR_HTTP_TIMEOUT_MS:-30000}"
+
+      # ZeroMQ miner transport
+      MINER_HOST: "${MINER_HOST:-core-miner-validation-api-miner-proxy-1}"
+      MINER_PUSH_PORT: "${MINER_PUSH_PORT:-6000}"
+      MINER_PULL_BIND: "${MINER_PULL_BIND:-0.0.0.0}"
+      MINER_PULL_PORT: "${MINER_PULL_PORT:-7000}"
+
+      # Legacy validator ZMQ transport (unused when NODE_START_FLAGS=--http)
+      VALIDATOR_HOST: "${VALIDATOR_HOST:-core-miner-validation-api-verification-api-1}"
+      VALIDATOR_PUSH_PORT: "${VALIDATOR_PUSH_PORT:-6001}"
+      VALIDATOR_PULL_BIND: "${VALIDATOR_PULL_BIND:-0.0.0.0}"
+      VALIDATOR_PULL_PORT: "${VALIDATOR_PULL_PORT:-7001}"
+
+    ports:
+      - "8333:8333"
+      - "8050:8050"
+    depends_on:
+      - verification-http-gateway
+
+  verification-api:
+    # Pre-built image from CI with CUDA/VLLM versioning
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-tensorcash}/verification-api:${IMAGE_TAG:-cuda${CUDA_VERSION:-12.3.0}-vllm${VLLM_VERSION:-0.10.0}}
+    # Build config for local development
+    build:
+      context: ../../../
+      dockerfile: services/verification-api/generic.Dockerfile
+      args:
+        CUDA_VERSION: "${CUDA_VERSION:-12.3.0}"
+    platform: ${CUDA_PLATFORM:-linux/amd64}  # Force AMD64 for CUDA services
+    runtime: ${DOCKER_RUNTIME:-nvidia}              
+    volumes:
+      - ${LOGS_DATA:-./data}:/data:rw
+      - ${MODELS_DATA:-./models}:/models:rw    
+    environment:
+      # ZeroMQ
+      ZMQ_VERIFY_PULL_PORT: "${ZMQ_VERIFY_PULL_PORT:-6001}"
+      ZMQ_VERIFY_RECV_TIMEOUT_MS: "${ZMQ_VERIFY_RECV_TIMEOUT_MS:-6000000}"
+      ZMQ_VERIFY_PUSH_HOST: "${ZMQ_VERIFY_PUSH_HOST:-verification-http-gateway}"
+      ZMQ_VERIFY_PUSH_PORT: "${ZMQ_VERIFY_PUSH_PORT:-7001}"
+
+      # VDF
+      VDF_DISCRIMINANT_SIZE: "${VDF_DISCRIMINANT_SIZE:-1024}"
+      VDF_CHECKPOINT_SIZE: "${VDF_CHECKPOINT_SIZE:-32768}"
+      VDF_UPDATE_INTERVAL: "${VDF_UPDATE_INTERVAL:-0.1}"
+
+      # Logging
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_FORMAT: "${LOG_FORMAT:-'%(asctime)s - %(name)s - %(levelname)s - %(message)s'}"
+
+      # Operator review embedded HTTP server
+      OPERATOR_HTTP_PORT: "${OPERATOR_HTTP_PORT:-9090}"
+      OPERATOR_HTTP_BIND: "${OPERATOR_HTTP_BIND:-0.0.0.0}"
+      OPERATOR_API_KEY: "${OPERATOR_API_KEY:?OPERATOR_API_KEY must be set for operator review auth}"
+    ports:
+      - "${OPERATOR_HTTP_PORT:-9090}:9090"
+
+  verification-http-gateway:
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-tensorcash}/verification-api:${IMAGE_TAG:-cuda${CUDA_VERSION:-12.3.0}-vllm${VLLM_VERSION:-0.10.0}}
+    build:
+      context: ../../../
+      dockerfile: services/verification-api/generic.Dockerfile
+      args:
+        CUDA_VERSION: "${CUDA_VERSION:-12.3.0}"
+    platform: ${CUDA_PLATFORM:-linux/amd64}
+    runtime: ${DOCKER_RUNTIME:-nvidia}
+    command:
+      - uvicorn
+      - extapi_stub.app:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9000"
+    environment:
+      VERIFY_ZMQ_PUSH_ENDPOINT: "${VERIFY_ZMQ_PUSH_ENDPOINT:-tcp://verification-api:6001}"
+      VERIFY_ZMQ_PULL_BIND: "${VERIFY_ZMQ_PULL_BIND:-tcp://*:7001}"
+      VERIFY_ZMQ_TIMEOUT_MS: "${VERIFY_ZMQ_TIMEOUT_MS:-60000}"
+      VERIFY_AUTH_ENABLED: "${VERIFY_AUTH_ENABLED:-true}"
+      VERIFY_API_KEYS: "${VERIFY_SHARED_API_KEY:-very-secret-key}"
+      VERIFY_RATE_LIMIT_PER_MIN: "${VERIFY_RATE_LIMIT_PER_MIN:-5000}"
+      VERIFY_PRECHECK_ENABLED: "${VERIFY_PRECHECK_ENABLED:-false}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_FORMAT: "${LOG_FORMAT:-'%(asctime)s - %(name)s - %(levelname)s - %(message)s'}"
+    ports:
+      - "9000:9000"
+    depends_on:
+      - verification-api
+
+  ipfs-models:
+    # Pre-built image from CI - manifest automatically selects architecture
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-tensorcash}/ipfs-models:${IMAGE_TAG:-latest}
+    # Build config for local development
+    build:
+      context: ../../../
+      dockerfile: shared-utils/ipfs/ipfs.Dockerfile
+      args:
+        TARGETARCH: "${TARGETARCH:-amd64}"
+    command: ["serve-all-cached"]
+    volumes:
+      - ${MODELS_DATA:-./models}:/models:rw
+      - ${IPFS_DATA:-./ipfs-data}:/data/ipfs:rw
+    environment:
+      # Model to ensure is available
+      MODEL_NAME: "${REPO_ID:-Qwen/Qwen3-8B}"
+      MODEL_COMMIT: "${REVISION:-9c925d64d72725edaf899c6cb9c377fd0709d9c5}"
+      LOAD_FROM: "${LOAD_FROM:-local}"
+      
+      # Logging
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_FORMAT: "${LOG_FORMAT:-'%(asctime)s - %(name)s - %(levelname)s - %(message)s'}"
+    ports:
+      - "4001:4001"  # IPFS swarm
+      - "5001:5001"  # IPFS API  
+      - "8080:8080"  # IPFS gateway
+    restart: unless-stopped
+
+
+# cd build/bin && ./bitcoin-cli -datadir=/data -rpcuser=user1 -rpcpassword=pass1 createwallet "wallet1"
+# ./bitcoin-cli -datadir=/data -rpcuser=user1 -rpcpassword=pass1 getnewaddress
+# ./bitcoin-cli -datadir=/data -rpcuser=user1 -rpcpassword=pass1 startmining 
+# cait1q4ea02n4209za70gjchy84zsaf6vtgx4l5gme7e
+# cait1qdtmj6kehp0w7p9tp82n8xgy7vps8rwdt2kaxk3
+# ./bitcoin-cli -datadir=/data -rpcuser=user1 -rpcpassword=pass1 startmining cait1qfukahe4h6u37wmwlz6zfqhh8gxzc8ada258n3s
+# sudo API_KEY=super-secret-token MODEL_API_KEY=super-secret-token RPC_USER=user1 RPC_PASS=pass1 CUDA_VERSION=12.0.0 VLLM_VERSION=0.10.0 docker compose -f deployments/docker-compose/core-miner-validation-api/docker-compose.yaml up --build
+# sudo API_KEY=super-secret-token MODEL_API_KEY=super-secret-token RPC_USER=user1 RPC_PASS=pass1 \ 
+#         MODELS_DATA=$HOME/models IPFS_DATA=$HOME/models \
+#         DATA_DIR=$HOME/bcore_data TOR_DIR=$HOME/tor_data \
+#         LOGS_DATA=$HOME/pow_logs TARGETARCH=arm64\
+#         docker compose -f deployments/docker-compose/core-validation-api/docker-compose.yaml up --build

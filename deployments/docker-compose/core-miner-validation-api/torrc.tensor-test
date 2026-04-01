@@ -1,0 +1,8 @@
+SocksPort 127.0.0.1:9050
+ControlPort 127.0.0.1:9051
+CookieAuthentication 1
+DataDirectory /var/lib/tor
+
+HiddenServiceDir /var/lib/tor/tensorcash-service
+HiddenServiceVersion 3
+HiddenServicePort 29241 127.0.0.1:29241

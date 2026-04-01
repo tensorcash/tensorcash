@@ -1,0 +1,61 @@
+version: "3.8"
+
+services:
+  core-node:
+    # run_tensor_testnet.sh controls whether verification-api service is launched.
+    # Keep it false for remote verification mode.
+    # ENABLE_VERIFICATION_API=false
+    ports:
+      - "29241:29241"
+    volumes:
+      - ./torrc.tensor-test:/etc/tor/torrc:ro
+    environment:
+      COOKIE_FILE: "/data/tensor-test/.cookie"
+      RPC_PORT: "29240"
+      # # Non-mock mode without local verification-api sidecar.
+      # VALIDATION_API_MODE: "desktop"
+      # VALIDATOR_BASE_URL: "https://verify.tensorcash.org"
+      # VALIDATOR_API_KEY: "${VALIDATOR_API_KEY:?set VALIDATOR_API_KEY via env or secrets manager}"
+      # VALIDATOR_HTTP_TIMEOUT_MS: "30000"
+    # environment:
+    #   TEST_MODE: "true"
+    #   TEST_DATA_FILE: "/app/tests/test_data.json"
+
+  # verification-api:
+  #   environment:
+  #     TEST_MODE: "true"
+  #     REMOTE_VERIFY_ENABLED: "true"
+  #     REMOTE_VERIFY_BASE_URL: "https://verify.tensorcash.org"
+  #     REMOTE_VERIFY_API_KEY: "${VALIDATOR_API_KEY:?set VALIDATOR_API_KEY via env or secrets manager}"
+  #     REMOTE_VERIFY_TIMEOUT_SECONDS: "60"
+
+  # vllm-backend:
+  #   environment:
+  #     POW_PROCESSOR_MODE: "python"
+  #     POW_SAVE_TO_DISK: "true"
+
+  miner-proxy:
+    environment:
+      MODEL_API_URL: "http://core-node:8050"
+      TARGET_URL: "${TARGET_URL:-http://vllm-backend:8000}"
+      USE_VLLM_XARGS: "false"
+      # TARGET_URL: "http://vllm-backend:8000"
+      # GENESIS_GENERATOR: "True"
+      # MODEL_API_URL: "http://172.18.0.1:8051"
+      # MODEL_REQUIRE_AUTH: "false"
+      MIN_ACTIVE_REQUESTS: "8"
+      MAX_CONCURRENT_REQUESTS: "12"
+      BATCH_SIZE: "8"
+      DUMMY_REQUEST_TIMEOUT: "120"
+      MONITOR_INTERVAL: "1.0"
+      PRIORITY_MODE: "true"
+      PROOF_CACHE_ENABLED: "true"
+      PROOF_CACHE_TTL_SECONDS: "3600"
+      MINING_STALE_THRESHOLD_SECONDS: "1200"
+  #     PROOF_CACHE_ENABLED: "false"
+  #     CHIAVDF_NO_ASM: "1"
+  #     VDF_NO_ASM: "1"
+  # verification-api:
+  #   environment:
+  #     CHIAVDF_NO_ASM: "1"
+  #     VDF_NO_ASM: "1"

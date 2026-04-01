@@ -1,0 +1,103 @@
+version: "3.8"
+
+services:
+  vllm-backend:
+    # Pre-built image from CI - will be pulled by default
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-tensorcash}/vllm-backend:${IMAGE_TAG:-cuda${CUDA_VERSION:-12.3.0}-vllm${VLLM_VERSION:-0.10.0}}
+    # Build config - used when --build is specified
+    build:
+      context: ../../../
+      dockerfile: services/miner-api/vllm_generic.Dockerfile
+      args:
+        CUDA_VERSION: "${CUDA_VERSION:-12.3.0}"
+        VLLM_VERSION: "${VLLM_VERSION:-0.10.0}"      
+    platform: ${CUDA_PLATFORM:-linux/amd64}  # Force AMD64 for CUDA services
+    runtime: ${DOCKER_RUNTIME:-nvidia}
+    environment:
+      MODEL_NAME: "${MODEL_NAME:-Qwen/Qwen3-8B}"
+      MAX_MODEL_LEN: "${MAX_MODEL_LEN:-1024}"
+      API_KEY: "${API_KEY}"
+      ZMQ_PUSH_PORT: "${ZMQ_PUSH_PORT:-7000}"
+      ZMQ_PUSH_HOST: "${ZMQ_PUSH_HOST:-core-node}"
+      DEVICE: "${VLLM_DEVICE:-auto}"
+      MODEL_COMMIT: "${MODEL_COMMIT:-9c925d64d72725edaf899c6cb9c377fd0709d9c5}"   
+      # Dual-publish proofs to miner-proxy
+      POW_PROXY_ENABLE: "${POW_PROXY_ENABLE:-true}"
+      POW_PROXY_PUSH_HOST: "${POW_PROXY_PUSH_HOST:-miner-proxy}"
+      POW_PROXY_PUSH_PORT: "${POW_PROXY_PUSH_PORT:-7002}"
+      POW_SAVE_TO_DISK: "${POW_SAVE_TO_DISK:-false}"
+      # Tool calling configuration (hermes for Qwen, llama3_json for Llama)
+      ENABLE_TOOL_CHOICE: "${ENABLE_TOOL_CHOICE:-true}"
+      TOOL_CALL_PARSER: "${TOOL_CALL_PARSER:-hermes}"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${LOGS_DATA:-./data}:/data:rw
+      - ${MODELS_DATA:-./models}:/models:rw
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8000'"]
+      interval: 10s       
+      timeout: 5s         
+      retries: 20         
+      start_period: 60s  
+
+  miner-proxy:
+    # Pre-built image from CI - manifest automatically selects architecture
+    image: ${REGISTRY:-ghcr.io}/${IMAGE_PREFIX:-tensorcash}/miner-proxy:${IMAGE_TAG:-latest}
+    # Build config for local development
+    build:
+      context: ../../../
+      dockerfile: services/miner-api/proxy.Dockerfile
+    depends_on:
+      vllm-backend:
+        condition: service_healthy
+    volumes:
+      - ${LOGS_DATA:-./data}:/data:rw
+    environment:
+      # HTTP server
+      HTTP_HOST: "${HTTP_HOST:-0.0.0.0}"
+      HTTP_PORT: "${HTTP_PORT:-8080}"
+      TARGET_URL: "${TARGET_URL:-http://vllm-backend:8000/v1/completions}"
+      API_KEY: "${API_KEY}"
+
+      # ZeroMQ
+      ZMQ_PULL_PORT: "${ZMQ_PULL_PORT:-6000}"
+      ZMQ_RECV_TIMEOUT_MS: "${ZMQ_RECV_TIMEOUT_MS:-6000000}"
+      TEST_MODE: "${TEST_MODE:-true}"
+
+      # VDF
+      VDF_DISCRIMINANT_SIZE: "${VDF_DISCRIMINANT_SIZE:-1024}"
+      VDF_CHECKPOINT_SIZE: "${VDF_CHECKPOINT_SIZE:-32768}"
+      VDF_UPDATE_INTERVAL: "${VDF_UPDATE_INTERVAL:-0.1}"
+
+      # Request manager
+      MIN_ACTIVE_REQUESTS: "${MIN_ACTIVE_REQUESTS:-4}"
+      DUMMY_REQUEST_TIMEOUT: "${DUMMY_REQUEST_TIMEOUT:-300}"
+      MONITOR_INTERVAL: "${MONITOR_INTERVAL:-1.0}"
+
+      # Model API (for proxy → chain)
+      MODEL_API_URL: "${MODEL_API_URL:-http://localhost:8080}"
+      MODEL_API_KEY: "${MODEL_API_KEY:-}"
+      MODEL_REQUIRE_AUTH: "${MODEL_REQUIRE_AUTH:-false}"
+      MODEL_RETRY_ATTEMPTS: "${MODEL_RETRY_ATTEMPTS:-3}"
+      MODEL_RETRY_BACKOFF: "${MODEL_RETRY_BACKOFF:-1.0}"
+      MODEL_POLL_INTERVAL: "${MODEL_POLL_INTERVAL:-600}"
+
+      # Mining defaults
+      DEFAULT_BLOCK_HASH: "${DEFAULT_BLOCK_HASH:-0000000000000000000000000000000000000000000000000000000000000000}"
+      DEFAULT_DIFFICULTY: "${DEFAULT_DIFFICULTY:-1000000}"
+      BASE_NBITS: "${BASE_NBITS:-0x207fffff}"
+      DEFAULT_VERSION: "${DEFAULT_VERSION:-3}"
+      BATCH_SIZE: "${BATCH_SIZE:-20}"
+      GENESIS_GENERATOR: "${GENESIS_GENERATOR:-0}"
+
+      # Logging
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_FORMAT: "${LOG_FORMAT:-'%(asctime)s - %(name)s - %(levelname)s - %(message)s'}"
+      # Proof cache + collector
+      PROOF_CACHE_ENABLED: "${PROOF_CACHE_ENABLED:-true}"
+      PROOF_CACHE_TTL_SECONDS: "${PROOF_CACHE_TTL_SECONDS:-600}"
+      PROOF_CACHE_MAX_SIZE_MB: "${PROOF_CACHE_MAX_SIZE_MB:-500}"
+      PROOF_COLLECTOR_PORT: "${PROOF_COLLECTOR_PORT:-7002}"
+    ports:
+      - "8080:8080"

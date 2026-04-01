@@ -1,0 +1,61 @@
+# Simple Worker CPU: llama.cpp + miner-proxy for CPU-only testing
+# Tests the full pipeline: model download, broker registration, attestation
+#
+# Usage:
+#   1. Copy .env.example to .env and set BROKER_WS_URL + PROVIDER_JWT_TOKEN
+#   2. docker compose up -d
+
+services:
+  simple-worker-cpu:
+    image: ghcr.io/tensorcash/simple-worker-cpu:latest
+    # Or build locally (from tensorcash/ root):
+    # build:
+    #   context: ../..
+    #   dockerfile: deployments/simple-worker-cpu/Dockerfile
+
+    # NO GPU needed - this is CPU-only
+    environment:
+      # === REQUIRED: Broker Connection ===
+      BROKER_WS_URL: ${BROKER_WS_URL:?Set BROKER_WS_URL in .env}
+      PROVIDER_JWT_TOKEN: ${PROVIDER_JWT_TOKEN:?Set PROVIDER_JWT_TOKEN in .env}
+
+      # === Model Configuration (tiny model for CPU) ===
+      MODEL_NAME: ${MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}
+      MODEL_COMMIT: ${MODEL_COMMIT:-}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN:-2048}
+
+      # === Worker Capabilities (CPU) ===
+      WORKER_CAPACITY: ${WORKER_CAPACITY:-1}
+      COMPUTE_TYPE: ${COMPUTE_TYPE:-cpu}
+      GPU_MODEL: ${GPU_MODEL:-none}
+      GPU_MEMORY_GB: ${GPU_MEMORY_GB:-0}
+      WORKER_REGION: ${WORKER_REGION:-westeurope}
+      MAX_CONTEXT_WINDOW: ${MAX_CONTEXT_WINDOW:-2048}
+      MAX_OUTPUT_TOKENS: ${MAX_OUTPUT_TOKENS:-512}
+
+      # === Confidential mode ===
+      CONFIDENTIAL_MODE_ENABLED: ${CONFIDENTIAL_MODE_ENABLED:-true}
+
+      # === Internal ===
+      WORKER_MODE: broker
+      STANDALONE_MODE: "true"
+      TARGET_URL: http://127.0.0.1:8000
+      API_KEY: internal-secret
+      MINING_ENABLED: "true"
+      PROOF_CACHE_ENABLED: "true"
+
+    volumes:
+      - models-cache:/models
+      - ./logs:/var/log/supervisor
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+volumes:
+  models-cache:
