@@ -512,6 +512,89 @@ committed lot count. Redemption and unwind are permissionless (zero asset delta,
 no ICU). A permissionless mint-factory is not expressible under current asset
 rules and is out of scope for this TIP.
 
+#### Composition: piecewise-linear payoffs and non-recourse leverage (non-normative)
+
+Because each capped-spread note is one monotone ramp over a bounded interval, a
+bounded index can be partitioned into adjacent buckets, each tokenised as an
+`L`/`S` pair, and arbitrary payoff profiles assembled from the tranches. Take an
+index that trades in a six-point band, partitioned into twelve 50-bps buckets;
+each bucket `[k, k+0.5]` is a collar whose long token pays `clamp(X − k, 0, 0.5)`
+and whose short token pays the complement `clamp(k + 0.5 − X, 0, 0.5)`. Then:
+
+- Holding the **full strip** of long tranches pays `Σ clamp(X − k_i, 0, 0.5)`,
+  which is **linear in the index across the whole band and flat in each tail** — a
+  linear long exposure to the full six-point range (≈ 6 per 100 of notional) with
+  bounded tails ("linear up to the tail").
+- Holding a **single in-the-money bucket** is a 50-bps slice (≈ 0.5 per 100): a
+  capital-light, concentrated exposure.
+- Holding a **subset** synthesises directional options: the long tranches above a
+  level form a call spread struck there, and the short tranches below a level form
+  a put spread — so a long call or short put is expressed by selecting from the
+  twelve instruments.
+
+The economically important property is that this delivers **leverage without
+forced liquidation**. Each tranche is fully funded and its payout clamps to
+`[0, vault_im]`, so a holder's maximum loss equals the collateral posted at entry
+— known, bounded, and pre-funded. There is no margin account, no maintenance
+requirement, and no liquidation engine. "Leverage" here is *capital
+concentration* — funding only the buckets in the region of interest — not borrowed
+exposure. Consequently an **illiquid or manipulated oracle print cannot trigger a
+liquidation cascade**: an adverse fixing can only move settlement within the
+pre-funded band, and can never seize more than the posted collateral or force an
+early close. This is a structural departure from margin-based perpetuals, where an
+oracle touch can liquidate a position regardless of whether the move is real or
+persistent.
+
+#### Categorical / mutually-exclusive outcomes (non-normative)
+
+A market with `M` mutually-exclusive outcomes (exactly one resolves true — a
+multimodal prediction market) does **not** require `M` independent one-hot
+binaries. Built that way, each binary is its own fully-funded vault and consensus
+cannot know the outcomes are exclusive, so each locks a full unit on its losing
+side — `M` units of collateral for a payout that can never exceed one. That
+over-collateralisation is an artifact of building the outcomes independently, not
+a property of the opcode. Sharing one pot removes it, using only primitives this
+TIP already defines — **no additional opcode, reject code, or rule**.
+
+**Capital efficiency = one shared pot, not `M` pots.** Mint `M` outcome tokens
+against one unit of collateral. The complete-set identity generalises the §6.3
+`L + S = collateral` unwind from two legs to `M`: the unwind leaf carries `M`
+`OP_OUTPUTMATCH_ASSET` legs joined by `OP_VERIFY` (`M − 1` verifies), so presenting
+one of each token reclaims the unit at any time, with no fixing. A complete set is
+therefore always worth exactly one unit, and the locked collateral is one unit
+regardless of `M`.
+
+**Resolution = winner-take-all routing through a tree of digital settles.** The
+fixing is published as the winning outcome index (`scalar = j`). A single
+`OP_SCALAR_CFD_SETTLE` in mode 0 (strike-denominated) with a sufficiently large
+`lambda_q` saturates its ramp to an exact `0`/`1` step — a digital that routes the
+**whole** input to one of two legs at a threshold. Composing these as a binary
+tree of depth `⌈log₂ M⌉`, where each node's settlement output is the next node's
+vault address, routes the single unit down **only the winning path**:
+
+```
+root pot (1 unit) ── read fixing ──► whole unit to the winning child
+   ├─ outcomes 1 .. M/2   (digital settle) ─► … ─► leaf pot j   (winner)
+   └─ outcomes M/2+1 .. M (digital settle) ─► … ─► (never funded)
+```
+
+Losing branches are never funded and never spent, so there is no per-outcome
+collateral trap. Each outcome token is a claim on its leaf pot, which fills only
+if that outcome wins; the complete-set collapse reclaims the root at any time as
+the liveness backstop. The digital step is exact: with integer outcome indices and
+thresholds at half-integers, `|X − K| ≥ 0.5`, so any `lambda_q ≥ 2·K` drives
+`clamp(λ·|X − K|/K, 0, 1)` to a clean `0` or `1` with no rounding.
+
+**Cost and the one optional consensus extension.** The price of this construction
+is transaction *structure*, not consensus: settlement is a depth-`⌈log₂ M⌉` chain
+of routing spends rather than a single transaction, and the market is a tree of
+covenant addresses. The only part that would need new consensus is **single-
+transaction** `M`-way settlement (routing the pot to one of `M` legs in one
+evaluation), which is a categorical winner-take-all `payoff_mode` — a clean future
+`template_version = 0x02` leaf, not a workaround. It is optional; the log-depth
+tree above needs nothing beyond the v1 opcode, the `OP_OUTPUTMATCH_ASSET`
+complete-set leaf, and the winning-index feed.
+
 ### Source types
 
 The leaf's `source_type` selects the resolver, so one covenant, payout, and
@@ -529,6 +612,34 @@ securitisation stack serves both objective and oracle feeds:
   covenant, payout math, securitisation, or interfaces. The `source_type` byte is
   specified from day one for this reason; in v1 only `ISSUER_PUBLISHED` need be
   wired, and an unresolvable `CHAIN_INTRINSIC` leaf MUST fail closed.
+
+#### Total-return feeds and perpetual-like notes (non-normative)
+
+Carry or funding can be expressed without any additional consensus surface by
+choosing the *feed's* semantics rather than adding mechanism. If the issuer
+publishes a **total-return / carry-accumulated index** instead of a spot price, a
+single fixed-term note settles on the accumulated value, so the tokens bear carry
+with no protocol change — the carry is realised as mark-to-market in the token's
+redemption value (sold on the secondary market, or unwound as a complete set),
+not as a periodic coupon. A note with **no fixed expiry** is obtained by
+committing "settle at the latest buried epoch" rather than a fixed `fixing_ref`,
+which is still a single-shot settlement. Both reuse the existing covenant
+unchanged.
+
+Two perpetual-style variants are intentionally **out of scope** for this TIP
+because they require genuinely new mechanism:
+
+- **Path-dependent liquidation latching** — permanently knocking out a side when
+  accumulated carry exhausts it mid-life. An endpoint fixing on an accumulator is
+  path-independent and cannot reproduce this; it needs a self-rolling covenant
+  that latches the clamp each period, under a future `template_version`.
+- **Literal periodic cash distribution** to fungible holders — which requires a
+  cumulative-funding-index feed plus per-token claim accounting (a per-period pot
+  per holder does not scale), and is better specified as a separate TIP.
+
+Notably, the fully-funded design already provides the leverage that perpetuals are
+usually sought for, *without* the liquidation machinery that makes them fragile on
+illiquid oracles (see the composition note in §Securitisation).
 
 ### Interfaces
 

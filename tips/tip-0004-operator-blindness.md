@@ -19,7 +19,11 @@ the network — and the miner operating the hardware — can also read. This TIP
 frames the open research problem of **operator blindness**: deploying models
 whose inference is intelligible and useful to the requesting party, yet whose committed
 token-id footprint makes recovering the conversation's *semantic content*
-cryptographically hard or computationally expensive. It establishes a negative
+cryptographically hard or computationally expensive. Operator blindness is
+strictly stronger than hiding the on-chain commitment: the operator runs the
+forward pass, so a zero-knowledge proof — which hides only from the verifier — is
+useful for the committed-artifact half but not sufficient; the operator must
+additionally compute over data it cannot decode. It establishes a negative
 result and a positive direction. The negative result: hiding the tokenizer or
 applying orthonormal transforms and row permutations to a public embedding
 matrix is obfuscation, not confidentiality — such maps are recoverable up to,
@@ -42,6 +46,24 @@ trustlessness and also the source of a hard limitation: **a verifiable proof is,
 by construction, a readable proof.** A miner who runs the model, and every full
 node that validates the block, can reconstruct the submitted prompt and the
 model's response from the committed token ids whenever the tokenizer is known.
+
+Two facts make this a materially safer starting point than it first appears — and
+than most on-chain AI designs. First, the protocol mandates publishing only the
+*winning* inference: the proof-of-work win is inference-derived and rare, so
+consensus commits on the order of one in millions of the inferences a miner runs,
+not the whole inference space. The on-chain disclosure surface is therefore a
+sparse, randomly selected sample of traffic rather than every input and output —
+the overwhelming majority of conversations never touch the chain at all. Second,
+everything beyond that one committed sample is **operator-side**, and the operator
+surface is the miner's own to control: a miner on its own hardware, or inside a
+TEE, decides how that plaintext is handled, because the protocol forces nothing
+more than the single winning result onto the public ledger. Many on-chain AI
+paradigms instead publish, or re-execute across every node, the inputs and outputs
+of *every* inference; here the consensus-mandated surface is far smaller and the
+remainder is a private infrastructure boundary rather than a broadcast. This is a
+better baseline, not a solution: a winning inference is still committed in
+cleartext today (§1), which is exactly the residue this TIP's research aims to
+close.
 
 For a large class of intended workloads — confidential assistants, regulated or
 proprietary data, "blind"/oblivious compute markets where a buyer rents compute
@@ -88,14 +110,33 @@ context_tokens || precision)`, rebuilds the CDF from the *committed* logits, and
 checks that the claimed token is the inverse-CDF bucket for `u`. The security
 model is "publish everything needed to re-check the seeded sampling cheaply."
 
-**Threat model for blindness.** The adversary is the party that can read the
-proof: the miner operating the hardware, and any full node. Define operator
-blindness as: given the committed proof for an inference, the adversary cannot
-recover the plaintext conversation except at a work factor that is large and
-tunable. The requesting party (and any party holding the model's private decoding
-material) retains an intelligible result. Two things leak even in the limit and
-are out of scope to hide here — the *length*/step-count footprint and coarse
-timing; these are addressed only by padding/batching, not by representation.
+**Threat model.** Distinguish two adversaries of increasing power. A *chain
+observer* sees only what is committed on chain — today, the plaintext prompt and
+output token ids and the logits, and only for the rare lottery-winning inferences
+that become blocks: a sparse random sample of all inferences served, not the full
+space. A *model operator* is strictly stronger: it runs
+the forward pass, so it additionally sees the runtime inputs, outputs,
+intermediate activations and memory, and any model or codec assets loaded to
+serve the request. **Chain-observer blindness** means the committed proof reveals
+no recoverable semantics. **Operator blindness** — the target of this TIP — is the
+strictly stronger property that the party running the hardware also learns
+nothing; it is achievable only if the request reaches the operator already
+client-side-encoded and the operator never receives plaintext or the decoding
+material. The goal: the adversary cannot recover the plaintext conversation
+except at a work factor that is large and tunable, while the requesting party,
+holding the private decoding material, retains an intelligible result. Two
+channels leak regardless of representation and are out of scope — the
+*length*/step-count footprint and coarse timing — addressed only by
+padding/batching.
+
+A property to preserve. The proof-of-work win is **inference-derived**: the
+target is a double-SHA over a commitment built from the header, VDF, tick, and
+the sampled output (itself a function of the forward-pass logits), and the header
+nonce is taken from that hash (`CheckProofOfWork`, `src/validation.cpp`). A miner
+cannot grind the target without running inference, so every failed attempt costs
+a forward pass — this is what makes the work *useful*, and it must survive any
+blinding redesign. Because only a winning inference is ever committed, a blinding
+or proving scheme need apply to the winner alone, not to the discarded attempts.
 
 ### 2. Negative result: obfuscating the embedding is not confidentiality
 
@@ -128,10 +169,13 @@ decisive on why.
   remainder is a complete reconstruction pipeline against a rotated embedding.
 - **The row permutation `P` falls to frequency analysis.** Token-id frequencies
   and co-occurrence statistics are a fingerprint, exactly as letter frequencies
-  break a substitution cipher. The *ordered* BPE merge list is a ranked
-  frequency table that leaks training-data proportions (Data Mixture Inference,
-  Hayase et al., NeurIPS 2024, arXiv:2407.16607); the same signal de-anonymizes a
-  permuted vocabulary.
+  break a substitution cipher. By analogy, the *ordered* BPE merge list is a
+  ranked frequency table from which training-data proportions are recoverable
+  (Data Mixture Inference, Hayase et al., NeurIPS 2024, arXiv:2407.16607). That
+  result does not itself de-anonymize a shuffled token-id vocabulary, but it
+  illustrates the governing principle: token-frequency orderings are a recoverable
+  fingerprint, and a permutation meant to hide content must defeat exactly that
+  statistical signal over high-volume traffic.
 
 **Normative guidance.** A confidentiality scheme whose security rests solely on a
 private tokenizer, a private linear/orthonormal transform of a public embedding
@@ -149,11 +193,14 @@ narrows the attack in specific regimes but does not rehabilitate the approach as
 a confidentiality primitive: the defender cannot guarantee non-isomorphism
 without also degrading the model.
 
-### 3. Why heavyweight cryptographic hiding is not competitive
+### 3. Why cryptographic hiding is not the answer — and what zkML actually buys
 
 If obfuscation is out, the question is whether genuine reconstruction-resistance
-can be bought cryptographically at a price an open compute market will bear.
-Current evidence says no:
+can be bought cryptographically at a price an open compute market will bear. For
+the operator-blinding routes (HE, MPC) the evidence says no — they are orders of
+magnitude too slow. zkML is the instructive exception: it is feasible at scale but
+hides from the verifier rather than the operator, so it solves a different
+problem. Taken in turn:
 
 - **Homomorphic encryption (HE) of transformer inference is orders of magnitude
   slower than plaintext.** Reported costs: BOLT, BERT ≈ 185–369 s on LAN (IEEE
@@ -163,16 +210,35 @@ Current evidence says no:
 - **Secure multiparty computation (MPC) inference is in the same regime.** PUMA,
   LLaMA-7B ≈ ~5 minutes per token (arXiv:2307.12533); SecFormer improves on it
   by ~3.5× and remains seconds-to-minutes (ACL 2024).
-- **Zero-knowledge ML (zkML) is no escape — it is as expensive or worse, and
-  infeasible at state-of-the-art model sizes.** Proving a forward pass in
-  zero-knowledge carries a prover blow-up comparable to or larger than HE/MPC;
-  published zkML systems demonstrate correctness for small CNNs and sub-billion-
-  parameter networks at prover times of seconds-to-minutes per inference and
-  memory that scales with circuit size, and do not reach contemporary
-  multi-billion-parameter transformer inference at practical cost. zkML also
-  solves *verifiability under hiding* rather than confidentiality per se, so it
-  does not remove the §2/§3 cost wall; it relocates it into the prover. It is
-  recorded here as a ruled-out path, not a building block.
+- **Zero-knowledge ML (zkML) is feasible at scale, but on the wrong axis and
+  off-cadence.** Contrary to a common assumption, zkML now reaches
+  state-of-the-art models: zkLLM (Sun, Zhang et al., CCS 2024, arXiv:2404.16109)
+  proves a single 2048-token forward pass of a 13B-parameter transformer with a
+  **~188 kB proof** ("< 200 kB"), **~1–3 s** verification, and **~13 min** proving
+  on one GPU, plus a one-time **~11 MB** model-weight commitment. It does this by
+  abandoning monolithic SNARKs (Groth16/Plonk, whose per-constraint elliptic-curve
+  prover and global FFT make a 13B forward pass infeasible) for a sumcheck/GKR
+  prover — linear-time, transparent, no per-circuit trusted setup — with lookup
+  arguments (`tlookup`) and a specialised attention argument (`zkAttn`) absorbing
+  the non-linear ops that otherwise wreck arithmetic circuits. Two facts matter
+  here. First, **size is not the blocker**: a 188 kB proof sits well under the
+  consensus `MAX_POW_BLOB_SIZE` (1,000,000 bytes, `src/consensus/consensus.h`) and
+  would *replace* today's bulky cleartext logit arrays; the ~11 MB weight
+  commitment is one-time per model and belongs at model registration, never per
+  block. The difficulty predicate is likewise free — proving
+  `SHA256d(commitment) < target` is ~50–60k constraints, under one part per
+  million of a 13B forward pass, and in any case is better checked publicly on the
+  commitment *outside* the circuit. Second, **zkML buys the wrong axis**: zkLLM is
+  zero-knowledge toward the *verifier* (it hides the weights; the input is public
+  to the protocol) while the *prover* holds weights and input in plaintext to run
+  the forward pass. In a proof-of-inference network the miner is the prover and
+  runs the model, so zkML yields *chain-observer* blindness — committing a succinct
+  proof instead of plaintext token ids and logits — never *operator* blindness.
+  Its proving latency (~13 min for one pass, multiplied per decode step for an
+  autoregressive response) is also far off block cadence and off the milliseconds
+  of native inference. zkML is therefore not a building block for operator
+  blindness; it is the natural mechanism for the *commitment-side* redesign of §6,
+  and a candidate for opt-in, issuer-borne use if its latency falls.
 - **Federated / split inference is *not* a confidentiality shortcut.** Sharing
   gradients or activations leaks the inputs: Deep Leakage from Gradients
   reconstructs private data from shared gradients (Zhu et al., NeurIPS 2019,
@@ -251,26 +317,35 @@ flattening and learnability are in tension.
 forward pass over a representation that is (A) patch/entropy-budgeted so the
 committed footprint's *size and compute* track information content rather than
 token identity, and (B) entropy-equalized so the committed *symbol values*
-approach uniform and carry no exploitable frequency signal — with the
-plaintext↔representation codec held privately by the requesting party (and the
-model), never exposed to the network, so that even given the full proof an
-operator must invert a learned compressor over a
-near-uniform stream to recover semantics. The target is a *tunable work factor*
-for reconstruction, not the brittle constant-factor bump that obfuscation buys.
+approach uniform and carry no exploitable frequency signal. The confidentiality
+then hinges on one hard requirement, stated plainly: the plaintext↔representation
+codec is held **only by the requesting party**, and the served model operates
+**natively over the encoded representation** — accepting encoded input and
+emitting encoded output, with the operator never possessing plaintext or the
+codec. This is the crux and the principal open problem. If the operator (or the
+model it runs) holds the codec, the operator can decode, and only chain-observer
+blindness is achieved; operator blindness requires a model *trained to compute
+over the encoded symbols directly*, so that even given the full proof an operator
+must invert a learned compressor over a near-uniform stream to recover semantics.
+The target is a *tunable work factor* for reconstruction, not the brittle
+constant-factor bump that obfuscation buys.
 
 #### Research prospects (each to be specified in a future Standards-Track TIP)
 
 1. **Rethink what is committed on chain (longer-dated; the crux).** The lever is
-   not heavier cryptography wrapped around a fixed cleartext commitment — §3 rules
-   that out, zkML included. It is changing *what the proof commits to*. Re-express
-   the §1 replay check so the committed footprint is over compressed/entropy-coded
-   symbols rather than vocabulary token ids, with the private codec bound by a
-   hiding commitment, such that the on-chain artifact is verifiable yet carries no
-   exploitable semantic signal. Touches: proof-of-inference object and the replay
-   verifier. Open problem: the seeded-sampler replay currently needs cleartext
-   logits; a blind variant must make the same determinism checkable from a
-   commitment without revealing the logits — and must do so without falling back
-   on the infeasible zkML route.
+   not heavier cryptography wrapped around a fixed cleartext commitment — §3 shows
+   HE/MPC are non-competitive. It is changing *what the proof commits to*. A clean
+   shape: hidden inference witness → a public hiding commitment and an
+   inference-derived nonce → a public `SHA256d(commitment) < target` check that
+   consensus performs directly → a succinct proof (e.g. zkML) that the public
+   commitment came from a valid execution of the registered model. The double-SHA
+   target test should stay *outside* the proof: with a public commitment,
+   consensus hashes it directly; placing the comparison in-circuit is cheap
+   (~50–60k constraints, §3) but unnecessary unless the preimage relation must
+   itself stay hidden. Touches: proof-of-inference object and the replay verifier.
+   Caveat: this delivers chain-observer blindness only — it must be combined with
+   an operator-blinding primitive (the Property A/B native codec, or TEE) to reach
+   the goal of this TIP.
 2. **Compute-budgeted footprint (near-term, study).** Characterise, empirically,
    how much frequency signal survives in a patch-model's committed footprint, and
    whether Property A meaningfully raises attacker cost on its own (the §5 caveat
@@ -281,26 +356,38 @@ for reconstruction, not the brittle constant-factor bump that obfuscation buys.
    equal-information-window representation, and the resulting reconstruction work
    factor. Touches: model training; informs whether (1) is worth a consensus
    change.
+4. **Opt-in zk-committed inference, issuer-borne (longer-dated; contingent on zkML
+   latency falling).** Should zkML proving become cheap enough, a model issuer
+   could *opt in* to a blind, zk-committed inference mode for its model and bear
+   the extra proving cost and block-cadence latency itself, rather than imposing it
+   network-wide. This confines the off-cadence cost (§3) to the issuers who want
+   the property and leaves the default fast path unchanged. It still delivers only
+   chain-observer blindness unless paired with prospect (1)/(3). Touches: model
+   registration (a per-model mode flag and a one-time weight-commitment reference)
+   and the proof object; no change to non-participating models.
 
 ### 6. What would have to be true
 
 The cost analysis forces a single conclusion: **the viable lever is what gets
-committed on chain, not how heavily it is wrapped.** Every general-purpose
-cryptographic route that hides a cleartext commitment after the fact — HE, MPC,
-and zkML alike — is either non-competitive or infeasible at state-of-the-art
-model sizes (§3). What remains is to make the committed artifact *itself* carry
-no exploitable semantics while staying cheaply verifiable. That requires some
-cleverness in the commitment, not a heavier outer envelope.
+committed on chain, not how heavily it is wrapped.** HE and MPC remain
+non-competitive (§3). zkML is the exception worth stating precisely: it is
+*feasible* at state-of-the-art sizes (zkLLM proves a 13B model with a ~188 kB
+proof) and is the natural mechanism for the commitment-side half — but it
+delivers *chain-observer* blindness, not *operator* blindness, because the prover
+runs the model over plaintext, and its proving latency is off-cadence. So the
+on-chain commitment can be made to carry no exploitable semantics; making the
+*operator* blind is the separate, harder half.
 
-Concretely, a consensus-level blindness mechanism is only worth proposing if it
-simultaneously: (a) preserves cheap public verifiability — the determinism of
-the seeded sampler must remain checkable from whatever is committed, **without**
-the per-inference prover cost of zkML; (b) keeps the reconstruction work factor
-large and tunable under the §2 attacks applied to the *committed compressed*
-footprint; (c) stays cost-competitive with cleartext inference within a small
-constant; and (d) does not silently reintroduce a trusted third party. No known
-construction meets all four. Identifying one — by changing what the proof commits
-to — is the point of the prospects above.
+Concretely, an operator-blindness mechanism is only worth proposing if it
+simultaneously: (a) preserves cheap public verifiability — the determinism of the
+seeded sampler must remain checkable from whatever is committed, without imposing
+the per-inference, off-cadence prover cost of zkML on the default path; (b) keeps
+the reconstruction work factor large and tunable under the §2 attacks applied to
+the *committed compressed* footprint; (c) stays cost-competitive with cleartext
+inference within a small constant; and (d) keeps the operator itself blind —
+computing over encoded inputs without ever holding plaintext or the codec — which
+no purely commitment-side tool, zkML included, achieves on its own. No known
+construction meets all four. Identifying one is the point of the prospects above.
 
 ## Rationale
 
@@ -312,8 +399,11 @@ does not relearn it.
 
 TEE already exists and already solves operator confidentiality where its trust
 model is acceptable; it is described in §4 as the existing baseline, not proposed
-as research. The general-purpose cryptographic routes (HE, MPC, zkML) are
-rejected on cost and feasibility (§3), not on security.
+as research. HE and MPC are rejected on cost (§3), not on security. zkML is not
+rejected but re-scoped: it is feasible at scale and is the natural commitment-side
+mechanism (chain-observer blindness), yet it does not by itself blind the operator
+and is off-cadence — so it is treated as a building block for the on-chain half,
+optionally issuer-borne, not as the answer.
 
 The representation-level direction is chosen because it is the only avenue that
 could, in principle, deliver tunable confidentiality *without* a several-hundred-
@@ -357,6 +447,12 @@ in §5.
   mechanism must show how verification survives once the cleartext token
   ids/logits are removed; "encrypt the proof" without a replacement verification
   path silently breaks consensus checkability.
+- **A succinct proof hides from the verifier, not the prover.** zkML (e.g.
+  zkLLM) is zero-knowledge toward the chain and other nodes, but the miner
+  generating the proof holds the model and the plaintext to run the forward pass.
+  Committing a zk proof instead of cleartext tokens therefore upgrades
+  *chain-observer* confidentiality only; it MUST NOT be described as protecting
+  content from the operator.
 - **Side channels persist under any representation.** Length/step-count and
   timing footprints leak coarse information regardless of how the symbols are
   encoded; mitigations are padding/batching at the protocol layer, out of scope
@@ -382,6 +478,7 @@ verification changes.
 - Song & Raghunathan, *Information Leakage in Embedding Models*, CCS 2020, arXiv:2004.00053
 - Morris et al., *Language Model Inversion*, ICLR 2024, arXiv:2311.13647
 - Carlini et al., *Stealing Part of a Production Language Model*, ICML 2024, arXiv:2403.06634
+- Sun, Zhang et al., *zkLLM: Zero Knowledge Proofs for Large Language Models*, ACM CCS 2024, arXiv:2404.16109
 - Conneau et al., *Word Translation Without Parallel Data* (MUSE), ICLR 2018, arXiv:1710.04087
 - Artetxe et al., *A Robust Self-Learning Method for Fully Unsupervised Cross-Lingual Mappings*, ACL 2018, arXiv:1805.06297
 - Hayase et al., *Data Mixture Inference: What do BPE Tokenizers Reveal?*, NeurIPS 2024, arXiv:2407.16607
