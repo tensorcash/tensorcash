@@ -71,6 +71,9 @@ jobs:
   validate:
     name: Validate Packaging Scripts
     runs-on: [self-hosted, linux, x64, docker]
+    # Fork-PR guard: self-hosted runners must not run untrusted fork code.
+    # Whole graph hangs off validate (see ci.yml for rationale).
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
       - name: Clean workspace (fix docker root-owned files)
         run: |
@@ -1276,13 +1279,21 @@ jobs:
             --timestamp \
             "dist/${DMG_NAME}"
 
-          xcrun notarytool submit "dist/${DMG_NAME}" \
-            --apple-id "${APPLE_ID}" \
-            --password "${APPLE_APP_PASSWORD}" \
-            --team-id "${APPLE_TEAM_ID}" \
-            --wait
+          # Notarization needs the Apple notary-service credentials. When the
+          # cert is present but those secrets are unset (signing only partially
+          # configured), Developer ID sign the DMG and skip notarization rather
+          # than hard-failing on an empty-credential notarytool submit.
+          if [[ -n "${APPLE_ID}" && -n "${APPLE_APP_PASSWORD}" && -n "${APPLE_TEAM_ID}" ]]; then
+            xcrun notarytool submit "dist/${DMG_NAME}" \
+              --apple-id "${APPLE_ID}" \
+              --password "${APPLE_APP_PASSWORD}" \
+              --team-id "${APPLE_TEAM_ID}" \
+              --wait
 
-          xcrun stapler staple "dist/${DMG_NAME}"
+            xcrun stapler staple "dist/${DMG_NAME}"
+          else
+            echo "::notice::Apple notarization credentials not set — DMG is Developer ID signed but not notarized."
+          fi
 
       - name: Cleanup signing keychain
         if: always() && env.SIGNING_KEYCHAIN != ''
@@ -2275,7 +2286,7 @@ jobs:
     name: Build Summary
     runs-on: k8s-build
     needs: [build-macos, build-linux, build-windows, build-docker-prod, release-all-platforms]
-    if: always()
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
 
     steps:
       - name: Summary
