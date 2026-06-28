@@ -7,6 +7,10 @@ from vllm.sampling.pow_utils import PowState, sha256_many, _tok_le_bytes, _u32le
 from vllm.sampling.zmq_pow_writer import MiningResponseSubmitter
 from vllm.sampling.uint256_arithmetics import get_compact
 
+# tokens.min()>=0 is a per-step host sync (bool(tensor)); it's a validation guard,
+# not a correctness requirement, so it's off by default and gated behind a flag.
+_POW_DEBUG_ASSERTS = os.environ.get('POW_DEBUG_ASSERTS', '0') in ('1', 'true', 'True')
+
 class CommonSamplerHelper:
     def __init__(self, owner, proxy_audit_enabled=None):
         # owner is the sampler instance (so we can reach window_size, device, logger, etc.)
@@ -77,6 +81,12 @@ class CommonSamplerHelper:
             "ring": ring,
             "ring_pos": ring_pos,
             "ring_filled": ring_filled,
+            # #2b defer-host accounting: gen_count counts device-committed decode
+            # steps (hot path, all sampled rows); prompt_len lets the post-sync hook
+            # check gen_count == len(archive_list)-prompt_len, i.e. that every device
+            # step also produced a committed (non-discarded) archive token.
+            "gen_count": 0,
+            "prompt_len": prompt_len,
         }
         self.s.seq_caches[seq_id] = cache
 
@@ -114,7 +124,8 @@ class CommonSamplerHelper:
 
     def update_caches(self, seq_ids, tokens):
         now = time.time()
-        assert tokens.min() >= 0,   f"Negative token found: {tokens.min().item()}"
+        if _POW_DEBUG_ASSERTS:
+            assert tokens.min() >= 0, f"Negative token found: {tokens.min().item()}"
 
         toks_cpu = tokens.detach().cpu().tolist()
         max_len = 1
@@ -140,6 +151,82 @@ class CommonSamplerHelper:
         curr_page    = max_len // PAGE
         self.s.prev_max_seq_len = max_len
         return (prev_page != curr_page and max_len > 0)
+
+    def update_caches_device_only(self, seq_ids, tokens):
+        """Hot-path subset of update_caches: GPU context-ring update + host-counter
+        page-flip ONLY. No D2H copy, no archive/pad-mask/EOS/proof work — those are
+        deferrable past vLLM's own sampled_token_ids.tolist() sync. Sync-free:
+        c['ring'][pos] = tokens[i] is a GPU->GPU write. page_flip is computed from a
+        host gen-counter, but MUST match legacy update_caches exactly because it is
+        written into the proof attention_mask: legacy uses max_len = len(archive_list)
+        = prompt_len + gen_count, so we reproduce prompt_len + gen_count here (NOT
+        gen_count alone) or the proof's attention_mask would diverge. Used by the
+        POW_ABLATE_DEFER_HOST ablation and the POW_DEFER_HOST real split."""
+        now = time.time()
+        PAGE = self.s.page_size
+        max_len = 1
+        for i, sid in enumerate(seq_ids):
+            c = self.s.seq_caches.get(sid)
+            if not c: continue
+            pos = c["ring_pos"]
+            c["ring"][pos] = tokens[i]                       # GPU->GPU, no host sync
+            c["ring_pos"] = (pos + 1) % self.s.window_size
+            c["ring_filled"] = min(c["ring_filled"] + 1, self.s.window_size)
+            c["last_updated"] = now
+            gc = c.get("gen_count", 0) + 1                   # host counter, no token value
+            c["gen_count"] = gc
+            # mirror legacy len(archive_list) == prompt_len + gen_count
+            max_len = max(max_len, c.get("prompt_len", 0) + gc)
+        prev_page = self.s.prev_max_seq_len // PAGE
+        curr_page = max_len // PAGE
+        self.s.prev_max_seq_len = max_len
+        return (prev_page != curr_page and max_len > 0)
+
+    def archive_and_check_host(self, sid, toks):
+        """Deferred host-side bookkeeping for one sequence, run from the model
+        runner AFTER vLLM's own sampled_token_ids.tolist() sync on the COMMITTED
+        tokens (toks = host ints; [] rows are filtered by the caller). Does the
+        work that update_caches_device_only skipped: archive/pad-mask append, EOS
+        free, and the window-boundary proof — all host-side, no GPU D2H sync (the
+        boundary uses the host gen_count, not the GPU steps tensor). Returns True
+        if a divergence was detected (debug only)."""
+        c = self.s.seq_caches.get(sid)
+        if not c:
+            return False
+        for tok in toks:
+            c["archive_list"].append(tok)
+            c["pad_mask_list"].append(False)
+        c["last_updated"] = time.time()
+
+        diverged = False
+        if _POW_DEBUG_ASSERTS:
+            # gen_count (device, all sampled rows) must equal committed archive
+            # growth (post-sync, non-discarded rows). A mismatch means a
+            # partial-prefill row advanced the device ring/steps but not the
+            # archive => Option-A is unsafe here and full-defer (B) is required.
+            committed = len(c["archive_list"]) - c.get("prompt_len", 0)
+            gc = c.get("gen_count", committed)
+            if gc != committed:
+                diverged = True
+                self.s.logger.log(
+                    f"[pow-defer] DIVERGENCE sid={sid} gen_count={gc} "
+                    f"archive_committed={committed} (partial-prefill discard leaked "
+                    f"into device state)", "ERROR")
+
+        # EOS — host int compare, no sync
+        if toks and toks[-1] == self.s.eos_token_id:
+            self.free_sequence(sid)
+            return diverged
+
+        # window-boundary proof, triggered off the host gen_count (== device steps
+        # when no discard); process_solution reads the GPU proof buffers written in
+        # the hot path for this step.
+        gc = c.get("gen_count", 0)
+        if gc > 0 and gc % self.s.window_size == 0:
+            row = self.s.row_manager.get_row(sid)
+            if row is not None:
+                self.s._process_solution(sid, row)
+        return diverged
 
     def free_sequence(self, seq_id):
         row = self.s.row_manager.free_row(seq_id)
