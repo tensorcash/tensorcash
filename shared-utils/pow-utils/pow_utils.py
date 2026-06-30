@@ -26,10 +26,122 @@ except Exception:
             break
     from proof import Proof, FloatArray, UIntArray
 import base64
-import numpy as np 
+import numpy as np
 from collections import deque
 from pprint import pformat
 import binascii
+
+
+def proof_snapshot(proof_logits, logsumexp_full, device):
+    """Pre-temperature proof ring-buffer snapshot from full-vocab logits.
+
+    Returns (extended_logits[B,70], extended_indices[B,70], mean_tensor[B,6]):
+    top-50 logits/indices + 20 fixed-stride probes, and the 6 logsumexp stats
+    (mean[0]=logsumexp_full, mean[1:5]=top50/50:500/500:2000/2000:+ bucket means,
+    mean[5]=mean-all). Full-vocab stable descending sort.
+    """
+    B, V = proof_logits.shape
+    probe_step = V // 20
+    probe_indices_list = torch.arange(0, V, probe_step, device=device)[:20]
+    probe_logits = proof_logits.gather(
+        1, probe_indices_list.unsqueeze(0).expand(B, -1))
+    probe_idx_row = probe_indices_list.unsqueeze(0).expand(B, -1).to(torch.int32)
+
+    sl, si = torch.sort(proof_logits, dim=-1, descending=True, stable=True)
+    topk_vals = sl[:, :50]
+    topk_idx = si[:, :50]
+    mean_tensor = torch.zeros((B, 6), dtype=torch.float32, device=device)
+    mean_tensor[:, 0] = logsumexp_full
+    if V >= 50:
+        mean_tensor[:, 1] = torch.mean(sl[:, :50], dim=-1)
+    if V >= 500:
+        mean_tensor[:, 2] = torch.mean(sl[:, 50:500], dim=-1)
+    if V >= 2000:
+        mean_tensor[:, 3] = torch.mean(sl[:, 500:2000], dim=-1)
+    if V > 2000:
+        mean_tensor[:, 4] = torch.mean(sl[:, 2000:], dim=-1)
+    mean_tensor[:, 5] = torch.mean(sl, dim=-1)
+
+    extended_logits = torch.cat([topk_vals, probe_logits], dim=1)
+    extended_indices = torch.cat([topk_idx, probe_idx_row], dim=1)
+    return extended_logits, extended_indices, mean_tensor
+
+
+def apply_topk_topp_mask(logits, k, p, fast=None, _topk_cap=50):
+    """PoW top-k/top-p masking. Strict exclusion: keep logits STRICTLY greater than
+    the k-th largest (mask `logits <= kth`), then nucleus for rows with p<1.
+
+    Two k-mask implementations, producing a BYTE-IDENTICAL masked tensor:
+      legacy: full-vocab ascending sort + gather(kth) + scatter-back.
+      fast  : topk(cap) for the per-row k-th-largest threshold, then
+              `logits.masked_fill(logits <= threshold)` — NO full sort, NO scatter.
+              PoW invariant top_k <= 50 makes `cap` sufficient (proof support is top-50).
+
+    `fast=None` (default, production): use the fast path for the top_p == 1.0 case
+    (p None, or no row with p < 1.0); fall back to the legacy sort when any p < 1.0
+    is present (kept until the nucleus path is separately cleaned up). `fast=True/False`
+    forces a path (used by the equivalence test).
+    """
+    if k is None and p is None:
+        return logits
+
+    if fast is None:
+        use_fast = (p is None) or (not bool((p.reshape(-1) < 1.0).any()))
+    else:
+        use_fast = fast
+
+    if k is not None:
+        if use_fast:
+            cap = min(_topk_cap, logits.size(-1))
+            topk_vals, _ = logits.topk(cap, dim=-1)                       # (B,cap) desc
+            idx = (k.to(torch.long) - 1).clamp_(0, cap - 1).unsqueeze(1)  # k-th largest slot
+            threshold = topk_vals.gather(1, idx)                         # (B,1)
+            masked = logits.masked_fill(logits <= threshold, -float("inf"))
+        else:
+            logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+            top_k_count = logits_sort.size(-1) - k.to(torch.long)
+            top_k_mask = logits_sort.gather(1, top_k_count.unsqueeze(dim=1))
+            logits_sort.masked_fill_(logits_sort <= top_k_mask, -float("inf"))
+            masked = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
+    else:
+        masked = logits.clone()
+
+    no_survivor = torch.isneginf(masked).all(dim=-1)              # (B,) bool
+    masked.masked_fill_(no_survivor.unsqueeze(-1), float("-inf"))
+    argmax = logits.argmax(dim=-1)                                # (B,) first max
+    ar = torch.arange(masked.size(0), device=masked.device)
+    masked[ar, argmax] = torch.where(no_survivor,
+                                     logits[ar, argmax],
+                                     masked[ar, argmax])
+
+    if p is not None:
+        p_flat = p.to(device=logits.device, dtype=torch.float32).reshape(-1)
+        if p_flat.numel() == 1:
+            p_flat = p_flat.expand(logits.shape[0])
+
+        top_p_rows = torch.nonzero(p_flat < 1.0, as_tuple=False).flatten()
+        for row_tensor in top_p_rows:
+            row = int(row_tensor.item())
+            support = torch.isfinite(masked[row]).nonzero(as_tuple=False).flatten()
+            if support.numel() <= 1:
+                continue
+            if support.numel() > 50:
+                raise ValueError(
+                    "PoW top_p < 1.0 requires top_k <= 50 so the "
+                    "verifier can replay from the fixed proof support")
+
+            support_logits = masked[row, support]
+            order = torch.argsort(-support_logits, stable=True)
+            sorted_support = support[order]
+            sorted_logits = support_logits[order]
+            probs_sort = sorted_logits.softmax(dim=-1)
+            prev_cum = torch.cumsum(probs_sort, dim=-1) - probs_sort
+            keep = prev_cum < p_flat[row]
+            keep[0] = True
+            masked[row, sorted_support[~keep]] = -float("inf")
+
+    return masked
+
 
 try:
     import atexit
