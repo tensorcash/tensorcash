@@ -1138,7 +1138,7 @@ jobs:
           -x
 
     - name: Run upstream sampler tests (regression)
-      working-directory: services/miner-api/vllm
+      working-directory: services/miner-api/vllm-v010
       timeout-minutes: 5
       continue-on-error: true
       run: |
@@ -1154,7 +1154,7 @@ jobs:
           || echo "Upstream sampler tests skipped/failed on CPU (expected)"
 
     - name: Import smoke check
-      working-directory: services/miner-api/vllm
+      working-directory: services/miner-api/vllm-v010
       run: |
         python -c "
         from vllm.v1.sample.sampler import Sampler, _has_pow
