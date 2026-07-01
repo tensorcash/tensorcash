@@ -1096,7 +1096,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@v6
-      with:
 
     - name: Initialize vllm submodule
       run: |
