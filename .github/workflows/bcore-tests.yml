@@ -48,6 +48,9 @@ jobs:
   build-test-image:
     name: Build Test Image
     runs-on: [self-hosted, linux, x64, docker]
+    # Fork-PR guard: self-hosted runners must not run untrusted fork code.
+    # Whole graph hangs off this job (see ci.yml for rationale).
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     timeout-minutes: 60
     steps:
       - name: Fix workspace ownership
@@ -189,7 +192,7 @@ jobs:
   # ============================================================================
   bcore-tests-success:
     name: BCore Tests
-    if: always()
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     needs: [unit-tests, functional-tests]
     runs-on: [self-hosted, linux, x64, docker]
     steps:

@@ -661,7 +661,7 @@ jobs:
           echo "DMG_PATH=$DMG_PATH" >> $GITHUB_ENV
 
       - name: Notarize DMG
-        if: env.HAS_SIGNING_CERT == 'true' && env.SIGNING_IDENTITY != '' && startsWith(github.ref, 'refs/tags/') && inputs.skip_notarization != 'true'
+        if: env.HAS_SIGNING_CERT == 'true' && env.SIGNING_IDENTITY != '' && env.APPLE_ID != '' && env.APPLE_APP_PASSWORD != '' && env.APPLE_TEAM_ID != '' && startsWith(github.ref, 'refs/tags/') && inputs.skip_notarization != 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}

@@ -22,6 +22,11 @@ jobs:
   changes:
     name: Detect Changes
     runs-on: k8s-build
+    # Fork-PR guard: self-hosted runners must not run untrusted fork code.
+    # Runs on push/dispatch/tag and same-repo PRs; fork PRs are skipped. The whole
+    # job graph hangs off this job, so skipping it skips every self-hosted job.
+    # (Add lightweight checks on GitHub-hosted runners for fork PRs if desired.)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     outputs:
       miner-api: ${{ steps.filter.outputs.miner-api }}
       verification-api: ${{ steps.filter.outputs.verification-api }}
@@ -1091,7 +1096,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@v6
-      with:
 
     - name: Initialize vllm submodule
       run: |
@@ -1169,6 +1173,7 @@ jobs:
     needs: [test-miner-api, test-verification-api, test-core-node, test-cosign-bridge, test-pow-utils, test-llama-server, test-vllm-sampler]
     if: |
       always() &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' ||
        (needs.changes.outputs.miner-api == 'true' && needs.changes.outputs.verification-api == 'true'))
     timeout-minutes: 10
@@ -1261,7 +1266,7 @@ jobs:
     name: CI Summary
     runs-on: k8s-build
     needs: [test-miner-api, test-verification-api, test-model-audit, test-core-node, test-cosign-bridge, test-pow-utils, test-llama-server, test-vllm-sampler, integration-tests]
-    if: always()
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
 
     steps:
     - name: Summary

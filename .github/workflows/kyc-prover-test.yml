@@ -24,6 +24,8 @@ jobs:
   build-and-test:
     name: Build KYC Prover & Generate Vectors
     runs-on: k8s-build
+    # Fork-PR guard: self-hosted runners must not run untrusted fork code.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
     defaults:
       run:
@@ -399,6 +401,8 @@ jobs:
   build-and-test-hd:
     name: Build KYC-HD v1 Alternative Prover & Generate Vectors
     runs-on: k8s-build
+    # Fork-PR guard: self-hosted runners must not run untrusted fork code.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
     defaults:
       run:
