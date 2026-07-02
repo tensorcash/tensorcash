@@ -41,7 +41,12 @@ class PriorityRequestManager(RequestManager):
         # Initialize priority manager
         self.priority_manager = RequestPriorityManager(
             min_concurrent=self.min_active,
-            max_concurrent=self.min_active * 2,  # Allow some headroom
+            # Headroom above the warm-dummy floor, but never 0: with
+            # MIN_ACTIVE_REQUESTS=0 (no warm dummies) min_active*2 collapses to
+            # zero capacity, which 503s every external request and makes
+            # get_statistics() divide by zero. Capacity must hold at least one
+            # batch regardless of the dummy minimum.
+            max_concurrent=max(self.min_active * 2, constants.BATCH_SIZE),
             batch_size=constants.BATCH_SIZE
         )
         
