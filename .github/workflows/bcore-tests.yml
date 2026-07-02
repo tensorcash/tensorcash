@@ -41,6 +41,12 @@ concurrency:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# Ephemeral runners don't share a local docker cache: the image built by
+# build-test-image is pushed to ghcr and pulled by the (separate) test jobs.
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   # ============================================================================
   # Build the tensorcash-tests Docker image (heavy C++ compilation)
@@ -75,13 +81,17 @@ jobs:
             shared-utils/secp256k1-zkp \
             shared-utils/liboqs
 
-      - name: Build tensorcash-tests image
+      - name: Build & push tensorcash-tests image
         run: |
+          IMG="ghcr.io/${{ github.repository }}/tensorcash-tests"
           docker build --no-cache \
             -f services/core-node/bcore/test-runner/Dockerfile \
             -t tensorcash-tests:${{ github.sha }} \
-            -t tensorcash-tests:latest \
+            -t "${IMG}:${{ github.sha }}" \
             .
+          # Ephemeral runners: publish so unit/functional jobs (separate runners) can pull it.
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${IMG}:${{ github.sha }}"
 
   # ============================================================================
   # Unit tests — fast feedback (~10-15 min)
@@ -92,6 +102,12 @@ jobs:
     runs-on: [self-hosted, linux, x64, docker]
     timeout-minutes: 45
     steps:
+      - name: Pull test image
+        run: |
+          IMG="ghcr.io/${{ github.repository }}/tensorcash-tests"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "${IMG}:${{ github.sha }}"
+          docker tag "${IMG}:${{ github.sha }}" tensorcash-tests:${{ github.sha }}
       - name: Run unit tests
         run: |
           # Run the boost suites in parallel via ctest (each suite is registered as its own
@@ -122,6 +138,12 @@ jobs:
     runs-on: [self-hosted, linux, x64, docker]
     timeout-minutes: 180
     steps:
+      - name: Pull test image
+        run: |
+          IMG="ghcr.io/${{ github.repository }}/tensorcash-tests"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "${IMG}:${{ github.sha }}"
+          docker tag "${IMG}:${{ github.sha }}" tensorcash-tests:${{ github.sha }}
       - name: Run functional tests
         id: functional
         continue-on-error: true
