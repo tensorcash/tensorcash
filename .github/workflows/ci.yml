@@ -180,7 +180,25 @@ jobs:
           fi
           sleep 2
         done
-    
+
+        # /health returns healthy the instant the web app binds, but the
+        # completion tests need a VDF proof, which the genesis grind produces a
+        # beat later. Wait for it explicitly so those tests never race the
+        # first checkpoint (otherwise they 500 "VDF proof not yet available").
+        echo "Waiting for first VDF proof..."
+        for i in $(seq 1 30); do
+          if curl -s http://localhost:8081/status 2>/dev/null | grep -q '"has_vdf_proof": true'; then
+            echo "VDF proof ready!"
+            break
+          fi
+          if [ $i -eq 30 ]; then
+            echo "VDF proof not ready in time"
+            docker compose -f docker-compose.test.yml logs mining-proxy
+            exit 1
+          fi
+          sleep 2
+        done
+
     - name: Run E2E tests
       working-directory: services/miner-api/tests
       timeout-minutes: 5
