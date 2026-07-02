@@ -32,14 +32,12 @@ ENV GMP_USE_ASM=1 \
     FLINT_ENABLE_ASM=1 \
     CHIAVDF_NO_ASM=""
 
-# ChiaVDF CMakeLists.txt defaults -march=native, which on the .132 builder
-# (Skylake-X / AVX-512) produces a .so that SIGILLs on any RUN host without
-# AVX-512 (i9-10850K Comet Lake — has AVX2 but no
-# AVX-512). x86-64-v3 is the portable baseline covering AVX2 + BMI2 + FMA +
-# F16C — supported on every Haswell+ CPU we deploy on. The CMakeLists
-# comment explicitly documents this knob (src/CMakeLists.txt:30).
-ENV CHIAVDF_MARCH=x86-64-v3
-
+# ChiaVDF CMakeLists.txt defaults -march=native, which bakes the builder host's
+# ISA into the .so and then SIGILLs on any RUN host that lacks it. Pin a
+# portable per-arch baseline instead (CHIAVDF_MARCH is documented in
+# src/CMakeLists.txt:30). x86-64-v3 is meaningless on ARM, so building on an
+# aarch64 host (e.g. Apple Silicon docker) with it produces a broken/no-op VDF
+# lib — the arch is detected at build time below, right before the wheel build.
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
     CMAKE_PREFIX_PATH=/usr/local \
     CMAKE_INCLUDE_PATH=/usr/local/include \
@@ -47,7 +45,15 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
 ENV BUILD_VDF_CLIENT=N
 
 
-RUN VERBOSE=1 pip wheel . -w /chiavdf-wheels
+# Portable -march per target arch (see note above). x86-64-v3 = AVX2+BMI2+FMA+
+# F16C (every Haswell+ we deploy on); armv8-a = ARMv8 baseline for aarch64.
+RUN case "$(uname -m)" in \
+      x86_64)        export CHIAVDF_MARCH=x86-64-v3 ;; \
+      aarch64|arm64) export CHIAVDF_MARCH=armv8-a ;; \
+      *)             export CHIAVDF_MARCH=native ;; \
+    esac; \
+    echo "chiavdf: building with -march=${CHIAVDF_MARCH} on $(uname -m)"; \
+    VERBOSE=1 pip wheel . -w /chiavdf-wheels
 
 # Stage 2: Runtime image for Mining Proxy
 FROM python:3.10-slim

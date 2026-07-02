@@ -68,6 +68,19 @@ services:
       - DUMMY_REQUEST_TIMEOUT=10
       - LOG_LEVEL=DEBUG
       - TEST_MODE=true
+      # Self-seed a genesis block so the VDF prover actually runs. Without this
+      # the proxy waits for a real mining job on ZMQ :6000, which only exists
+      # when the runner host is a live miner (the self-hosted case) — on clean
+      # CI runners no job ever arrives, the block stays all-zero, the VDF is
+      # skipped (see vdf_service.py: all-zero hash => skip unless GENESIS), and
+      # every completion 500s with "VDF proof not yet available". Genesis mode
+      # makes the test hermetic.
+      - GENESIS_GENERATOR=True
+      # The e2e asserts pow rides in `extra_sampling_params` (the older vLLM /
+      # llama.cpp field). Default is USE_VLLM_XARGS = not LLAMA_CPP = True, which
+      # injects into `vllm_xargs` instead and fails the assertion. Pin the field
+      # the test expects.
+      - USE_VLLM_XARGS=false
       - MODEL_API_URL=http://mock-core-node:8050
       - PROOF_CACHE_ENABLED=true
       - BATCH_SIZE=5
