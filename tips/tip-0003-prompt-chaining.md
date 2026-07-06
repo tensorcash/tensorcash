@@ -7,6 +7,137 @@ Status: Draft
 Created: 2026-06-25
 ```
 
+## Editor's note — construction amendment (2026-07-06)
+
+I agree with the threat model in this TIP, but as author/editor I no longer think Candidate
+A (header-bound inert-token injection) should be the primary construction, and I do not think
+"by-construction precompute infeasibility" is the right bar to set. This note narrows v3.0 to a
+**B-conditional memory-hard admission gate** and moves prompt/context non-reuse (Candidate B)
+to a separately reviewed later deployment. The Specification below is retained as the original
+design space; this note governs where the reference implementation is heading.
+
+### 1. Candidate A is economic, not by-construction
+
+The stated objective — that no forward pass underlying a v3 proof can be computed before the
+header and VDF exist — is not what token injection delivers. With inert-alphabet size `m` and
+injection cadence `c`, precompute branching grows like `m^(N/c)` over an `N`-step window: a
+build-cost multiplier, not impossibility. It also trades directly against inert-alphabet
+integrity — tokens strong enough to defeat precompute are not obviously inert, and tokens inert
+enough to preserve model behaviour may not add enough branching. I would therefore not make
+vocabulary injection load-bearing.
+
+### 2. Primary construction for v3.0 — B-conditional admission
+
+Use the verifier's realized sampling mass to decide when a memory-hard admission puzzle is
+required. No vocabulary injection, no hot-path token splicing.
+
+**(a) Conservative realized entropy.** Recompute `B_cred` from the existing id-sorted CDF
+interval bounds, reusing the reuse-gate's interval-mass logic:
+
+```
+mass_upper = min(1, max(0, upper - lower) + 2*ATOL)
+B_cred     = Σ_j  -log2(mass_upper_j)        # uncapped, double precision, order-independent
+```
+
+**(b) Tier rule** (identical in quick and full verification):
+
+```
+B_cred < 45        → invalid
+45 ≤ B_cred < 70   → require valid predecode admission
+B_cred ≥ 70        → admission not required
+```
+
+If an admission nonce is present it is verified regardless of tier — an unverified nonce would
+be a free sampling re-roll.
+
+**(c) Admission puzzle.** A memory-hard `Argon2id` nonce, solved predecode, bound to exactly
+what sampling already commits to — the rolling window context, not the full prompt:
+
+```
+msg_w = header_prefix | vdf | tick | j_first | rolling_context_tokens | compute_precision   # existing sampler preimage
+elig  = Argon2id( msg_w | u16le(len(model_identifier)) | model_identifier | admission_nonce32 )
+valid iff  uint256_le(elig) < admission_target(model)
+```
+
+`model_identifier` is included so two models sharing a tokenizer cannot amortize one grind.
+`admission_target` derives from the already-registered `difficulty` (an inverse compute scalar)
+and two chain constants, so no registration-schema change is needed.
+
+**(d) The nonce enters sampling.** For v3 windows the nonce is appended to the existing per-step
+preimage for every step:
+
+```
+u_j = first4bytes( SHA256( header_prefix | vdf | tick | j | rolling_context_tokens | compute_precision | admission_nonce32 ) )
+```
+
+This makes admission window-specific and predecode: any change to header, VDF, tick, context,
+precision, or nonce changes every `u`, so a nonce cannot be retrofitted after decoding. It
+reuses the existing preimage — no new hash construction, no arbitrary-vocabulary indexing, no
+hot-path injection — satisfying both hard constraints of this TIP structurally rather than by
+tuning. The proof hash is this same construction, so the derived header nonce and the target
+check commit to the admission nonce transitively: no header/block-format change, and no
+separate post-admission grind field may be introduced.
+
+The nonce is carried in the existing `extra_flags.v3.admission_nonce`; no `proof.fbs`,
+`CProofBlob`, or block-serializer change is part of v3.0.
+
+### 3. Sampler contract
+
+v3 accepts only the registered/default sampler profile (`temperature=1.0, top_k=50,
+top_p=1.0, repetition_penalty=1.0`); a model-specific override may live in the existing
+model-record `extra`. Sampler params are already transcript-bound (changing them breaks the
+`u → token` replay), and recomputed `B_cred` self-prices any in-bounds choice — concentrating
+mass lowers credited bits into the admission tier or below the floor. Any silent sampler-param
+fallback (the current `top_k="30"` default) is removed for v3: absence is a hard failure.
+
+### 4. Security claim
+
+I do not claim forward-pass precompute becomes impossible; the defensible claim is economic and
+measurable. A cached adversary pays the admission cost per admitted attempt and succeeds only if
+the header-selected path lands in its represented legal set. If that set has at most `L` legal
+leaves and the verifier credits effective entropy `B_eff`, coverage is bounded by approximately
+
+```
+P_success  ≲  L · 2^(−B_eff)
+```
+
+The cached-capital bound is independent of block difficulty and of the puzzle exponent; the
+admission target itself still scales from registered model difficulty via the decode-cost
+constants. Break-even is parameterized by the admission cost fraction `α` and the
+attacker/honest Argon cost ratio `β`; with `α ≈ 4%` and a memory-hard puzzle (`β ≈ 1`), the
+moderate-entropy band carries an anti-amortization tax. This is the achievable version of this TIP's goal:
+bounded cached-capital economics with explicit assumptions, not by-construction infeasibility.
+
+### 5. Prompt/context non-reuse — deferred to a later deployment
+
+A duplicate-prompt index is a distinct consensus mechanism (a persistent index, per-block undo,
+reorg handling, mempool policy, and a retention-horizon decision), not a small addition to the
+admission gate. I would not couple it to the first v3 deployment. If shipped later, keep the key
+minimal:
+
+```
+prompt_context_hash = H( "TC_V3_PROMPT" | prompt_tokens | generated_tokens_before_window )
+prompt_reuse_key    = model_identifier | prompt_context_hash
+```
+
+No sampler salt in the key (a nudged temperature would otherwise mint a fresh key); no
+tokenizer/template fields (pinned by `model_commit`). It is defense-in-depth — it stops the same
+accepted prompt/context tree from earning indefinitely — and is not required for the admission
+gate.
+
+### 6. Open measurement items
+
+Before activation: the attacker/honest Argon cost ratio `β`; cross-architecture `B_cred` slack
+and the false-reject envelope; and the `α`/target calibration (reference Argon2 eval time and
+the decode-cost reference).
+
+**Direction for v3:** retain the threat model; drop inert-token injection as the primary
+construction; adopt B-conditional Argon admission as v3.0; treat prompt/context non-reuse as a
+separately reviewed v3.1 consensus change.
+
+— takakuni-imosuke
+
+
 ## Abstract
 
 This proposal opens a design question on the proof-of-inference verification contract:
