@@ -200,6 +200,8 @@ RUN pip install --no-cache-dir -r /app/proxy_requirements.txt
 
 COPY services/miner-api/src /app/miner-proxy/src
 COPY shared-utils/pow-utils/pow_utils.py /app/miner-proxy/src/utils/
+COPY shared-utils/pow-utils/pow_v3.py /app/miner-proxy/src/utils/
+COPY shared-utils/pow-utils/bcred_table_r1024.py /app/miner-proxy/src/utils/
 COPY shared-utils/pow-utils/uint256_arithmetics.py /app/miner-proxy/src/utils/
 COPY shared-utils/config/constants.py /app/miner-proxy/src/config/
 

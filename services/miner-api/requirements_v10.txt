@@ -8,3 +8,5 @@ torchvision==0.22.1
 vllm==0.10.0
 pyzmq>=25.0.0
 setproctitle>=1.2.3
+# Argon2id for v3 admission puzzle (TIP-0003)
+argon2-cffi==23.1.0

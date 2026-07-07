@@ -309,6 +309,9 @@ py::dict unpack_validation_request(py::bytes buf) {
         d["bits"]          = blk->bits();
         d["nonce"]         = blk->nonce();
         d["adjusted_bits"] = blk->adjusted_bits();
+        // Registered model difficulty (appended v3 field; 0 = not provided —
+        // old senders). Lets the verifier derive the admission target (§6).
+        d["difficulty"]    = blk->difficulty();
         // raw bytes
         auto ph = blk->prev_block_hash();
         d["prev_block_hash"] = py::bytes(reinterpret_cast<const char*>(ph->data()), ph->size());
@@ -400,6 +403,19 @@ static std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
 
 // Internal helper to pack Proof from dict into builder
 static flatbuffers::Offset<proof::Proof> pack_proof_internal(flatbuffers::FlatBufferBuilder& builder, py::dict data) {
+    // pfunpack is a DUMB packer (TIP-0003 boundary): the v3
+    // admission nonce is carried inside extra_flags (merged by the shared
+    // helper at the writer layer, extracted by the verifier from extra_flags).
+    // pack_proof_internal serializes the extra_flags string verbatim (below)
+    // and preserves it across a repack. A SIDE "admission_nonce" field would
+    // be a second, silent v3 writer path — this packer would ignore it and
+    // emit a proof missing the nonce. Fail loudly rather than invent one.
+    if (data.contains("admission_nonce")) {
+        throw std::invalid_argument(
+            "pfunpack.pack_proof does not accept a side 'admission_nonce'; "
+            "merge it into extra_flags via the shared v3 helper "
+            "(pow_v3.merge_extra_flags_v3) at the writer layer before packing");
+    }
     // Extract scalar fields
     uint32_t version = data["version"].cast<uint32_t>();
     uint64_t tick = data["tick"].cast<uint64_t>();
@@ -637,6 +653,9 @@ PYBIND11_MODULE(pfunpack, m) {
                 uint32_t bits = req.contains("bits") ? req["bits"].cast<uint32_t>() : 0;
                 uint32_t nonce = req.contains("nonce") ? req["nonce"].cast<uint32_t>() : 0;
                 uint32_t adjusted_bits = req.contains("adjusted_bits") ? req["adjusted_bits"].cast<uint32_t>() : 0;
+                // Registered model difficulty (v3 admission target derivation,
+                // TIP-0003); 0 = not provided.
+                int64_t blk_difficulty = req.contains("difficulty") ? req["difficulty"].cast<int64_t>() : 0;
 
                 auto prev_block_hash = req.contains("prev_block_hash") ? req["prev_block_hash"].cast<std::string>() : std::string();
                 auto prev_block_hash_vec = builder.CreateVector(reinterpret_cast<const uint8_t*>(prev_block_hash.data()), prev_block_hash.size());
@@ -652,6 +671,7 @@ PYBIND11_MODULE(pfunpack, m) {
                 bvb.add_bits(bits);
                 bvb.add_nonce(nonce);
                 bvb.add_adjusted_bits(adjusted_bits);
+                if (blk_difficulty != 0) bvb.add_difficulty(blk_difficulty);
                 bvb.add_prev_block_hash(prev_block_hash_vec);
                 if (proof_offset.o != 0) bvb.add_pow_blob(proof_offset);
                 auto blk = bvb.Finish();

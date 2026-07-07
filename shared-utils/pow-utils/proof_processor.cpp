@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "proof_processor.h"
 #include "pow_zmq_writer.h"
+#include "pow_v3.h"
 #include "pfunpack/libproofpack.h"
 #include <openssl/sha.h>
 #include <cstdlib>
@@ -257,8 +258,10 @@ std::unordered_map<std::string, std::any> ProofProcessor::assemble_proof_dict(
 ) {
     std::unordered_map<std::string, std::any> proof;
     
-    // Basic metadata
-    proof["version"] = uint32_t(2);
+    // Basic metadata. Version comes from proof_version_ (TIP-0003
+    // §3: version=3 turns on the v3 carrier rules); the pfunpack and
+    // pow_zmq_writer serializers both read it from this dict entry.
+    proof["version"] = uint32_t(proof_version_);
     proof["is_solution"] = is_solution_;
     
     // Extract POW hasher data
@@ -408,7 +411,46 @@ py::dict ProofProcessor::process_proof(
             proof_dict["model_config_diff"] = std::string("{\"proof_purpose\":\"audit\"}");
         }
     }
-    
+
+    // v3 (TIP-0003, §9): merge the sampler-selected admission
+    // nonce into model_config_diff — serialized verbatim into
+    // Proof.extra_flags — via the shared merge helper, just before
+    // FlatBuffer serialization. The sampler passes the nonce it already
+    // ground (32 raw bytes or 64 lowercase hex) in
+    // pow_hasher_data["admission_nonce"]; this path must NOT re-grind and
+    // must not infer a nonce from the digest. Ordering: AFTER the audit
+    // splice above — the merge preserves existing members, so both the
+    // proof_purpose marker (front) and the v3 member (end) survive.
+    if (proof_version_ >= 3 && pow_hasher_data.contains("admission_nonce")) {
+        py::object nonce_obj = pow_hasher_data["admission_nonce"];
+        std::string nonce_hex;
+        if (py::isinstance<py::bytes>(nonce_obj)) {
+            std::string raw = nonce_obj.cast<std::string>();
+            if (raw.size() != pow_v3::ADMISSION_NONCE_BYTES) {
+                throw std::invalid_argument(
+                    "admission_nonce bytes must be exactly 32 bytes");
+            }
+            static const char* hex_digits = "0123456789abcdef";
+            nonce_hex.reserve(2 * raw.size());
+            for (unsigned char c : raw) {
+                nonce_hex.push_back(hex_digits[c >> 4]);
+                nonce_hex.push_back(hex_digits[c & 0x0F]);
+            }
+        } else {
+            // 64 lowercase hex; merge_extra_flags_v3 enforces the shape
+            nonce_hex = nonce_obj.cast<std::string>();
+        }
+        std::string existing;
+        if (proof_dict.count("model_config_diff")) {
+            try {
+                existing = std::any_cast<std::string>(
+                    proof_dict.at("model_config_diff"));
+            } catch (...) { existing = ""; }
+        }
+        proof_dict["model_config_diff"] =
+            pow_v3::merge_extra_flags_v3(existing, nonce_hex);
+    }
+
     // Normalize field names (attention_mask → pad_mask for schema)
     // Already handled in extract_window_arrays - we set both fields
     

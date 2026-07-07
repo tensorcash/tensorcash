@@ -319,6 +319,8 @@ jobs:
           # Copy shared utils
           mkdir -p "$BUNDLE_SRC/utils"
           cp shared-utils/pow-utils/pow_utils.py "$BUNDLE_SRC/utils/"
+          cp shared-utils/pow-utils/pow_v3.py "$BUNDLE_SRC/utils/"
+          cp shared-utils/pow-utils/bcred_table_r1024.py "$BUNDLE_SRC/utils/"
           cp shared-utils/pow-utils/uint256_arithmetics.py "$BUNDLE_SRC/utils/"
 
           mkdir -p "$BUNDLE_SRC/config"

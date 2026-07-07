@@ -177,11 +177,15 @@ class VerificationLogger:
     
     def _generate_failure_report(self, failure_data: FailureData) -> str:
         """Generate a detailed failure report"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         safe_failure_type = failure_data.failure_type.replace(" ", "_").replace("/", "_")
         
         report_name = f"failure_{safe_failure_type}_{timestamp}"
         report_dir = self.reports_dir / report_name
+        suffix = 1
+        while report_dir.exists():
+            suffix += 1
+            report_dir = self.reports_dir / f"{report_name}_{suffix}"
         report_dir.mkdir(exist_ok=True)
         
         # Save failure data as JSON

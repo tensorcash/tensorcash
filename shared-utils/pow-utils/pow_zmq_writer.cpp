@@ -535,7 +535,16 @@ std::vector<uint8_t> MiningResponseWriter::serialize_response(
 
     // 6) Build the Proof table
     proof::ProofBuilder pb(builder);
-    pb.add_version(2);
+    // Version comes from the proof dict (stamped from
+    // ProofProcessor::proof_version_) — never hardcoded, so version=3 proofs
+    // (TIP-0003) serialize with the right wire version. Missing /
+    // malformed entry keeps the legacy value 2.
+    uint32_t proof_version_wire = 2;
+    if (response.proof_dict.count("version")) {
+        proof_version_wire = extract_numeric_flexible<uint32_t>(
+            response.proof_dict.at("version"), 2);
+    }
+    pb.add_version(proof_version_wire);
     pb.add_tick(extract_numeric_flexible<int64_t>(response.proof_dict.at("tick")));
     pb.add_timestamp(extract_numeric_flexible<int64_t>(response.proof_dict.at("timestamp")));
     // Slice 11.4 — read is_solution from the proof_dict instead of

@@ -149,6 +149,9 @@ RUN mkdir -p /app/src/utils/proof && \
 
 # Copy pow_utils.py to src/utils/
 COPY shared-utils/pow-utils/pow_utils.py /app/src/utils/
+COPY shared-utils/pow-utils/pow_v3.py /app/src/utils/
+# R=1024 B_cred table (§4) — MUST sit beside pow_v3.py (it imports it).
+COPY shared-utils/pow-utils/bcred_table_r1024.py /app/src/utils/
 COPY shared-utils/pow-utils/uint256_arithmetics.py /app/src/utils/
 COPY shared-utils/config/constants.py /app/src/config/constants.py 
 

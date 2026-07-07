@@ -108,6 +108,7 @@ from config.constants import _DTYPE_BYTES, _NORMAL, _TWO_PI, ATOL
 from utils.shared_utils import validate_by_quantiles, validate_by_quantiles_higher, validate_by_quantiles_lower, proof_to_dict, _snap, _ulp, _sigma_from_ulp, _bucket_means, chiavdf_verify, parse_safetensors_header, inspect_bin_dtype, get_native_dtype_from_commit, inspect_model_dtype, fit_nb_mom, right_tail_test, RunningMeanCov      
 from utils.pow_utils import POW_WINDOW_SIZE, SequenceCache, PowState, Logger, RowManager, RingBuffers, PowHasher, ProofWriter, _to_bytes, serialize_proof, sha256_many, check_hash_against_target
 from utils.pow_utils import _tok_le_bytes, _u32le, _str_bytes, _build_msg, _digest_to_u, hex_to_bytes_tensor, nbits_to_target, _has_pow, to_python_string
+from utils import pow_v3
 from utils.uint256_arithmetics import set_compact, get_compact
 import pfunpack
 
@@ -1325,6 +1326,63 @@ class ProofVerifier:
             self.top_p              = p['top_p']
             self.top_k              = p['top_k']
             self.repetition_penalty = p['repetition_penalty']
+
+            # ---- V3 admission carrier (TIP-0003) ----
+            # Parsed once per proof; the nonce (when claimed with valid
+            # shape) is appended to every step preimage in _get_u/_get_u_batch
+            # and priced by _verify_v3_admission_tier. Parser violations mean
+            # "no nonce claimed" — the tier rule then decides.
+            self.proof_version = int(p.get('version') or 0)
+            self._v3_nonce = None
+            self._v3_nonce_t = None
+            try:
+                self._v3_difficulty = int(p.get('difficulty') or 0)
+            except (TypeError, ValueError):
+                self._v3_difficulty = 0
+            # Option 2 (TIP-0003): the verifier NEVER selects the
+            # ruleset from proof.version alone — that would replay a
+            # pre-activation version-3 blob under v3 rules (nonce folded into
+            # every u) and diverge from consensus, which judges it as v2.
+            # bcore advertises the registered difficulty (>0) ONLY when v3 is
+            # ACTIVE at the block's height; below activation it sends 0. So
+            # difficulty>0 is the v3-active signal AND the admission-target
+            # input. A version>=3 proof with difficulty==0 is replayed as v2:
+            # no nonce in u, no tier/admission gate.
+            self._v3_active = (self.proof_version >= pow_v3.V3_PROOF_VERSION
+                               and self._v3_difficulty > 0)
+            # Rollout observability (Finding 4 / TIP-0003): the
+            # difficulty==0 signal is INTENTIONALLY ambiguous between a
+            # pre-activation INERT v3 blob (correctly replayed as v2) and a LOST
+            # signal from an un-upgraded sender. The stateless verifier cannot
+            # distinguish them, so it does NOT fail closed (that would reject
+            # valid pre-activation proofs and break the byte-compat rule).
+            # Instead emit a named metric so ops can ALERT if v3_inert_replay
+            # appears at/after the known activation height — the operational
+            # rollout contract (verifier+bcore co-upgraded before activation),
+            # with bcore's local ConnectBlock enforcement as the authoritative
+            # backstop, is the real safety rail. No wire change.
+            if self.proof_version >= pow_v3.V3_PROOF_VERSION:
+                _v3_event = ("v3_active_verify" if self._v3_difficulty > 0
+                             else "v3_inert_replay")
+                self.logger.info(_v3_event, extra={
+                    "event": _v3_event,
+                    "proof_version": self.proof_version,
+                    "v3_difficulty": self._v3_difficulty,
+                })
+            if self._v3_active:
+                flags = p.get('extra_flags')
+                if isinstance(flags, str):
+                    self._v3_nonce = pow_v3.extract_admission_nonce(flags)
+                else:
+                    mcd = p.get('model_config_diff')
+                    if isinstance(mcd, str):
+                        self._v3_nonce = pow_v3.extract_admission_nonce(mcd)
+                    elif isinstance(mcd, dict):
+                        v3 = mcd.get('v3')
+                        val = (v3.get('admission_nonce')
+                               if isinstance(v3, dict) else None)
+                        if pow_v3.is_valid_admission_nonce_hex(val):
+                            self._v3_nonce = bytes.fromhex(val)
 
             # Load logit correlation table
             filename = "config/correl.npy"
@@ -3020,6 +3078,19 @@ class ProofVerifier:
                 out = forward(inp,attn_mask_pre, use_cache=False)
             return out.logits[:, -1]  
 
+    def _v3_nonce_tensor(self):
+        """(32,) uint8 tensor of the v3 admission nonce on self.device, or
+        None. Cached per device; None for v2 proofs and unclaimed nonces so
+        the preimage stays byte-identical to the legacy shape (§7)."""
+        nonce = getattr(self, '_v3_nonce', None)
+        if nonce is None:
+            return None
+        t = getattr(self, '_v3_nonce_t', None)
+        if t is None or str(t.device) != str(torch.device(self.device)):
+            t = torch.frombuffer(bytearray(nonce), dtype=torch.uint8).to(self.device)
+            self._v3_nonce_t = t
+        return t
+
     def _get_u(self, context_tokens, step_idx, hash_out=False):
         """Generate deterministic u value from context and step."""
         window_tokens = torch.zeros(self.window_size, dtype=torch.int64, device=self.device)
@@ -3033,10 +3104,11 @@ class ProofVerifier:
                                     batch_size=ctx_bytes.size(0),
                                     device=self.device
                                     )
-        
+
         header_data = hex_to_bytes_tensor(self.proof['header_prefix'], device=self.device)
         v = hex_to_bytes_tensor(self.proof['vdf'], device=self.device)
-        msg = _build_msg(header_data, v, T8, j4, ctx_bytes, precision_bytes)
+        msg = _build_msg(header_data, v, T8, j4, ctx_bytes, precision_bytes,
+                         nonce=self._v3_nonce_tensor())
         digest = sha256_many(msg)
         if hash_out:
             return digest[0].cpu().numpy().tobytes().hex()
@@ -3473,6 +3545,161 @@ class ProofVerifier:
 
         return True
 
+    def _verify_v3_admission_tier(self, lower, upper) -> bool:
+        """V3 tier acceptance + admission verification (TIP-0003
+        §2, §4-§6). No-op (True) for proofs below version 3.
+
+        Order of rules:
+          1. §2  consensus-fixed sampler profile — exact equality, any
+             missing/divergent field invalid.
+          2. §4  conservative B_cred from the replayed CDF bounds (R=1024
+             integer table units, shared helper).
+          3. §5  tier rule: < B_FLOOR invalid; < B_FREE requires a claimed
+             nonce; a PRESENT nonce is verified regardless of tier.
+          4. §6  admission: Argon2id(msg_w | prompt_commitment |
+             u16le(len(mid)) | mid | nonce) read little-endian must beat the
+             target derived from the registered difficulty. The gate only runs
+             when the registered difficulty is present (>0), which under
+             option 2 is exactly when v3 is active — so the target is always
+             checked here; bcore remains the authoritative enforcer.
+        """
+        # Gate on v3-active (proof_version>=3 AND registered difficulty>0),
+        # not proof.version alone: pre-activation version-3 blobs carry no
+        # registered difficulty and are judged under v2 rules, byte-identical
+        # to consensus (§6, option 2). Recomputed from the two fields (not the
+        # cached _v3_active) so the gate is a pure function of its inputs.
+        if not (int(getattr(self, 'proof_version', 0) or 0) >= pow_v3.V3_PROOF_VERSION
+                and int(getattr(self, '_v3_difficulty', 0) or 0) > 0):
+            return True
+
+        actual = {
+            'temperature': self.temperature,
+            'top_p': self.top_p,
+            'top_k': self.top_k,
+            'repetition_penalty': self.repetition_penalty,
+        }
+        for key, want in pow_v3.SAMPLER_PROFILE_V3.items():
+            got = actual.get(key)
+            if got is None or float(got) != float(want):
+                self.logger.error(
+                    f"v3 sampler profile mismatch: {key}={got} != {want}",
+                    failure_type="v3_sampler_profile_mismatch",
+                    hash_id=self.proof.get('hash'),
+                )
+                return False
+
+        lower_vals = lower.detach().cpu().tolist() if torch.is_tensor(lower) else list(lower)
+        upper_vals = upper.detach().cpu().tolist() if torch.is_tensor(upper) else list(upper)
+        try:
+            b_cred_units = pow_v3.b_cred_units_from_bounds(lower_vals, upper_vals)
+        except ValueError as exc:
+            self.logger.error(
+                f"v3 B_cred computation failed: {exc}",
+                failure_type="v3_bcred_failure",
+                hash_id=self.proof.get('hash'),
+            )
+            return False
+
+        tier = pow_v3.tier_for_b_cred_units(b_cred_units)
+        nonce = getattr(self, '_v3_nonce', None)
+        self.logger.debug(
+            f"v3 tier: B_cred={pow_v3.b_cred_bits(b_cred_units):.2f} bits "
+            f"tier={tier} nonce={'present' if nonce else 'absent'}")
+
+        if tier == pow_v3.TIER_INVALID:
+            self.logger.error(
+                "v3 proof below B_FLOOR",
+                failure_type="v3_below_floor",
+                hash_id=self.proof.get('hash'),
+                metrics={'b_cred_units': str(b_cred_units),
+                         'b_cred_bits': pow_v3.b_cred_bits(b_cred_units)},
+            )
+            return False
+        if tier == pow_v3.TIER_ADMISSION and nonce is None:
+            self.logger.error(
+                "v3 proof below B_FREE with no admission nonce claimed",
+                failure_type="v3_admission_missing",
+                hash_id=self.proof.get('hash'),
+                metrics={'b_cred_bits': pow_v3.b_cred_bits(b_cred_units)},
+            )
+            return False
+
+        if nonce is not None:
+            # §5: present => verify regardless of tier (an unverified nonce
+            # would otherwise be a free sampling re-roll lever).
+            #
+            # Malformed proof DATA here (bad hex in header_prefix/vdf, a
+            # pad_mask/prompt length mismatch) is the PROOF's fault -> reject
+            # (return False -> RED). Only genuine infra faults (argon2-cffi
+            # missing => ImportError/RuntimeError) are allowed to propagate so
+            # the worker abstains instead of falsely REDding a valid block.
+            try:
+                msg_w = pow_v3.build_step_message(
+                    bytes.fromhex(self.proof['header_prefix']),
+                    bytes.fromhex(self.proof['vdf']),
+                    int(self.proof['tick']),
+                    0,
+                    self.prompt_tokens.detach().cpu().tolist(),
+                    self.stated_precision,
+                )
+                # §6: admission binds the FULL model-visible prefix (the
+                # proof's prompt_tokens + pad_mask, rederived — never carried),
+                # not just msg_w's rolling window, so one solve cannot be
+                # amortized across inert out-of-window prefix variations.
+                commitment = pow_v3.prompt_commitment(
+                    self.prompt_tokens.detach().cpu().tolist(),
+                    self.pad_mask.detach().cpu().tolist(),
+                )
+                admission_msg = pow_v3.admission_message(
+                    msg_w, self.proof['model_identifier'], nonce, commitment)
+            except (ValueError, KeyError, TypeError, IndexError) as exc:
+                self.logger.error(
+                    f"v3 admission preimage malformed: {exc}",
+                    failure_type="v3_admission_malformed",
+                    hash_id=self.proof.get('hash'),
+                )
+                return False
+            digest = pow_v3.argon2id_digest(admission_msg)
+            # The gate only runs when _v3_difficulty>0 (v3-active guard above),
+            # so the registered difficulty is always present and the target is
+            # always checked — no soft-skip path.
+            difficulty = int(getattr(self, '_v3_difficulty', 0) or 0)
+            target = pow_v3.admission_target(difficulty)
+            if not pow_v3.admission_valid(digest, target):
+                self.logger.error(
+                    "v3 admission nonce inadmissible for registered difficulty",
+                    failure_type="v3_admission_inadmissible",
+                    hash_id=self.proof.get('hash'),
+                    metrics={'difficulty': difficulty},
+                )
+                return False
+
+        return True
+
+    def _verify_v3_full_gate(self) -> bool:
+        """§4/§5 tier + admission enforcement on the FULL verification path.
+
+        Full replay's statistical stage samples a step SUBSET, so it never
+        materializes all-256 CDF bounds; rebuild them here with the same
+        model-free per-step evidence replay the light path uses and apply the
+        identical gate. A u-inconsistent step is an outright failure (the
+        transcript does not replay). Callers gate on _v3_active (§6, option
+        2): proof_version>=3 AND registered difficulty>0."""
+        lower_bounds = []
+        upper_bounds = []
+        for i in range(self.window_size):
+            step_ok, lower, upper = self._verify_step_light(i)
+            if not step_ok:
+                self.logger.error(
+                    f"v3 full gate: step {i} u-replay inconsistent",
+                    failure_type="v3_full_gate_step_failure",
+                    hash_id=self.proof.get('hash'),
+                )
+                return False
+            lower_bounds.append(lower)
+            upper_bounds.append(upper)
+        return self._verify_v3_admission_tier(lower_bounds, upper_bounds)
+
     def _verify_parameters_audit(self) -> bool:
         """Sanity-only parameter validation for AUDIT (logits) proofs.
 
@@ -3596,7 +3823,10 @@ class ProofVerifier:
         if all_passed and not self._verify_reuse_entropy(lower_bounds, upper_bounds):
             all_passed = False
 
-        return all_passed               
+        if all_passed and not self._verify_v3_admission_tier(lower_bounds, upper_bounds):
+            all_passed = False
+
+        return all_passed
 
     # ----------------------------------------------------------------- #
     #                        Heavy Weight verification
@@ -4155,6 +4385,42 @@ class ProofVerifier:
         status = None
         msg = ""
 
+        # Forensic persistence: keep the RAW p-values + rank errors and the
+        # runtime model identity on the instance so the report writer (and the
+        # replay harness) can dump them instead of only the error-distribution
+        # payload. This is what a same-bytes L4-vs-spark diff needs; without it
+        # a RED can't be told apart from a wrong-model false-RED after the fact.
+        try:
+            _pv = np.asarray(p_values, dtype=float)
+            self._last_full_forensics = {
+                "p_values": _pv.tolist(),
+                "rank_error_actual": list(rank_error_actual),
+                "rank_error_calib": list(rank_error_calib),
+                "n_steps": int(_pv.size),
+                "mean_pvalue": float(_pv.mean()) if _pv.size else None,
+                "min_pvalue": float(_pv.min()) if _pv.size else None,
+                "n_below_0.05": int((_pv < 0.05).sum()),
+                "n_below_0.01": int((_pv < 0.01).sum()),
+                "n_below_0.001": int((_pv < 0.001).sum()),
+                "runtime_model_name": getattr(self, "model_name", None),
+                "runtime_commit_hash": getattr(self, "commit_hash", None),
+                "runtime_model_identifier": getattr(self, "_current_model_identifier", None),
+                "runtime_param_count": (
+                    sum(p.numel() for p in self.model.parameters())
+                    if getattr(self, "model", None) is not None else None),
+                "runtime_num_layers": getattr(getattr(self.model, "config", None),
+                                               "num_hidden_layers", None)
+                                      if getattr(self, "model", None) is not None else None,
+                "runtime_hidden_size": getattr(getattr(self.model, "config", None),
+                                                "hidden_size", None)
+                                       if getattr(self, "model", None) is not None else None,
+                "tokenizer": getattr(getattr(self, "tokenizer", None), "name_or_path", None),
+                "stated_precision": getattr(self, "precision", None),
+                "stated_dtype": str(getattr(self, "stated_dtype", None)),
+            }
+        except Exception:
+            self._last_full_forensics = None
+
         # Optional quick plots
         if charting:
             _ = plt.hist(rank_error_calib, bins=30, alpha=0.3, density=1)
@@ -4175,6 +4441,7 @@ class ProofVerifier:
                             (0.001, 0)]
 
         if not validate_by_quantiles_lower(p_values, p_values_red_qt):
+            full_forensics = getattr(self, "_last_full_forensics", None)
             charts_data = {
                 'p_value_distribution': {
                     'type': 'histogram',
@@ -4203,7 +4470,8 @@ class ProofVerifier:
                     'status': status,
                     'total_steps': len(p_values),
                     'mean_pvalue': float(p_values.mean()),
-                    'min_pvalue': float(p_values.min())
+                    'min_pvalue': float(p_values.min()),
+                    'full_forensics': full_forensics,
                 },
                 charts_data=charts_data
             )
@@ -4215,7 +4483,8 @@ class ProofVerifier:
                     'status': status,
                     'total_steps': len(p_values),
                     'mean_pvalue': float(p_values.mean()),
-                    'min_pvalue': float(p_values.min())
+                    'min_pvalue': float(p_values.min()),
+                    'full_forensics': full_forensics,
                 },
                 charts_data=charts_data2
             )            
@@ -4651,7 +4920,8 @@ class ProofVerifier:
                             T8,
                             j4,
                             ctx_bytes,
-                            precision_bytes)
+                            precision_bytes,
+                            nonce=self._v3_nonce_tensor())
         digests   = sha256_many(msg_batch)       # → [batch_size, digest_len]
         return _digest_to_u(digests)             # → [batch_size]
 
@@ -4804,6 +5074,8 @@ class ProofVerifier:
                 ok = (u > (lower - ATOL)) & (u <= (upper + ATOL))
                 if bool(ok.all()):
                     if not self._verify_reuse_entropy(lower, upper):
+                        return False
+                    if not self._verify_v3_admission_tier(lower, upper):
                         return False
                     self.logger.debug(f"✅ All {window_size} steps verified successfully")
                     return True
@@ -5049,6 +5321,11 @@ class ProofVerifier:
         
         if all_passed:
             if not self._verify_reuse_entropy(
+                [result['lower'] for result in results],
+                [result['upper'] for result in results],
+            ):
+                return False
+            if not self._verify_v3_admission_tier(
                 [result['lower'] for result in results],
                 [result['upper'] for result in results],
             ):
@@ -6062,13 +6339,30 @@ class ProofVerifier:
     # ----------------------------------------------------------------- #
     #                        Exposed Interfaces
     # ----------------------------------------------------------------- #
+    @staticmethod
+    def _stash_request_difficulty(_request, d):
+        """Copy BlockValidation.difficulty (the registered model difficulty)
+        onto the proof dict before _load_io. Under option 2 (§6) this is the
+        verifier's v3-active signal AND admission-target input: bcore sends
+        it >0 only when v3 rules are active at the block's height. Quick and
+        full must apply it identically or they disagree on the u preimage.
+        Absent/0 => the proof is replayed under v2 rules."""
+        try:
+            diff = int(_request.get('difficulty') or 0)
+        except (TypeError, ValueError):
+            diff = 0
+        if diff > 0 and not d.get('difficulty'):
+            d['difficulty'] = diff
+
     def quick_verify(self, proof, target_override_hex: Optional[str] = None):
         """Slice 11: ``target_override_hex`` is forwarded into
         ``_verify_block_sanity`` so a share-mode request can be
         accepted under an easier threshold. All non-PoW checks
         (params, sequence) run identically regardless of override."""
         try:
-            d = pfunpack.unpack_validation_request(proof)['request']['pow_blob']
+            _request = pfunpack.unpack_validation_request(proof)['request']
+            d = _request['pow_blob']
+            self._stash_request_difficulty(_request, d)
             self.initialise(d)
 
             with self.logger.verification_context(
@@ -6115,6 +6409,10 @@ class ProofVerifier:
         (the realized reuse gate belongs to mining only)."""
         try:
             d = pfunpack.unpack_validation_request(proof)['request']['pow_blob']
+            # Audit (logits) requests are near-greedy and NOT mining: we never
+            # stash a registered difficulty here, so _v3_active stays false and
+            # the proof replays under v2 rules — the fixed v3 sampler-profile
+            # equality (§5) must not reject a legitimate low-entropy audit.
             # Normalize optional block fields for non-blockchain requests
             defaults = {
                 "tick": 0,
@@ -6162,7 +6460,9 @@ class ProofVerifier:
         the override relaxes ONLY the final PoW threshold; smell
         test and sequence checks are unchanged."""
         try:
-            d = pfunpack.unpack_validation_request(proof)['request']['pow_blob']
+            _request = pfunpack.unpack_validation_request(proof)['request']
+            d = _request['pow_blob']
+            self._stash_request_difficulty(_request, d)
             self.initialise(d)
 
             with self.logger.verification_context(
@@ -6208,9 +6508,61 @@ class ProofVerifier:
             )
             raise
 
+    def _assert_runtime_model_matches(self, proof_identifier: str) -> None:
+        """Defence-in-depth against runtime-state pollution (e.g. a warmup that
+        loaded a different model and restored only the scalar identifiers).
+
+        The scalar identifiers (model_name / commit_hash /
+        _current_model_identifier) can LIE — verify the ACTUAL loaded
+        ``self.model``'s architecture against the proof's declared model. On
+        mismatch raise ModelPlacementError so the caller ABSTAINS / reroutes:
+        recomputing an 8B proof against a resident 0.6B model is an infra fault
+        (produces ~10σ Mahalanobis errors), never a reason to RED a block."""
+        if self.model is None:
+            raise ModelPlacementError(
+                f"no model resident for full verify of {proof_identifier}")
+        exp_name, _, exp_commit = proof_identifier.partition("@")
+        try:
+            exp_cfg = AutoConfig.from_pretrained(
+                exp_name,
+                revision=exp_commit or None,
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+        except Exception as e:  # noqa: BLE001 — can't fetch: don't block, just log
+            raise ModelPlacementError(
+                f"runtime-model assert could not load cached expected config for "
+                f"{proof_identifier}: {e}; abstaining rather than trusting a RED"
+            ) from e
+        got = self.model.config
+        mismatched = []
+        for attr in ("num_hidden_layers", "hidden_size", "vocab_size"):
+            exp_v = getattr(exp_cfg, attr, None)
+            got_v = getattr(got, attr, None)
+            if exp_v is not None and got_v is not None and exp_v != got_v:
+                mismatched.append(f"{attr}: loaded={got_v} expected={exp_v}")
+        if mismatched:
+            n_params = sum(p.numel() for p in self.model.parameters())
+            devices = sorted({str(p.device) for p in self.model.parameters()})
+            self.logger.error(
+                "RUNTIME MODEL MISMATCH — abstaining (not RED)",
+                failure_type="full_verification_runtime_model_mismatch")
+            raise ModelPlacementError(
+                f"runtime model mismatch for proof {proof_identifier}: "
+                f"{'; '.join(mismatched)}; loaded param_count={n_params/1e9:.2f}B "
+                f"devices={devices} "
+                f"tokenizer={getattr(getattr(self,'tokenizer',None),'name_or_path',None)}"
+                f" -> abstaining rather than returning RED")
+
     def full_verify(self, proof):
         try:
-            d = pfunpack.unpack_validation_request(proof)['request']['pow_blob']
+            _request = pfunpack.unpack_validation_request(proof)['request']
+            d = _request['pow_blob']
+            # v3: BlockValidation carries the registered model difficulty
+            # (appended field; 0/absent from old senders). Stash it on the
+            # proof dict BEFORE _load_io so it becomes the v3-active signal +
+            # admission-target input (TIP-0003, option 2).
+            self._stash_request_difficulty(_request, d)
             proof_identifier = (d.get("model_identifier") or "").strip()
             if not proof_identifier:
                 self.logger.error(
@@ -6260,12 +6612,29 @@ class ProofVerifier:
                         f"runtime={runtime_identifier}); abstaining rather than returning RED"
                     )
 
+            # Defence-in-depth: the scalar identifiers now match the proof, but
+            # they can lie if runtime state was polluted (warmup left a 0.6B model
+            # resident while the names read 8B). Prove the ACTUAL loaded model's
+            # architecture matches the proof before we trust any RED it produces.
+            self._assert_runtime_model_matches(proof_identifier)
+
             with self.logger.verification_context(
                 hash_id=d.get('hash'),
                 model_identifier=d.get('model_identifier'),
                 step="full",
                 verification_type="full"
             ):
+                # v3 gate on the FULL path too (§4/§5: the tier rule must be
+                # identical in quick and full — no quick-pass/full-fail gap).
+                # Gated on _v3_active (proof_version>=3 AND registered
+                # difficulty>0), NOT proof.version alone: bcore only advertises
+                # a nonzero difficulty once v3 rules are active at the block's
+                # height, so this replays a pre-activation version-3 blob under
+                # v2 rules exactly as consensus does (§6, option 2).
+                if getattr(self, '_v3_active', False):
+                    if not self._verify_v3_full_gate():
+                        return "RED"
+
                 verifier_version = os.getenv("POW_FULL_VERIFIER_VERSION", "v2").strip().lower()
                 with mca_active(
                     k_lin=float(_K_LIN_CV.get()),

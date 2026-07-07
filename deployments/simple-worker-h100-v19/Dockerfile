@@ -104,7 +104,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git wget unzip \
         libzmq3-dev pkg-config \
         python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python3-pip \
-        libssl-dev libcrypto++-dev && \
+        libssl-dev libcrypto++-dev libargon2-dev && \
     rm -rf /var/lib/apt/lists/*
 
 RUN wget -q https://raw.githubusercontent.com/zeromq/cppzmq/v4.10.0/zmq.hpp -O /usr/include/zmq.hpp
@@ -163,7 +163,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc g++ \
         cuda-nvcc-12-8 \
         git unzip ca-certificates rsync wget curl \
-        libboost-all-dev libflint-dev libzmq3-dev \
+        libboost-all-dev libflint-dev libzmq3-dev libargon2-1 \
         supervisor && \
     rm -rf /var/lib/apt/lists/*
 
@@ -225,6 +225,8 @@ COPY --from=proof-processor-builder /build/tests/build/proof_processor.so \
 # PoW sampling helpers into vllm/sampling/
 COPY shared-utils/pow-utils/common_sampler_helper.py /app/vllm/vllm/sampling/
 COPY shared-utils/pow-utils/pow_utils.py             /app/vllm/vllm/sampling/
+COPY shared-utils/pow-utils/pow_v3.py                /app/vllm/vllm/sampling/
+COPY shared-utils/pow-utils/bcred_table_r1024.py     /app/vllm/vllm/sampling/
 COPY shared-utils/pow-utils/zmq_pow_writer.py        /app/vllm/vllm/sampling/
 COPY shared-utils/pow-utils/uint256_arithmetics.py   /app/vllm/vllm/sampling/
 COPY shared-utils/pow-utils/test/zmq_test_listener.py /app/vllm/vllm/sampling/
@@ -254,6 +256,8 @@ RUN pip install --no-cache-dir -r /app/proxy_requirements.txt
 
 COPY services/miner-api/src /app/miner-proxy/src
 COPY shared-utils/pow-utils/pow_utils.py /app/miner-proxy/src/utils/
+COPY shared-utils/pow-utils/pow_v3.py /app/miner-proxy/src/utils/
+COPY shared-utils/pow-utils/bcred_table_r1024.py /app/miner-proxy/src/utils/
 COPY shared-utils/pow-utils/uint256_arithmetics.py /app/miner-proxy/src/utils/
 COPY shared-utils/config/constants.py /app/miner-proxy/src/config/
 RUN mkdir -p /app/miner-proxy/src/proof && \

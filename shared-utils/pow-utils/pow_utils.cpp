@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "pow_utils.h"
+#include "pow_v3.h"
 #include <openssl/sha.h>
 #include <fstream>
 #include <sstream>
@@ -674,6 +675,10 @@ void ProofWriter::set_compute_precision(const std::string& precision) {
     compute_precision = precision;
 }
 
+void ProofWriter::set_proof_version(int version) {
+    proof_version = version;
+}
+
 std::pair<std::vector<uint8_t>, std::unordered_map<std::string, std::any>>
 ProofWriter::write_proof(
     int seq_id,
@@ -704,6 +709,18 @@ ProofWriter::write_proof(
     }
     // store digest hex for the dict (we’ll convert back below)
     proof["hash"] = bytes_to_hex(digest);
+
+    // v3 (TIP-0003): absent sampler params are a hard failure,
+    // not a default — the recomputed B_cred prices the real params, so a
+    // silently-defaulted value would desync miner and verifier. v2 keeps the
+    // legacy fallbacks byte-for-byte.
+    for (const char* key : {"temperature", "top_p", "top_k",
+                            "repetition_penalty"}) {
+        if (proof_version >= 3 && pow_params.find(key) == pow_params.end()) {
+            throw std::invalid_argument(
+                std::string("v3 proof missing required sampler param: ") + key);
+        }
+    }
 
     if (pow_params.find("temperature") != pow_params.end()) {
         proof["temperature"] = std::string(pow_params.at("temperature"));
@@ -751,6 +768,26 @@ ProofWriter::write_proof(
     }
     if (pow_params.find("difficulty") != pow_params.end()) {
         proof["difficulty"] = pow_params.at("difficulty");
+    }
+
+    // v3 (TIP-0003, §9): the sampler-selected admission nonce
+    // arrives as 64 lowercase hex in pow_params["admission_nonce"]; merge it
+    // into model_config_diff (written verbatim into Proof.extra_flags below)
+    // through the shared helper so existing keys survive. Placed after the
+    // pow_params/window_data/seq_info copies and just before FlatBuffer
+    // serialization — nothing can overwrite the merged member afterwards.
+    // This path never re-grinds and never parses JSON beyond the one merge.
+    {
+        auto nonce_it = pow_params.find("admission_nonce");
+        if (proof_version >= 3 && nonce_it != pow_params.end()) {
+            std::string existing;
+            try {
+                existing = std::any_cast<std::string>(
+                    proof.at("model_config_diff"));
+            } catch (...) { existing = ""; }
+            proof["model_config_diff"] =
+                pow_v3::merge_extra_flags_v3(existing, nonce_it->second);
+        }
     }
 
     // 2) Now *really* serialize into a FlatBuffer:
@@ -832,7 +869,9 @@ ProofWriter::write_proof(
 
     // --- Build the Proof table ---
     proof::ProofBuilder pb(builder);
-    pb.add_version(2);
+    // Wire version from the writer's proof_version member (TIP-0003
+    // §3: version=3 turns on the v3 carrier rules) — never hardcoded.
+    pb.add_version(static_cast<uint32_t>(proof_version));
     pb.add_tick(std::stoll(std::any_cast<std::string>(proof.at("tick"))));
     pb.add_timestamp(std::stoll(std::any_cast<std::string>(proof.at("timestamp"))));
     pb.add_is_solution(is_solution);

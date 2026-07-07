@@ -5,12 +5,22 @@ CXX = g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -O2 -g -Wno-deprecated-declarations
 LDFLAGS ?= -lssl -lcrypto -lzmq
 
+# v3 admission (TIP-0003): `make ARGON2=1` compiles pow_v3 with
+# libargon2 (needs libargon2-dev); default builds the runtime_error fallback
+# so the dev targets stay dependency-free (v2 paths unaffected).
+ifeq ($(ARGON2),1)
+POW_V3_CXXFLAGS := -DPOW_V3_HAVE_ARGON2
+LDFLAGS += -largon2
+else
+POW_V3_CXXFLAGS :=
+endif
+
 # Source files
-SOURCES := pow_utils.cpp pow_zmq_writer.cpp pow_test.cpp compile_test.cpp debug_messages.cpp
-HEADERS := pow_utils.h pow_zmq_writer.h
+SOURCES := pow_utils.cpp pow_v3.cpp bcred_table_r1024.cpp pow_zmq_writer.cpp pow_test.cpp compile_test.cpp debug_messages.cpp
+HEADERS := pow_utils.h pow_v3.h bcred_table_r1024.h pow_zmq_writer.h
 
 # Common objects needed by all targets that use pow_utils symbols
-COMMON_OBJS := pow_utils.o pow_zmq_writer.o
+COMMON_OBJS := pow_utils.o pow_v3.o bcred_table_r1024.o pow_zmq_writer.o
 TEST_OBJ := pow_test.o
 COMPILE_TEST_OBJ := compile_test.o
 DEBUG_OBJ := debug_messages.o
@@ -38,6 +48,12 @@ $(DEBUG_TEST): $(COMMON_OBJS) $(DEBUG_OBJ)
 # Compile source files
 pow_utils.o: pow_utils.cpp $(HEADERS)
 	$(CXX) $(CXXFLAGS) -c pow_utils.cpp -o pow_utils.o
+
+pow_v3.o: pow_v3.cpp pow_v3.h bcred_table_r1024.h
+	$(CXX) $(CXXFLAGS) $(POW_V3_CXXFLAGS) -c pow_v3.cpp -o pow_v3.o
+
+bcred_table_r1024.o: bcred_table_r1024.cpp bcred_table_r1024.h
+	$(CXX) $(CXXFLAGS) -c bcred_table_r1024.cpp -o bcred_table_r1024.o
 
 pow_zmq_writer.o: pow_zmq_writer.cpp pow_zmq_writer.h $(HEADERS)
 	$(CXX) $(CXXFLAGS) -c pow_zmq_writer.cpp -o pow_zmq_writer.o

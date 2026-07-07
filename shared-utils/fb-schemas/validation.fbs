@@ -45,6 +45,21 @@ table BlockValidation {
   pow_blob_hash: [ubyte];
   adjusted_bits: uint32;
   pow_blob: Proof;
+  // Registered model difficulty from the ModelRecord active at the block's
+  // height. Appended field: wire-compatible with old readers/writers.
+  //
+  // Option 2 (TIP-0003) — this field doubles as the verifier's
+  // v3-ACTIVE signal, so there is NO separate v3_active field:
+  //   difficulty == 0  => v3 admission inactive/unavailable at this height;
+  //                       a version>=3 proof is replayed under v2 rules
+  //                       (admission nonce NOT folded into the u preimage),
+  //                       byte-identical to consensus.
+  //   difficulty  > 0  => v3 is ACTIVE; the verifier applies the v3
+  //                       nonce/tier/admission semantics and derives the
+  //                       admission target from this value.
+  // bcore MUST send difficulty > 0 only when Consensus::IsV3Active(height)
+  // is true, and remains authoritative for the admission check itself.
+  difficulty: int64;
 }
 
 table ModelValidation {

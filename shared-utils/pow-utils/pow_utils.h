@@ -191,7 +191,11 @@ private:
     std::string model_config_diff;
     std::string sampling_params_diff;
     std::string ipfs_cid;
-    
+    // Proof schema version: 2 = legacy, >= 3 enables the v3 carrier rules
+    // (TIP-0003: canonical extra_flags, no sampler-param
+    // fallbacks).
+    int proof_version = 2;
+
 public:
     ProofWriter(const std::string& output_dir = "/data/pow_proofs");
     void set_callback(std::function<void(const std::string&)> callback);
@@ -200,6 +204,8 @@ public:
     void set_model_config_diff(const std::string& model_config_diff);
     void set_sampling_params_diff(const std::string& sampling_params_diff);
     void set_compute_precision(const std::string& precision);
+    void set_proof_version(int version);
+    int get_proof_version() const { return proof_version; }
 
     // Getters for accessing metadata fields
     std::string get_model_identifier() const { return model_identifier; }
