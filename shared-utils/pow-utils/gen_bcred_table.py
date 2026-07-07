@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Offline generator for the R=1024 B_cred credit-threshold table (PROMPT
-BINDING.md §4).
+"""Offline generator for the R=1024 B_cred credit-threshold table
+(TIP-0003).
 
 The consensus B_cred score credits, per decode step, an integer number of
 "credit units" (R units == 1 bit) equal to::
