@@ -7,6 +7,7 @@ the mode is off or the proof version is v2."""
 
 import os
 import sys
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -42,7 +43,7 @@ NONCE = bytes(range(32))
 TICK = 42
 PRECISION = "fp16"
 MODEL_ID = "org/model@abcdef012345"
-DIFFICULTY = 1_000_000            # expected_tries = 50 at chain defaults
+DIFFICULTY = 1_000_000            # expected_tries = 60 at chain defaults
 SEQ = "seq_v3"
 ROW = 0
 
@@ -159,6 +160,60 @@ class TestBoundaryScheduling:
         assert call["prompt_commitment"] == pow_v3.prompt_commitment(
             [1, 2, 3], [False] * 3)
         # nonce stored BEFORE the window's first sampled token
+        assert owner.ring_buffers.pow_admission_valid_host[ROW]
+        assert bytes(owner.ring_buffers.pow_admission_nonce[ROW].tolist()) == NONCE
+
+    def test_parallel_grind_all_boundary_rows(self, csh_real):
+        """Two rows at a boundary both grind + store via the concurrent path
+        (thread pool); each row is prepared from its OWN cache (distinct
+        commitments) and the result is order-independent."""
+        owner = _owner()
+        SEQ2, ROW2 = "seq_v3_b", 1
+        owner.seq_caches[SEQ2] = {"archive_list": [7, 8, 9, 10],
+                                  "pad_mask_list": [False] * 4}
+        owner.seq_params[SEQ2] = owner.seq_params[SEQ]
+        spy = _GrindSpy()
+        h = _helper(csh_real, owner, grind_fn=spy)
+        h.ensure_admission_for_rows(
+            [SEQ, SEQ2], [ROW, ROW2], torch.tensor([0, 0], dtype=torch.int32),
+            _ctx_rows([1, 2, 3], [7, 8, 9, 10]), PRECISION)
+        assert len(spy.calls) == 2
+        # distinct prompt commitments prove each row used its own cache (the
+        # pool may run them in either order, so compare as a set)
+        commits = {c["prompt_commitment"] for c in spy.calls}
+        assert len(commits) == 2
+        assert owner.ring_buffers.pow_admission_valid_host[ROW]
+        assert owner.ring_buffers.pow_admission_valid_host[ROW2]
+
+    def test_async_row_parking_lifecycle(self, csh_real):
+        """begin_admission_for_rows submits in the background and reports the row
+        as pending (not yet sampleable); poll_admission stores the nonce and
+        clears pending only once the grind finishes."""
+        import threading
+        owner = _owner()
+        gate = threading.Event()
+
+        def slow_grind(msg_w, model_id, target_le, max_tries, commitment):
+            gate.wait(5)                      # block the worker until released
+            return NONCE
+
+        h = _helper(csh_real, owner, grind_fn=slow_grind)
+        pending = h.begin_admission_for_rows(
+            [SEQ], [ROW], torch.tensor([0], dtype=torch.int32),
+            _ctx_rows([1, 2, 3]), PRECISION)
+        assert ROW in pending                          # parked
+        assert h.poll_admission() == set()             # still grinding
+        assert not owner.ring_buffers.pow_admission_valid_host[ROW]
+
+        gate.set()                                     # let the grind finish
+        ready = set()
+        for _ in range(500):
+            ready = h.poll_admission()
+            if ready:
+                break
+            time.sleep(0.01)
+        assert ROW in ready
+        assert h.pending_admission_rows() == set()
         assert owner.ring_buffers.pow_admission_valid_host[ROW]
         assert bytes(owner.ring_buffers.pow_admission_nonce[ROW].tolist()) == NONCE
 

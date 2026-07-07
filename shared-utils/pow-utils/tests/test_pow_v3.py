@@ -329,16 +329,16 @@ class TestAdmission:
             admission_message(b"msg", "m", NONCE, b"\x00" * 31)
 
     def test_expected_tries_integer_math(self):
-        # defaults: alpha=4/100, decode_us=10_000_000, argon_ref_us=8_000,
-        # normalizer=1_000_000. difficulty == normalizer => decode at
-        # reference: tries = 0.04 * 10s / 8ms = 50.
-        assert admission_expected_tries(1_000_000) == 50
-        # difficulty = normalizer/2 => model is 2x the compute => 100 tries
-        assert admission_expected_tries(500_000) == 100
+        # calibrated defaults (L40S/EPYC 2026-07-07): alpha=4/100,
+        # decode_us=6_000_000, argon_ref_us=4_000, normalizer=1_000_000.
+        # difficulty == normalizer => tries = 0.04 * 6s / 4ms = 60.
+        assert admission_expected_tries(1_000_000) == 60
+        # difficulty = normalizer/2 => model is 2x the compute => 120 tries
+        assert admission_expected_tries(500_000) == 120
         # tiny model, huge difficulty => clamp to 1
         assert admission_expected_tries(10**15) == 1
-        # floor behaviour: difficulty 3e6 => 50/3 = 16.66 -> 16
-        assert admission_expected_tries(3_000_000) == 16
+        # floor behaviour: difficulty 3e6 => 60/3 = 20 exactly
+        assert admission_expected_tries(3_000_000) == 20
 
     def test_expected_tries_rejects_nonpositive_difficulty(self):
         for bad in (0, -5):
@@ -353,7 +353,7 @@ class TestAdmission:
         t_easy = admission_target(10**15)      # tiny model, tries=1
         assert t_hard < t_ref < t_easy
         assert t_easy == UINT256_MAX
-        assert t_ref == UINT256_MAX // 50
+        assert t_ref == UINT256_MAX // 60
 
     def test_admission_valid_little_endian_strict(self):
         # digest bytes little-endian: last byte is most significant.
