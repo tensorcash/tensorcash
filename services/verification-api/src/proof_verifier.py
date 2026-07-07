@@ -1196,6 +1196,19 @@ class ProofVerifier:
         self._gpu_activation_reserve_bytes = int(
             float(os.getenv("POW_GPU_ACTIVATION_RESERVE_GB", "8.0")) * (1 << 30)
         )
+        # Co-residency (keeping >1 model hot on the GPU) is ONLY safe on cards
+        # with enough VRAM to hold multiple working models AND their activation
+        # peak. On tight cards (e.g. a 24GB L4/A5000 running an 8B model whose
+        # full-verify peak is ~22GB) a second parked model forces GPU<->CPU
+        # ping-pong and eviction churn that can corrupt the active model's
+        # verify and produce a FALSE RED. Below this per-GPU total-VRAM
+        # threshold we hold a single model solo (discard on switch) — correct,
+        # at the cost of a reload on model switches (routing minimises those via
+        # model affinity). Default 40GB: co-resident on >=48GB / spark, solo on
+        # 24GB cards.
+        self._coresidency_min_gpu_bytes = int(
+            float(os.getenv("POW_CORESIDENCY_MIN_GPU_GB", "40.0")) * (1 << 30)
+        )
         # Allow CPU inference fallback (dev/CPU-only hosts). In production this
         # stays False so we never silently run an 8B forward on CPU.
         self._allow_cpu_inference = os.getenv(
@@ -1426,6 +1439,26 @@ class ProofVerifier:
             if attr.startswith('_kv_cache') or attr.startswith('_cached_ctx'):
                 delattr(self, attr)
 
+    def _coresidency_enabled(self) -> bool:
+        """Whether it is safe to keep more than one model hot on the GPU.
+
+        Only true on cards whose largest GPU has enough total VRAM to hold
+        multiple working models plus activation peak. On tight cards (24GB
+        L4/A5000 vs an 8B model peaking ~22GB) co-residency forces GPU<->CPU
+        ping-pong / eviction churn that can corrupt the active model's verify
+        and produce a FALSE RED — so we hold a single model solo instead.
+        """
+        if not torch.cuda.is_available():
+            return False
+        try:
+            total = max(
+                torch.cuda.get_device_properties(i).total_memory
+                for i in range(torch.cuda.device_count())
+            )
+        except Exception:
+            return False
+        return total >= self._coresidency_min_gpu_bytes
+
     def _park_current_model(self) -> None:
         """Retire the active model into the registry, keeping it HOT.
 
@@ -1436,6 +1469,14 @@ class ProofVerifier:
         _reclaim_gpu when a new model actually needs the room.
         """
         if not self.model:
+            return
+
+        if not self._coresidency_enabled():
+            # Tight card: never keep a second model resident. Discard the current
+            # model on switch so the incoming model runs SOLO and cleanly loaded,
+            # avoiding the GPU<->CPU ping-pong / eviction churn that can corrupt a
+            # verify and produce a false RED. Correctness over reload latency.
+            self._discard_current_model()
             return
 
         identifier = getattr(self, "_current_model_identifier", None)
@@ -6202,12 +6243,22 @@ class ProofVerifier:
                 bound_identifier = getattr(self, "_current_model_identifier", None)
                 runtime_identifier = f"{self.model_name}@{self.commit_hash}"
                 if bound_identifier != proof_identifier or runtime_identifier != proof_identifier:
+                    # A model-binding mismatch is a WORKER/INFRA condition (the model
+                    # we need is not the one actually bound — a co-residency swap or a
+                    # placement failure under VRAM pressure), NOT evidence the proof is
+                    # invalid. Returning RED here would KILL A VALID BLOCK. Abstain
+                    # instead (raise -> worker publishes status -1 -> broker re-routes
+                    # to a healthy worker without ever recording a RED verdict).
                     self.logger.error(
-                        "Full verification failed: model binding mismatch after forced resync "
+                        "Full verification ABSTAINING (not RED): model binding mismatch after forced resync "
                         f"(proof={proof_identifier}, bound={bound_identifier}, runtime={runtime_identifier})",
                         failure_type="full_verification_model_binding_mismatch"
                     )
-                    return "RED"
+                    raise ModelPlacementError(
+                        "model binding mismatch after forced resync "
+                        f"(proof={proof_identifier}, bound={bound_identifier}, "
+                        f"runtime={runtime_identifier}); abstaining rather than returning RED"
+                    )
 
             with self.logger.verification_context(
                 hash_id=d.get('hash'),
