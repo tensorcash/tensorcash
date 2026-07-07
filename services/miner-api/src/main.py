@@ -6,6 +6,7 @@ Exposes:
 """
 
 import asyncio
+import contextlib
 import logging
 import signal
 import sys
@@ -181,6 +182,43 @@ class MiningProxyApp:
         
         # Broker worker client (if enabled)
         self.worker_client = None
+        self.worker_client_task: asyncio.Task | None = None
+
+    def _start_worker_client_task(self) -> None:
+        if self.worker_client is None:
+            return
+        if self.worker_client_task and not self.worker_client_task.done():
+            return
+        self.worker_client_task = asyncio.create_task(
+            self.worker_client.start(),
+            name="broker_worker_client",
+        )
+        self.worker_client_task.add_done_callback(self._on_worker_client_done)
+
+    def _on_worker_client_done(self, task: asyncio.Task) -> None:
+        if self.worker_client is None:
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            exc = None
+            if self.worker_client.running:
+                logger.warning("[App] Broker worker client task was cancelled")
+            else:
+                logger.debug("[App] Broker worker client task cancelled during shutdown")
+        if exc is not None:
+            logger.error(
+                "[App] Broker worker client task exited: %s",
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+        elif self.worker_client.running:
+            logger.error("[App] Broker worker client task exited while still marked running")
+
+        if self.worker_client.running:
+            logger.warning("[App] Restarting broker worker client task")
+            self.worker_client_task = None
+            self._start_worker_client_task()
 
     async def start(self):
         """Start all services"""
@@ -245,7 +283,7 @@ class MiningProxyApp:
                 # /api/v1/models fetch.
                 request_manager=self.request_manager,
             )
-            asyncio.create_task(self.worker_client.start())
+            self._start_worker_client_task()
             logger.info("[App] Started broker worker client")
         else:
             logger.info(f"Broker worker disabled (WORKER_MODE={constants.WORKER_MODE})")
@@ -264,6 +302,11 @@ class MiningProxyApp:
         # Stop broker worker client (if it was started)
         if self.worker_client:
             await self.worker_client.stop()
+        if self.worker_client_task and not self.worker_client_task.done():
+            self.worker_client_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.worker_client_task
+        self.worker_client_task = None
 
         # Stop async services
         await self.request_manager.stop()
