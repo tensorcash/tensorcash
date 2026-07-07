@@ -595,8 +595,7 @@ class BrokerWorkerClient:
         # reads schema_version + networks + supported_modes + max_parallel
         # to decide whether and how to dispatch mining work; without
         # these fields the scheduler MUST treat the worker as
-        # mining_capable=False even if `enabled` is true. See
-        # COMPUTE_BROKER_IMPROV.md §"Effective Runtime Config".
+        # mining_capable=False even if `enabled` is true.
         mining_capability = None
         if self.mining_enabled:
             # mining_modes follows the worker's actual capabilities:
@@ -3905,10 +3904,9 @@ class BrokerWorkerClient:
         Validates the typed schema, mints a BlockHeader FlatBuffer from
         the broker-supplied template, and feeds it into
         ``zmq_listener._process_mining_job`` — the same downstream entry
-        point the legacy ZMQ source used. The conversion is the
-        BrokerMiningContextAdapter from COMPUTE_BROKER_IMPROV.md, inlined
-        here so we don't introduce a new class for what's effectively
-        a per-request transform.
+        point the legacy ZMQ source used. The broker-context-to-mining-job
+        conversion is inlined here so we don't introduce a new class for
+        what's effectively a per-request transform.
         """
         from components.mining_protocol import (  # local import to avoid early-import cost
             MineRequest, MineResult, MiningProtocolError,

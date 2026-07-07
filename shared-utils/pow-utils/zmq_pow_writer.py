@@ -18,8 +18,8 @@ from proof import MiningResponse, Proof, FloatArray, UIntArray
 
 logger = logging.getLogger(__name__)
 
-# Mutually-exclusive PoW egress modes (COMPUTE_BROKER_IMPROV.md §"PoW
-# writer egress envvar contract"). The mode chooses both the primary
+# Mutually-exclusive PoW egress modes (the PoW writer egress envvar
+# contract). The mode chooses both the primary
 # destination and whether dual-publish to a secondary "proxy" socket is
 # allowed; the two modes are not meant to coexist in one deployment.
 _EGRESS_MODE_LOCAL_MINER = "local_miner"

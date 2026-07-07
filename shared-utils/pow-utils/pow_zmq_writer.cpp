@@ -80,8 +80,7 @@ MiningResponseWriter::MiningResponseWriter(size_t max_queue_size)
     // validate it BEFORE touching any other env var so a misconfigured
     // node fails loudly at construction rather than silently leaking
     // solutions to Core Node from a worker that thinks it's in broker
-    // mode. See COMPUTE_BROKER_IMPROV.md §"PoW writer egress envvar
-    // contract".
+    // mode (see the egress-mode contract in pow_zmq_writer.h).
     egress_mode_ = get_env_var("POW_EGRESS_MODE", kEgressModeLocalMiner);
     if (egress_mode_ != kEgressModeLocalMiner &&
         egress_mode_ != kEgressModeBroker) {
