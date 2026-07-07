@@ -3737,69 +3737,69 @@
  ],
  "target_derivation": [
   {
-   "admission_target_hex_be": "00000055e63b88c230e77e7ee106959b5d3e1e9ea69ebac0b0b4be383479da36",
-   "argon_ref_us": 8000,
-   "decode_us_at_normalizer": 10000000,
+   "admission_target_hex_be": "0000004795319ca1d36b941466302756cdb3c42ee02ef0f5e8969e842bbae082",
+   "argon_ref_us": 4000,
+   "decode_us_at_normalizer": 6000000,
    "difficulty": 1,
    "elig_alpha": [
     4,
     100
    ],
-   "expected_tries": 50000000,
+   "expected_tries": 60000000,
    "normalizer": 1000000
   },
   {
-   "admission_target_hex_be": "0083126e978d4fdf3b645a1cac083126e978d4fdf3b645a1cac083126e978d4f",
-   "argon_ref_us": 8000,
-   "decode_us_at_normalizer": 10000000,
+   "admission_target_hex_be": "006d3a06d3a06d3a06d3a06d3a06d3a06d3a06d3a06d3a06d3a06d3a06d3a06d",
+   "argon_ref_us": 4000,
+   "decode_us_at_normalizer": 6000000,
    "difficulty": 100000,
    "elig_alpha": [
     4,
     100
    ],
-   "expected_tries": 500,
+   "expected_tries": 600,
    "normalizer": 1000000
   },
   {
-   "admission_target_hex_be": "028f5c28f5c28f5c28f5c28f5c28f5c28f5c28f5c28f5c28f5c28f5c28f5c28f",
-   "argon_ref_us": 8000,
-   "decode_us_at_normalizer": 10000000,
+   "admission_target_hex_be": "0222222222222222222222222222222222222222222222222222222222222222",
+   "argon_ref_us": 4000,
+   "decode_us_at_normalizer": 6000000,
    "difficulty": 500000,
    "elig_alpha": [
     4,
     100
    ],
-   "expected_tries": 100,
+   "expected_tries": 120,
    "normalizer": 1000000
   },
   {
-   "admission_target_hex_be": "051eb851eb851eb851eb851eb851eb851eb851eb851eb851eb851eb851eb851e",
-   "argon_ref_us": 8000,
-   "decode_us_at_normalizer": 10000000,
+   "admission_target_hex_be": "0444444444444444444444444444444444444444444444444444444444444444",
+   "argon_ref_us": 4000,
+   "decode_us_at_normalizer": 6000000,
    "difficulty": 1000000,
    "elig_alpha": [
     4,
     100
    ],
-   "expected_tries": 50,
+   "expected_tries": 60,
    "normalizer": 1000000
   },
   {
-   "admission_target_hex_be": "0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-   "argon_ref_us": 8000,
-   "decode_us_at_normalizer": 10000000,
+   "admission_target_hex_be": "0ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+   "argon_ref_us": 4000,
+   "decode_us_at_normalizer": 6000000,
    "difficulty": 3000000,
    "elig_alpha": [
     4,
     100
    ],
-   "expected_tries": 16,
+   "expected_tries": 20,
    "normalizer": 1000000
   },
   {
    "admission_target_hex_be": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-   "argon_ref_us": 8000,
-   "decode_us_at_normalizer": 10000000,
+   "argon_ref_us": 4000,
+   "decode_us_at_normalizer": 6000000,
    "difficulty": 1000000000000,
    "elig_alpha": [
     4,
@@ -3810,8 +3810,8 @@
   },
   {
    "admission_target_hex_be": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-   "argon_ref_us": 8000,
-   "decode_us_at_normalizer": 10000000,
+   "argon_ref_us": 4000,
+   "decode_us_at_normalizer": 6000000,
    "difficulty": 1000000000000000,
    "elig_alpha": [
     4,

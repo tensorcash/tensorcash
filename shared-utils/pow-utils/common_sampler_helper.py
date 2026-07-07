@@ -2,7 +2,14 @@
 # common_sampler.py
 import time, torch, struct, hashlib
 import os
-from collections import deque
+from collections import deque, namedtuple
+from concurrent.futures import ThreadPoolExecutor
+
+# One boundary row's fully-prepared admission grind (pure inputs — no GPU/ring
+# access), so the expensive Argon2 grind can run off the engine thread.
+_AdmissionJob = namedtuple(
+    "_AdmissionJob",
+    "row seq_id difficulty msg_w model_id target_le max_tries commitment")
 from vllm.sampling.pow_utils import PowState, sha256_many, _tok_le_bytes, _u32le, _str_bytes, _build_msg, _digest_to_u, POW_WINDOW_SIZE, check_hash_against_target, SequenceCache, Logger,RowManager,RingBuffers,PowHasher,ProofWriter, hex_to_bytes_tensor
 from vllm.sampling.zmq_pow_writer import MiningResponseSubmitter
 from vllm.sampling.uint256_arithmetics import get_compact
@@ -88,6 +95,12 @@ class CommonSamplerHelper:
         self._admission_grind_fn = None       # injectable for tests
         self._admission_grind_resolved = False
         self._admission_warned_no_grinder = False
+        # Async (row-parking) admission state: row -> (_AdmissionJob, Future).
+        # A boundary row grinds in the background while other rows keep sampling;
+        # poll_admission() harvests finished nonces. Drives the non-blocking
+        # begin_admission_for_rows/poll_admission API (vs the blocking
+        # ensure_admission_for_rows). Empty unless the async path is used.
+        self._adm_pending = {}
 
     def assert_v3_ready(self):
         """Startup self-test for v3 mining (fail fast, never at the first
@@ -146,34 +159,162 @@ class CommonSamplerHelper:
         0). Must run BEFORE batch_sample_tokens hashes those steps — the
         nonce enters every u of the window (§6: admission is pre-decode).
         No-op unless POW_V3_ADMISSION_MODE=always and proof version >= 3,
-        so the default hot path pays nothing."""
+        so the default hot path pays nothing.
+
+        The grinds are independent per row and any nonce < target is valid, so
+        they run CONCURRENTLY: the native admission_grind releases the GIL, so a
+        thread pool grinds all boundary rows at once instead of serially (a batch
+        of B fresh prompts otherwise costs B x single-grind before the first
+        token). Stale-nonce clears and result writes stay on the engine thread;
+        only the pure-C++ grind runs on workers."""
         if self.admission_mode != 'always':
             return
         if int(getattr(self.s.proof_writer, 'proof_version', 2) or 2) < pow_v3.V3_PROOF_VERSION:
             return
         boundary = (steps == 0).nonzero(as_tuple=False).flatten().tolist()
+        if not boundary:
+            return
+        grind_fn = self._resolve_admission_grind_fn()
+        if grind_fn is None:
+            self._warn_no_grinder()
+            return
+        # Prepare (engine thread): build preimages + clear stale nonces.
+        jobs = []
         for i in boundary:
             row = rows[i]
             if row is None:
                 continue
-            self.ensure_admission_for_window(
+            job = self._prepare_admission(
                 seq_ids[i], row, contexts[i].tolist(), 0, compute_precision)
+            if job is not None:
+                jobs.append(job)
+        if not jobs:
+            return
+        # Grind. One row runs inline (no pool/scheduling overhead); many rows
+        # fan out across the pool (bounded to ~physical cores — 8 MiB Argon2 is
+        # memory-bandwidth-bound past that).
+        if len(jobs) == 1:
+            results = [(jobs[0], self._grind(grind_fn, jobs[0]))]
+        else:
+            pool = self._admission_pool()
+            futs = [(j, pool.submit(self._grind, grind_fn, j)) for j in jobs]
+            results = [(j, f.result()) for j, f in futs]
+        # Store (engine thread): ring-buffer writes are not worker-safe.
+        for job, nonce in results:
+            self._store_admission_result(job, nonce)
 
-    def ensure_admission_for_window(self, seq_id, row, context_tokens,
-                                    step_idx, compute_precision):
-        """Decide THIS window's admission for one row: clear any stale nonce
-        (a nonce admits exactly one window — msg_w changes at every
-        boundary), grind against the registered-difficulty target, and store
-        the selected 32 bytes in RingBuffers before the window's first
-        sampled token. Returns True iff an admissible nonce was stored."""
-        rb = self.s.ring_buffers
-        rb.write_admission_nonce(row, None)
+    # ----- true async admission (row parking) — non-blocking API ------------- #
+    # Unlike ensure_admission_for_rows (which blocks the sampler until every
+    # boundary nonce is ground), this lets a boundary row grind in the BACKGROUND
+    # while the other rows keep sampling. The sampler drives it per tick:
+    #   pending = begin_admission_for_rows(...)   # submit new boundaries, get not-ready set
+    #   ... sample only rows NOT in `pending` ...
+    #   begin_admission_for_rows already polled; use poll_admission() again if needed
+    # A row's window-first token cannot be sampled until its nonce lands (the nonce
+    # enters the step hash), so the CALLER must exclude `pending` rows from
+    # batch_sample_tokens AND from commit this tick — that exclusion is the
+    # engine-level integration (see design note; not wired here).
+
+    def begin_admission_for_rows(self, seq_ids, rows, steps, contexts,
+                                 compute_precision):
+        """NON-BLOCKING. Submit a background grind for every boundary row
+        (steps==0) that is not already pending or ready, harvest anything already
+        finished, and return the set of rows whose nonce is NOT yet available
+        (the caller must not sample those this tick). No-op set unless
+        POW_V3_ADMISSION_MODE=always and proof version >= 3."""
+        if self.admission_mode != 'always':
+            return set()
+        if int(getattr(self.s.proof_writer, 'proof_version', 2) or 2) < pow_v3.V3_PROOF_VERSION:
+            return set()
+        grind_fn = self._resolve_admission_grind_fn()
+        if grind_fn is None:
+            self._warn_no_grinder()
+            return set()
+        boundary = (steps == 0).nonzero(as_tuple=False).flatten().tolist()
+        pool = None
+        for i in boundary:
+            row = rows[i]
+            if row is None or row in self._adm_pending:
+                continue
+            job = self._prepare_admission(
+                seq_ids[i], row, contexts[i].tolist(), 0, compute_precision)
+            if job is None:
+                continue                      # skip -> mines nonce-less, not parked
+            if pool is None:
+                pool = self._admission_pool()
+            self._adm_pending[row] = (job, pool.submit(self._grind, grind_fn, job))
+        self.poll_admission()                 # harvest any already-finished grinds
+        return set(self._adm_pending)
+
+    def poll_admission(self):
+        """NON-BLOCKING. Store the nonce for every finished grind and drop it from
+        the pending set. Returns the set of rows that just became ready."""
+        if not self._adm_pending:
+            return set()
+        ready = set()
+        for row, (job, fut) in list(self._adm_pending.items()):
+            if fut.done():
+                self._store_admission_result(job, fut.result())
+                del self._adm_pending[row]
+                ready.add(row)
+        return ready
+
+    def pending_admission_rows(self):
+        """Rows whose admission grind is still in flight (must not be sampled)."""
+        return set(self._adm_pending)
+
+    @staticmethod
+    def _grind(grind_fn, job):
+        return grind_fn(job.msg_w, job.model_id, job.target_le,
+                        job.max_tries, job.commitment)
+
+    def _admission_pool(self):
+        """Lazily-built grind pool. Sized to leave one core for the engine
+        thread; override with POW_V3_GRIND_THREADS. Argon2 8 MiB scales ~linearly
+        to physical cores then flattens (memory bandwidth), so more is wasteful."""
+        pool = getattr(self, "_adm_pool", None)
+        if pool is None:
+            default = max(1, (os.cpu_count() or 2) - 1)
+            raw = os.environ.get("POW_V3_GRIND_THREADS")
+            n = default
+            if raw:
+                try:
+                    n = int(raw)
+                except (TypeError, ValueError):
+                    self.s.logger.log(
+                        f"POW_V3_GRIND_THREADS={raw!r} is not an int — using "
+                        f"default {default}", "WARN")
+                else:
+                    if n < 1:
+                        self.s.logger.log(
+                            f"POW_V3_GRIND_THREADS={n} < 1 — clamping to 1", "WARN")
+                        n = 1
+            pool = ThreadPoolExecutor(max_workers=n, thread_name_prefix="v3grind")
+            self._adm_pool = pool
+        return pool
+
+    def _warn_no_grinder(self):
+        if not self._admission_warned_no_grinder:
+            self._admission_warned_no_grinder = True
+            self.s.logger.log(
+                "v3 admission requested but native admission_grind is "
+                "unavailable (proof_processor.so without argon2?) — "
+                "mining nonce-less; [B_FLOOR, B_FREE) windows will be "
+                "forfeited", "ERROR")
+
+    def _prepare_admission(self, seq_id, row, context_tokens, step_idx,
+                           compute_precision):
+        """Build one row's grind inputs and CLEAR its stale nonce (a nonce admits
+        exactly one window — msg_w changes at every boundary). Returns an
+        _AdmissionJob, or None to skip (row mines nonce-less). Pure prep: no grind,
+        no result write, so it is safe to run before fanning grinds out to workers."""
+        self.s.ring_buffers.write_admission_nonce(row, None)
 
         snapshot = self.s.seq_params.get(seq_id, {}).get("pow_snapshot")
         if not snapshot:
             self.s.logger.log(
                 f"v3 admission skipped for seq {seq_id}: no pow_snapshot", "WARN")
-            return False
+            return None
         difficulty = snapshot.get("difficulty")
         try:
             difficulty = int(difficulty)
@@ -183,54 +324,63 @@ class CommonSamplerHelper:
             self.s.logger.log(
                 f"v3 admission skipped for seq {seq_id}: no registered "
                 f"difficulty on snapshot", "WARN")
-            return False
+            return None
 
-        grind_fn = self._resolve_admission_grind_fn()
-        if grind_fn is None:
-            if not self._admission_warned_no_grinder:
-                self._admission_warned_no_grinder = True
-                self.s.logger.log(
-                    "v3 admission requested but native admission_grind is "
-                    "unavailable (proof_processor.so without argon2?) — "
-                    "mining nonce-less; [B_FLOOR, B_FREE) windows will be "
-                    "forfeited", "ERROR")
-            return False
-
-        # msg_w: the SAME preimage batch_sample_tokens will hash for this
-        # window's first step, without the nonce (§6). Header falls back to
-        # block_hash exactly like the sampling path.
+        # Build the grind preimage through the SINGLE shared source so the
+        # sampler and the scheduler produce byte-identical bytes (§6). msg_w is
+        # this window's first-step preimage (header falls back to block_hash
+        # exactly like the sampling path); the commitment binds the full
+        # pre-window prefix (the archive at the boundary IS the eventual proof's
+        # prompt tokens).
         header_hex = snapshot.get("header_prefix") or snapshot.get("block_hash")
-        msg_w = pow_v3.build_step_message(
-            bytes.fromhex(header_hex),
-            bytes.fromhex(snapshot["vdf"]),
-            int(snapshot["tick"]),
-            int(step_idx),
-            context_tokens,
-            compute_precision,
-        )
-        # Full pre-window prefix (§6): the archive at the boundary IS
-        # prompt_tokens of the eventual proof (archive[:-256] at emission).
         cache = self.s.seq_caches.get(seq_id, {})
-        commitment = pow_v3.prompt_commitment(
-            cache.get("archive_list", []) or [],
-            cache.get("pad_mask_list", []) or [],
-        )
-        target_le = pow_v3.admission_target(difficulty).to_bytes(32, "little")
-        max_tries = (pow_v3.admission_expected_tries(difficulty)
-                     * self.admission_max_tries_factor)
         model_identifier = (getattr(self.s.proof_writer, "model_identifier",
                                     None) or "unknown")
+        msg_w, model_identifier, target_le, max_tries, commitment = \
+            pow_v3.build_admission_preimage(
+                header_prefix=bytes.fromhex(header_hex),
+                vdf=bytes.fromhex(snapshot["vdf"]),
+                tick=int(snapshot["tick"]),
+                step=int(step_idx),
+                context_tokens=context_tokens,
+                prefix_tokens=cache.get("archive_list", []) or [],
+                prefix_pad_mask=cache.get("pad_mask_list", []) or [],
+                precision=compute_precision,
+                difficulty=difficulty,
+                model_identifier=model_identifier,
+                max_tries_factor=self.admission_max_tries_factor,
+            )
+        return _AdmissionJob(row, seq_id, difficulty, msg_w,
+                             model_identifier, target_le, max_tries, commitment)
 
-        nonce = grind_fn(bytes(msg_w), model_identifier, target_le,
-                         int(max_tries), bytes(commitment))
+    def _store_admission_result(self, job, nonce):
+        """Engine-thread: write the ground nonce (or note exhaustion). Returns
+        True iff a nonce was stored."""
         if nonce is None:
             self.s.logger.log(
-                f"v3 admission grind exhausted {max_tries} tries for seq "
-                f"{seq_id} (difficulty {difficulty}) — window mined "
+                f"v3 admission grind exhausted {job.max_tries} tries for seq "
+                f"{job.seq_id} (difficulty {job.difficulty}) — window mined "
                 f"nonce-less", "WARN")
             return False
-        rb.write_admission_nonce(row, bytes(nonce))
+        self.s.ring_buffers.write_admission_nonce(job.row, bytes(nonce))
         return True
+
+    def ensure_admission_for_window(self, seq_id, row, context_tokens,
+                                    step_idx, compute_precision):
+        """Single-row serial path (startup self-test + unit tests). Clears any
+        stale nonce, grinds against the registered-difficulty target, and stores
+        the selected 32 bytes before the window's first sampled token. Returns
+        True iff an admissible nonce was stored. The batch hot path uses
+        ensure_admission_for_rows (concurrent)."""
+        job = self._prepare_admission(seq_id, row, context_tokens, step_idx,
+                                      compute_precision)
+        if job is None:
+            return False
+        grind_fn = self._resolve_admission_grind_fn()
+        if grind_fn is None:
+            self._warn_no_grinder()
+            return False
+        return self._store_admission_result(job, self._grind(grind_fn, job))
 
     def init_sequence_cache(self, seq_id, prompt_tokens):
         W = self.s.window_size

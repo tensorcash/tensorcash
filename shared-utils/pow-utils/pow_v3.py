@@ -99,9 +99,12 @@ ARGON2_SALT = b"TC_V3_ADMISSION!"
 
 # Reference timings in integer microseconds (§1) — integer so the target
 # derivation is exact in every language.
-ARGON_REF_US = 8_000                     # CALIBRATION: Argon2 eval on ref HW
-DECODE_US_AT_NORMALIZER = 10_000_000     # CALIBRATION: 256-window decode at
-                                         # difficulty == ModelDifficultyNormalizer
+ARGON_REF_US = 4_000                     # CALIBRATION: Argon2id(8MiB,t=1,l=1) eval,
+                                         # measured 4010us on EPYC 7R13 (2026-07-07)
+DECODE_US_AT_NORMALIZER = 6_000_000      # CALIBRATION: one 256-window standalone
+                                         # decode at difficulty == ModelDifficultyNormalizer;
+                                         # measured B=1 5.97s, Qwen3-8B bf16 on L40S
+                                         # → expected_tries = 60 at normalizer
 
 MODEL_DIFFICULTY_NORMALIZER = 1_000_000  # consensus/params.h default
 
@@ -427,6 +430,38 @@ def admission_valid(digest: bytes, target: int) -> bool:
     if len(digest) != ARGON2_HASH_LEN:
         raise ValueError("admission digest must be 32 bytes")
     return int.from_bytes(digest, "little") < int(target)
+
+
+def build_admission_preimage(*, header_prefix: bytes, vdf: bytes, tick: int,
+                             step: int, context_tokens, prefix_tokens,
+                             prefix_pad_mask, precision: str, difficulty: int,
+                             model_identifier: str,
+                             max_tries_factor: int = 1):
+    """SINGLE SOURCE for the v3 admission grind inputs (§6/§9). Returns the exact
+    5-tuple the native grind consumes:
+
+        (msg_w, model_identifier, target_le, max_tries, commitment)
+
+    Both the miner sampler (common_sampler_helper) and the scheduler
+    (AdmissionScheduler) MUST build the grind preimage through this one function
+    so it is byte-identical on both sides — a nonce ground here validates when the
+    sampler hashes the same msg_w at sample time. Every model/precision/difficulty
+    input is EXPLICIT: no hidden process-global (`model_identifier` and `precision`
+    come from the writer on vLLM and from the pow payload on llama.cpp, so the
+    caller must pass them in).
+
+    - msg_w binds this window's first-step preimage (header|vdf|tick|step|
+      ctx_window|precision, NO nonce): `context_tokens` is the rolling window
+      (build_step_message keeps its last `POW_WINDOW_SIZE`).
+    - commitment binds the full pre-window prefix: `prefix_tokens`/`prefix_pad_mask`
+      are the archive before this window (the eventual proof's prompt tokens)."""
+    difficulty = int(difficulty)
+    msg_w = build_step_message(bytes(header_prefix), bytes(vdf), int(tick),
+                               int(step), context_tokens, precision)
+    commitment = prompt_commitment(prefix_tokens, prefix_pad_mask)
+    target_le = admission_target(difficulty).to_bytes(32, "little")
+    max_tries = int(admission_expected_tries(difficulty) * int(max_tries_factor))
+    return bytes(msg_w), str(model_identifier), target_le, max_tries, bytes(commitment)
 
 
 # --------------------------------------------------------------------------- #
