@@ -122,7 +122,11 @@ jobs:
     # Apple signing/notarization secrets gated behind an admin-approved environment.
     environment: release
     needs: validate
-    if: github.event.inputs.platforms != 'windows-only' && github.event.inputs.platforms != 'linux-only'
+    # Skipped on pull_request: the `release` environment's deployment-branch
+    # policy only allows main and v* refs, so this job can never start from a
+    # PR branch — it would be rejected before runner assignment. macOS builds
+    # run on push to main, tags, and manual dispatch.
+    if: github.event_name != 'pull_request' && github.event.inputs.platforms != 'windows-only' && github.event.inputs.platforms != 'linux-only'
     timeout-minutes: 120
 
     strategy:
