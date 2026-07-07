@@ -383,6 +383,11 @@ class RingBuffers:
         self.pow_block_hash = torch.zeros((max_rows, 32), dtype=torch.uint8, device=device)  # 32-byte block hash
         self.pow_header_len = torch.zeros(max_rows, dtype=torch.int32, device=device)    # actual header length (32 or 76)
         self.pow_valid = torch.zeros(max_rows, dtype=torch.bool, device=device)          # whether pow params are set
+        # Host mirrors for per-row message-width metadata. These are written at
+        # row allocation alongside the GPU tensors and let the hot sampling path
+        # avoid header_len.unique()/item() GPU->CPU syncs every decode step.
+        self.pow_header_len_host = [0] * max_rows
+        self.pow_vdf_len_host = [0] * max_rows
 
         # --- legacy-compatible views on top of packed blocks ---
         # float views
@@ -420,6 +425,8 @@ class RingBuffers:
         self.pow_share_target[row].zero_()
         self.pow_block_hash[row].zero_()
         self.pow_header_len[row] = 0
+        self.pow_header_len_host[row] = 0
+        self.pow_vdf_len_host[row] = 0
         self.pow_valid[row] = False
 
     def write_pow_params(self, row: int, pow_snapshot: dict):
@@ -434,11 +441,15 @@ class RingBuffers:
         """
         if pow_snapshot is None:
             self.pow_valid[row] = False
+            self.pow_header_len_host[row] = 0
+            self.pow_vdf_len_host[row] = 0
             return
 
         vdf_hex = pow_snapshot.get("vdf", "")
         self.pow_tick[row] = pow_snapshot["tick"]
         self.pow_request_id[row] = pow_snapshot.get("request_id", 0)
+        self.pow_header_len_host[row] = 0
+        self.pow_vdf_len_host[row] = 0
 
         # Decode and write header
         header_hex = pow_snapshot.get("header_prefix", "")
@@ -447,6 +458,7 @@ class RingBuffers:
             hlen = min(header_bytes.numel(), 76)
             self.pow_header[row, :hlen] = header_bytes[:hlen]
             self.pow_header_len[row] = hlen
+            self.pow_header_len_host[row] = int(hlen)
         else:
             self.pow_header_len[row] = 0
 
@@ -457,6 +469,9 @@ class RingBuffers:
             vlen = min(vdf_bytes.numel(), 1024)  # VDF can be up to 1024 bytes
             self.pow_vdf[row, :vlen] = vdf_bytes[:vlen]
             self.pow_vdf_len[row] = vlen
+            self.pow_vdf_len_host[row] = int(vlen)
+        else:
+            self.pow_vdf_len[row] = 0
 
         # Decode and write target (32 bytes)
         target_hex = pow_snapshot.get("target", "")
@@ -491,9 +506,10 @@ class RingBuffers:
             self.pow_block_hash[row, :bhlen] = bh_bytes[:bhlen]
 
         # If no header_prefix, use block_hash as header
-        if self.pow_header_len[row] == 0 and block_hash_hex:
+        if self.pow_header_len_host[row] == 0 and block_hash_hex:
             self.pow_header[row, :bhlen] = self.pow_block_hash[row, :bhlen]
             self.pow_header_len[row] = bhlen
+            self.pow_header_len_host[row] = int(bhlen)
 
         self.pow_valid[row] = True
 
@@ -519,6 +535,13 @@ class RingBuffers:
         self.pow_target[r].zero_()
         self.pow_block_hash[r].zero_()
         self.pow_header_len[r] = 0
+        if isinstance(rows, torch.Tensor):
+            rows_iter = rows.detach().cpu().tolist()
+        else:
+            rows_iter = rows
+        for row in rows_iter:
+            self.pow_header_len_host[int(row)] = 0
+            self.pow_vdf_len_host[int(row)] = 0
         self.pow_valid[r] = False
 
     def _write_buffers(self, pos, rows, logits, indices, tokens, probs, u, mask, normalizers, stats):
@@ -629,7 +652,7 @@ class PowHasher:
             self.ipfs_cid = payload["ipfs_cid"]
 
     # @pow_profiler
-    def batch_sample_tokens(self, contexts, steps, cdfs, compute_precision, ring_buffers=None, rows_tensor=None, pow_snapshot=None):
+    def batch_sample_tokens(self, contexts, steps, cdfs, compute_precision, ring_buffers=None, rows_tensor=None, rows_host=None, pow_snapshot=None):
         """Sample tokens for multiple sequences in a batch.
 
         Args:
@@ -639,6 +662,9 @@ class PowHasher:
             compute_precision: Precision string (e.g., 'fp16')
             ring_buffers: RingBuffers instance with per-row pow params (preferred)
             rows_tensor: (B,) tensor of row indices to read pow params from ring_buffers
+            rows_host: Optional host list/tuple of the same row indices. When
+                provided, per-row message widths are read from RingBuffers'
+                host mirrors instead of unique()/item() on CUDA tensors.
             pow_snapshot: DEPRECATED - Optional dict for backwards compatibility
 
         When ring_buffers and rows_tensor are provided, pow params are read directly
@@ -664,18 +690,39 @@ class PowHasher:
             # T8 needs to be (B, 4) for per-row tick values
             T8_batch = _u32le(ticks.to(torch.uint32))  # (B, 4)
 
-            # Check if we can use fast batched path (all same header and VDF lengths)
-            unique_hlens = header_lens.unique()
-            unique_vlens = vdf_lens.unique()
+            host_lengths = None
+            if rows_host is not None:
+                rows_host = [int(r) for r in rows_host]
+                if len(rows_host) != B:
+                    raise ValueError(
+                        f"rows_host length {len(rows_host)} does not match batch {B}")
+                host_lengths = [
+                    (ring_buffers.pow_header_len_host[r],
+                     ring_buffers.pow_vdf_len_host[r])
+                    for r in rows_host
+                ]
 
             if compute_precision != self.prior_precision:
                 self.precision_bytes = _str_bytes(compute_precision, batch_size=1, device=self.device)
                 self.prior_precision = compute_precision
 
-            if len(unique_hlens) == 1 and len(unique_vlens) == 1:
+            if host_lengths is not None:
+                same_lengths = all(lengths == host_lengths[0]
+                                   for lengths in host_lengths)
+            else:
+                # Fallback for old callers: this path has the original
+                # per-step GPU->CPU sync and should not be used by V1.
+                unique_hlens = header_lens.unique()
+                unique_vlens = vdf_lens.unique()
+                same_lengths = len(unique_hlens) == 1 and len(unique_vlens) == 1
+
+            if same_lengths:
                 # All same lengths - fast batched path
-                hlen = unique_hlens[0].item()
-                vlen = unique_vlens[0].item()
+                if host_lengths is not None:
+                    hlen, vlen = host_lengths[0]
+                else:
+                    hlen = unique_hlens[0].item()
+                    vlen = unique_vlens[0].item()
                 header_data = headers[:, :hlen]  # (B, hlen)
                 vdf_data = vdfs[:, :vlen]  # (B, vlen)
                 pb = self.precision_bytes.expand(B, -1)
@@ -700,8 +747,11 @@ class PowHasher:
                 all_digests = []
 
                 for i in range(B):
-                    hlen = header_lens[i].item()
-                    vlen = vdf_lens[i].item()
+                    if host_lengths is not None:
+                        hlen, vlen = host_lengths[i]
+                    else:
+                        hlen = header_lens[i].item()
+                        vlen = vdf_lens[i].item()
                     header_i = headers[i, :hlen].unsqueeze(0)  # (1, hlen)
                     vdf_i = vdfs[i, :vlen].unsqueeze(0)  # (1, vlen)
                     T8_i = T8_batch[i].unsqueeze(0)  # (1, 4)
@@ -1198,10 +1248,224 @@ def serialize_proof(obj: dict) -> bytes:
     b.Finish(root, file_identifier=b"PROF")
     return bytes(b.Output())
 
-# @pow_profiler
-def sha256_many(msg: torch.ByteTensor) -> torch.ByteTensor:
-    """Ship whole batch to CPU once, hash there, copy one (B,32) back."""
-    assert msg.dtype == torch.uint8 and msg.ndim == 2
+# ======================================================================
+# GPU SHA-256 (Triton) — byte-exact, fixed-length batched path
+# ----------------------------------------------------------------------
+# Removes the GPU->CPU->hashlib->GPU round trip for CUDA inputs. In every
+# production call path the rows of a single sha256_many() call are the same
+# length (rectangular `_build_msg`, and the 80-/32-byte double-SHA in
+# `check_solution`); the per-row ragged case is already split into
+# one-row calls upstream. So the kernel hashes a fixed `L` bytes per row —
+# no ragged masking, one launch, no device round trip.
+#
+# Availability is gated on Triton exactly like vLLM gates its own kernels:
+# the runtime image may force-disable Triton (HAS_TRITON=False), in which
+# case we keep the byte-exact CPU hashlib fallback below. The CPU path is
+# the reference oracle; the Triton path MUST produce identical bytes — see
+# tests/test_sha256_gpu_equivalence.py.
+# ======================================================================
+try:
+    # Authoritative flag inside the vLLM runtime (some images set it False).
+    from vllm.triton_utils import HAS_TRITON as _VLLM_HAS_TRITON  # type: ignore
+except Exception:
+    _VLLM_HAS_TRITON = None
+
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_IMPORTABLE = True
+except Exception:
+    _TRITON_IMPORTABLE = False
+
+# Explicit kill-switch independent of vLLM's flag (set to "1" to force CPU).
+_POW_SHA256_DISABLE_TRITON = os.getenv("POW_SHA256_DISABLE_TRITON", "0") == "1"
+_sha256_triton_warned = False
+
+# SHA-256 round constants (host copy used only to build the device tensor).
+_SHA256_K_PY = (
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+)
+_sha256_k_cache: dict = {}  # device -> int64 (64,) tensor of round constants
+
+# Rows (independent messages) processed per Triton program. Power of two.
+_SHA256_ROWS = 64
+
+
+def _sha256_use_triton() -> bool:
+    """Use the Triton kernel only when Triton is importable, not force-disabled
+    by the vLLM runtime, and not killed via the POW_SHA256_DISABLE_TRITON env."""
+    if _POW_SHA256_DISABLE_TRITON or not _TRITON_IMPORTABLE:
+        return False
+    return _VLLM_HAS_TRITON is not False
+
+
+def _sha256_k_dev(device) -> "torch.Tensor":
+    t = _sha256_k_cache.get(device)
+    if t is None:
+        t = torch.tensor(_SHA256_K_PY, dtype=torch.int64, device=device)
+        _sha256_k_cache[device] = t
+    return t
+
+
+if _TRITON_IMPORTABLE:
+
+    @triton.jit
+    def _rotr32(x, n: tl.constexpr):
+        # x holds a 32-bit value in an int64; rotate right by n (0<n<32).
+        return ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF
+
+    @triton.jit
+    def _blkword(msg_ptr, row_base, bb, p: tl.constexpr, Lc, last8, bitlen,
+                 rmask, ROWS: tl.constexpr):
+        # Build schedule word `p` (0..15) of the current block from its 4 bytes,
+        # applying SHA-256 padding (0x80) and the 64-bit big-endian bit length
+        # where this position falls at/after the message end. `p` is
+        # compile-time; bb/Lc/last8/bitlen are runtime scalars.
+        word = tl.zeros((ROWS,), tl.int64)
+        for k in range(4):
+            pos = bb + (p * 4 + k)
+            in_msg = pos < Lc
+            is_pad = pos == Lc
+            in_len = pos >= last8
+            data = tl.load(msg_ptr + row_base + pos,
+                           mask=rmask & in_msg, other=0).to(tl.int64)
+            len_idx = pos - last8
+            shift = tl.maximum(tl.minimum((7 - len_idx) * 8, 56), 0)
+            len_byte = (bitlen >> shift) & 0xFF
+            bval = data + 0x80 * is_pad.to(tl.int64) + len_byte * in_len.to(tl.int64)
+            word = (word << 8) | (bval & 0xFF)
+        return word & 0xFFFFFFFF
+
+    @triton.jit
+    def _store_word(out_ptr, out_row, widx: tl.constexpr, hv, rmask):
+        # Serialize a 32-bit state word big-endian into out[*, widx*4 .. +4].
+        tl.store(out_ptr + out_row + (widx * 4 + 0), ((hv >> 24) & 0xFF).to(tl.uint8), mask=rmask)
+        tl.store(out_ptr + out_row + (widx * 4 + 1), ((hv >> 16) & 0xFF).to(tl.uint8), mask=rmask)
+        tl.store(out_ptr + out_row + (widx * 4 + 2), ((hv >> 8) & 0xFF).to(tl.uint8), mask=rmask)
+        tl.store(out_ptr + out_row + (widx * 4 + 3), (hv & 0xFF).to(tl.uint8), mask=rmask)
+
+    @triton.jit
+    def _sha256_fixed_kernel(msg_ptr, out_ptr, k_ptr, B, L, n_blocks,
+                             ROWS: tl.constexpr):
+        """One program hashes ROWS independent messages, each exactly L bytes.
+
+        msg: (B, L) uint8 contiguous; out: (B, 32) uint8; k_ptr: (64,) int64.
+        The 16-word message schedule lives in 16 named registers (m0..m15)
+        rotated one slot per round, so at round t: m0=W[t-16], m1=W[t-15],
+        m9=W[t-7], m14=W[t-2]. Triton 3.3.0's frontend rejects Python
+        list/tuple subscripting and comprehensions inside @triton.jit, so no
+        container is ever indexed.
+        """
+        pid = tl.program_id(0)
+        rows = pid * ROWS + tl.arange(0, ROWS)          # (ROWS,) int32
+        rmask = rows < B
+        row_base = rows.to(tl.int64) * L                # byte offset of each row
+
+        Lc = L.to(tl.int64)
+        bitlen = Lc * 8
+        last8 = n_blocks.to(tl.int64) * 64 - 8          # start of the 8 length bytes
+
+        h0 = tl.full((ROWS,), 0x6a09e667, tl.int64)
+        h1 = tl.full((ROWS,), 0xbb67ae85, tl.int64)
+        h2 = tl.full((ROWS,), 0x3c6ef372, tl.int64)
+        h3 = tl.full((ROWS,), 0xa54ff53a, tl.int64)
+        h4 = tl.full((ROWS,), 0x510e527f, tl.int64)
+        h5 = tl.full((ROWS,), 0x9b05688c, tl.int64)
+        h6 = tl.full((ROWS,), 0x1f83d9ab, tl.int64)
+        h7 = tl.full((ROWS,), 0x5be0cd19, tl.int64)
+
+        for bidx in range(0, n_blocks):
+            bb = bidx.to(tl.int64) * 64
+            m0 = _blkword(msg_ptr, row_base, bb, 0, Lc, last8, bitlen, rmask, ROWS)
+            m1 = _blkword(msg_ptr, row_base, bb, 1, Lc, last8, bitlen, rmask, ROWS)
+            m2 = _blkword(msg_ptr, row_base, bb, 2, Lc, last8, bitlen, rmask, ROWS)
+            m3 = _blkword(msg_ptr, row_base, bb, 3, Lc, last8, bitlen, rmask, ROWS)
+            m4 = _blkword(msg_ptr, row_base, bb, 4, Lc, last8, bitlen, rmask, ROWS)
+            m5 = _blkword(msg_ptr, row_base, bb, 5, Lc, last8, bitlen, rmask, ROWS)
+            m6 = _blkword(msg_ptr, row_base, bb, 6, Lc, last8, bitlen, rmask, ROWS)
+            m7 = _blkword(msg_ptr, row_base, bb, 7, Lc, last8, bitlen, rmask, ROWS)
+            m8 = _blkword(msg_ptr, row_base, bb, 8, Lc, last8, bitlen, rmask, ROWS)
+            m9 = _blkword(msg_ptr, row_base, bb, 9, Lc, last8, bitlen, rmask, ROWS)
+            m10 = _blkword(msg_ptr, row_base, bb, 10, Lc, last8, bitlen, rmask, ROWS)
+            m11 = _blkword(msg_ptr, row_base, bb, 11, Lc, last8, bitlen, rmask, ROWS)
+            m12 = _blkword(msg_ptr, row_base, bb, 12, Lc, last8, bitlen, rmask, ROWS)
+            m13 = _blkword(msg_ptr, row_base, bb, 13, Lc, last8, bitlen, rmask, ROWS)
+            m14 = _blkword(msg_ptr, row_base, bb, 14, Lc, last8, bitlen, rmask, ROWS)
+            m15 = _blkword(msg_ptr, row_base, bb, 15, Lc, last8, bitlen, rmask, ROWS)
+
+            a, b_, c, d, e, f, g, hh = h0, h1, h2, h3, h4, h5, h6, h7
+            for t in range(64):
+                if t >= 16:
+                    # m0 (=W[t-16]) is updated in place to W[t]
+                    s0 = (_rotr32(m1, 7) ^ _rotr32(m1, 18) ^ (m1 >> 3)) & 0xFFFFFFFF
+                    s1 = (_rotr32(m14, 17) ^ _rotr32(m14, 19) ^ (m14 >> 10)) & 0xFFFFFFFF
+                    m0 = (m0 + s0 + m9 + s1) & 0xFFFFFFFF
+                wt = m0
+                kt = tl.load(k_ptr + t)
+                S1 = (_rotr32(e, 6) ^ _rotr32(e, 11) ^ _rotr32(e, 25)) & 0xFFFFFFFF
+                ch = (e & f) ^ ((e ^ 0xFFFFFFFF) & g)
+                temp1 = (hh + S1 + ch + kt + wt) & 0xFFFFFFFF
+                S0 = (_rotr32(a, 2) ^ _rotr32(a, 13) ^ _rotr32(a, 22)) & 0xFFFFFFFF
+                maj = (a & b_) ^ (a & c) ^ (b_ & c)
+                temp2 = (S0 + maj) & 0xFFFFFFFF
+                hh = g
+                g = f
+                f = e
+                e = (d + temp1) & 0xFFFFFFFF
+                d = c
+                c = b_
+                b_ = a
+                a = (temp1 + temp2) & 0xFFFFFFFF
+                # rotate the 16-word schedule window left by one slot
+                m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15 = \
+                    m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15, m0
+
+            h0 = (h0 + a) & 0xFFFFFFFF
+            h1 = (h1 + b_) & 0xFFFFFFFF
+            h2 = (h2 + c) & 0xFFFFFFFF
+            h3 = (h3 + d) & 0xFFFFFFFF
+            h4 = (h4 + e) & 0xFFFFFFFF
+            h5 = (h5 + f) & 0xFFFFFFFF
+            h6 = (h6 + g) & 0xFFFFFFFF
+            h7 = (h7 + hh) & 0xFFFFFFFF
+
+        out_row = rows.to(tl.int64) * 32
+        _store_word(out_ptr, out_row, 0, h0, rmask)
+        _store_word(out_ptr, out_row, 1, h1, rmask)
+        _store_word(out_ptr, out_row, 2, h2, rmask)
+        _store_word(out_ptr, out_row, 3, h3, rmask)
+        _store_word(out_ptr, out_row, 4, h4, rmask)
+        _store_word(out_ptr, out_row, 5, h5, rmask)
+        _store_word(out_ptr, out_row, 6, h6, rmask)
+        _store_word(out_ptr, out_row, 7, h7, rmask)
+
+
+def _sha256_many_triton(msg: torch.ByteTensor) -> torch.ByteTensor:
+    """Fixed-length batched SHA-256 on the GPU, byte-identical to hashlib.
+
+    Caller guarantees msg.is_cuda, B>0, L>0 and a uniform row length.
+    """
+    msg_c = msg.contiguous()
+    B, L = msg_c.shape
+    out = torch.empty((B, 32), dtype=torch.uint8, device=msg_c.device)
+    n_blocks = (L + 9 + 63) // 64                      # >= 1; 1 byte 0x80 + 8 len
+    k_dev = _sha256_k_dev(msg_c.device)
+    grid = (triton.cdiv(B, _SHA256_ROWS),)
+    _sha256_fixed_kernel[grid](msg_c, out, k_dev, B, L, n_blocks,
+                               ROWS=_SHA256_ROWS)
+    return out
+
+
+def _sha256_many_cpu(msg: torch.ByteTensor) -> torch.ByteTensor:
+    """Byte-exact reference path: ship the batch to CPU once, hash with
+    hashlib, copy one (B,32) back. Also the fallback when Triton is off."""
     device = msg.device
     B, L = msg.shape
 
@@ -1221,6 +1485,34 @@ def sha256_many(msg: torch.ByteTensor) -> torch.ByteTensor:
 
     # 4) single hop back to original device
     return out_cpu.to(device, non_blocking=True)
+
+
+# @pow_profiler
+def sha256_many(msg: torch.ByteTensor) -> torch.ByteTensor:
+    """Batch SHA-256: (B, L) uint8 -> (B, 32) uint8 big-endian digests.
+
+    Hashes the full L bytes of each row (all rows share L in every production
+    call path). On CUDA with Triton available the work stays on the GPU; the
+    CPU hashlib path is the byte-exact fallback/reference."""
+    assert msg.dtype == torch.uint8 and msg.ndim == 2
+    device = msg.device
+    B, L = msg.shape
+
+    # Degenerate shapes: keep them on the simple, proven path.
+    if B == 0:
+        return torch.empty((0, 32), dtype=torch.uint8, device=device)
+
+    if msg.is_cuda and L > 0 and _sha256_use_triton():
+        try:
+            return _sha256_many_triton(msg)
+        except Exception as exc:  # never break sampling on a kernel issue
+            global _sha256_triton_warned
+            if not _sha256_triton_warned:
+                _sha256_triton_warned = True
+                print(f"[pow_utils] Triton SHA-256 unavailable, falling back "
+                      f"to CPU hashlib: {exc!r}")
+
+    return _sha256_many_cpu(msg)
 
 # @pow_profiler
 def check_hash_against_target(digest: torch.ByteTensor,

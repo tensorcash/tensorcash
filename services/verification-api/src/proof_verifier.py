@@ -59,7 +59,7 @@ import tempfile
 import warnings
 import psutil
 from itertools import product
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import sys
 import struct
 from pathlib import Path
@@ -1116,6 +1116,16 @@ def dedupe_keep_max_dense(idx_raw: torch.Tensor,
 #                          ProofVerifier Class                                #
 # --------------------------------------------------------------------------- #
 
+class ModelPlacementError(RuntimeError):
+    """Raised when a model cannot be placed on the GPU.
+
+    We refuse to silently run an 8B forward pass on CPU (which turns a ~50s
+    verify into ~700s and trips probe timeouts). Callers should surface this
+    as a retryable execution error so the job is failed fast / re-routed to a
+    worker that can hold the model, instead of blocking on CPU inference.
+    """
+
+
 class ProofVerifier:
     """Statistical Proof-of-Work verifier with comprehensive validation.
     
@@ -1173,8 +1183,29 @@ class ProofVerifier:
         else:
             self.logger = logger
 
-        # Model registry for caching/stashing (key -> PreTrainedModel)
-        self._model_registry: Dict[str, PreTrainedModel] = {}
+        # Model registry for hot-caching (key -> PreTrainedModel), LRU-ordered
+        # (oldest first). Unlike the old design this holds *parked* models on
+        # the GPU whenever VRAM allows, so switching between a small set of
+        # models (e.g. 0.6B + 8B) is a pointer swap, not a 16GB CPU<->GPU copy.
+        # Models are only demoted to CPU / dropped under real VRAM pressure
+        # (see _reclaim_gpu).
+        self._model_registry: "OrderedDict[str, PreTrainedModel]" = OrderedDict()
+        # Headroom (bytes) to keep free on the active GPU for activations/KV
+        # after the active model is resident. Parked co-resident models are
+        # evicted to preserve this margin. Tune per-GPU via env.
+        self._gpu_activation_reserve_bytes = int(
+            float(os.getenv("POW_GPU_ACTIVATION_RESERVE_GB", "8.0")) * (1 << 30)
+        )
+        # Allow CPU inference fallback (dev/CPU-only hosts). In production this
+        # stays False so we never silently run an 8B forward on CPU.
+        self._allow_cpu_inference = os.getenv(
+            "POW_ALLOW_CPU_INFERENCE", "false"
+        ).strip().lower() in {"1", "true", "yes"}
+        # Inline smell-stats bake (the 21-52 min _collect_logits_stats pass) is
+        # OFF on the load/verify path — the full-verify path never reads
+        # self.stats, and the quick/share path is pre-baked by the warmup loop.
+        # The warmup path sets this True to force the bake.
+        self._allow_inline_stats_bake = False
         self.model: Optional[PreTrainedModel] = None
         self.tokenizer = None
         self.initialised = False     
@@ -1357,20 +1388,22 @@ class ProofVerifier:
 
         # Decision logic:
         if not same_model:
-            # Different model - stash current and load new
+            # Different model - park current (keep it hot on GPU if VRAM
+            # allows) and load/reuse the new one.
             if self.model is not None:
-                self._stash_current_model()
-            # Check if new model is already stashed
+                self._park_current_model()
+            # Check if new model is already resident
             if new_identifier in self._model_registry:
                 self.logger.debug(f"  ✅ New model {new_identifier} found in registry")
             else:
                 self.logger.debug(f"  ⚠️  New model {new_identifier} not in registry - will need to download")
             self._load_or_reuse_model()
         elif force_model_reload:
-            # Force reload of same model
+            # Force reload of same model — discard the current instance
+            # entirely (do NOT park/reuse) so we truly reload fresh.
             self.logger.debug(f"  🔄 Force reloading model: {new_identifier}")
-            if self.model is not None:
-                self._stash_current_model()
+            self._discard_current_model()
+            self._model_registry.pop(new_identifier, None)
             self._load_or_reuse_model(force=True)
         elif self.model is None:
             # Same model but not currently loaded
@@ -1387,78 +1420,186 @@ class ProofVerifier:
     #                           Model handling                               #
     # --------------------------------------------------------------------- #
 
-    def _stash_current_model(self) -> None:
-        """Move current model to CPU (if possible) and register it for reuse."""
+    def _clear_kv_caches(self) -> None:
+        """Drop any per-model KV / context caches hanging off the instance."""
+        for attr in list(self.__dict__.keys()):
+            if attr.startswith('_kv_cache') or attr.startswith('_cached_ctx'):
+                delattr(self, attr)
+
+    def _park_current_model(self) -> None:
+        """Retire the active model into the registry, keeping it HOT.
+
+        Unlike the old _stash_current_model this does NOT move the model to
+        CPU — it leaves it exactly where it is (ideally the GPU) and simply
+        moves the reference into the LRU registry so a later switch back is a
+        pointer swap. VRAM is only reclaimed lazily, on demand, by
+        _reclaim_gpu when a new model actually needs the room.
+        """
         if not self.model:
             return
 
-        # Get the identifier of the CURRENT model, not the new one
-        # We need to determine this from the model itself or track it separately
-        if not hasattr(self, '_current_model_identifier'):
-            # This shouldn't happen in normal flow, but let's be defensive
-            self.logger.debug("  ⚠️  Warning: Current model identifier not tracked")
+        identifier = getattr(self, "_current_model_identifier", None)
+        if not identifier:
+            # Untracked model — we can't key it for reuse, so drop it.
+            self.logger.debug("  ⚠️  Current model identifier not tracked — discarding")
+            self._discard_current_model()
             return
 
-        identifier = self._current_model_identifier
+        self._clear_kv_caches()
 
-        # Check if already stashed - if so, just clear the current reference
         if identifier in self._model_registry:
-            self.logger.debug(f"  ✅ Model {identifier} already stashed, clearing current reference")
-            del self.model
+            # Already parked (shouldn't normally happen); keep the parked copy
+            # and drop the duplicate active reference.
             self.model = None
-            self._ensure_clean_switch()
             return
 
-        cpu_free = self._get_available_cpu_mem()
-        model_bytes = self._estimate_model_size(self.model)
+        self._model_registry[identifier] = self.model
+        self._model_registry.move_to_end(identifier)  # most-recently-used
+        self.model = None
 
-        if model_bytes < cpu_free - (512 << 20):  # leave 512 MB margin
-            self.logger.debug(f"  🔄 Stashing model {identifier} on CPU RAM …")
-            # Clear any KV caches before moving to CPU
-            for attr in list(self.__dict__.keys()):
-                if attr.startswith('_kv_cache') or attr.startswith('_cached_ctx'):
-                    delattr(self, attr)
+    def _discard_current_model(self) -> None:
+        """Free the active model entirely (GPU memory reclaimed)."""
+        if self.model is None:
+            return
+        self._clear_kv_caches()
+        del self.model
+        self.model = None
+        self._ensure_clean_switch()
 
-            # Move to CPU and register with the CURRENT model's identifier
-            self.model.to("cpu")
-            self._model_registry[identifier] = self.model
-
-            # Clear the reference to ensure GPU memory is freed
-            self.model = None
-
-            # Ensure clean GPU state
+    def _evict_registry_entry(self, identifier: str) -> None:
+        """Drop a parked model from the registry, freeing its memory."""
+        model = self._model_registry.pop(identifier, None)
+        if model is None:
+            return
+        try:
+            del model
+        finally:
             self._ensure_clean_switch()
-        else:
-            warnings.warn(
-                f"Not enough CPU RAM to stash model {identifier} – discarding instead.",
-                RuntimeWarning,
+
+    def _reclaim_gpu(self, target_free_bytes: int) -> None:
+        """Evict LRU *parked* GPU-resident models until `target_free_bytes` is
+        free on some GPU, or nothing is left to evict.
+
+        Parked models are demoted to CPU RAM when it fits (so switching back is
+        a cheap copy, not a disk reload), otherwise dropped. The active model
+        (self.model) is never touched here.
+        """
+        if not torch.cuda.is_available() or target_free_bytes <= 0:
+            return
+
+        def _max_free() -> int:
+            mem = self._get_all_gpu_mem()
+            return max(mem.values()) if mem else 0
+
+        # Iterate LRU order (oldest first). Only GPU-resident parked models
+        # help; CPU-parked ones already hold no GPU memory.
+        for identifier in list(self._model_registry.keys()):
+            if _max_free() >= target_free_bytes:
+                return
+            model = self._model_registry.get(identifier)
+            if model is None:
+                continue
+            try:
+                on_gpu = next(model.parameters()).device.type == "cuda"
+            except StopIteration:
+                on_gpu = False
+            if not on_gpu:
+                continue
+
+            model_bytes = self._estimate_model_size(model)
+            cpu_free = self._get_available_cpu_mem()
+            if model_bytes < cpu_free - (512 << 20):
+                self.logger.debug(f"  🔄 Demoting parked model {identifier} GPU→CPU to reclaim VRAM")
+                model.to("cpu")
+            else:
+                self.logger.debug(f"  🗑️  Dropping parked model {identifier} (CPU RAM full) to reclaim VRAM")
+                self._model_registry.pop(identifier, None)
+                del model
+            self._ensure_clean_switch()
+
+    def _place_model_on_gpu(self, model: "PreTrainedModel", est_bytes: int) -> None:
+        """Move `model` onto the best-fit GPU, evicting parked models if needed.
+
+        Raises ModelPlacementError if the model cannot be made GPU-resident and
+        CPU inference is not explicitly permitted.
+        """
+        if not torch.cuda.is_available():
+            if not self._allow_cpu_inference:
+                raise ModelPlacementError("CUDA unavailable and CPU inference disabled")
+            self.device = "cpu"
+            return
+
+        needed = int(est_bytes * 1.05)
+        self._reclaim_gpu(needed)
+
+        gpu_mem = self._get_all_gpu_mem()
+        best_gpu = max(
+            (idx for idx, free in gpu_mem.items() if free > needed),
+            key=gpu_mem.get,
+            default=None,
+        )
+        if best_gpu is None:
+            if self._allow_cpu_inference:
+                self.logger.warning("  ⚠️  No GPU fits model; running on CPU (POW_ALLOW_CPU_INFERENCE)")
+                model.to("cpu")
+                self.device = "cpu"
+                return
+            raise ModelPlacementError(
+                f"model needs ~{needed >> 20}MB but no GPU has room after eviction"
             )
-            # Clear all references and force cleanup
-            del self.model
-            self.model = None
-            self._ensure_clean_switch()
-        
+
+        self.logger.debug(f"  🚀 Placing model on cuda:{best_gpu}")
+        model.to(f"cuda:{best_gpu}")
+        self.device = f"cuda:{best_gpu}"
+        self._clear_kv_caches()
+
+    def _trim_coresident_models(self) -> None:
+        """Preserve an activation-memory margin on the active GPU by evicting
+        parked co-resident models that would eat into the reserve."""
+        if not torch.cuda.is_available():
+            return
+        self._reclaim_gpu(self._gpu_activation_reserve_bytes)
+
+    def _assert_gpu_resident(self) -> None:
+        """Fail closed if the active model ended up on CPU when it shouldn't."""
+        if self.model is None or self._allow_cpu_inference or not torch.cuda.is_available():
+            return
+        try:
+            dev = next(self.model.parameters()).device
+        except StopIteration:
+            return
+        if dev.type != "cuda":
+            raise ModelPlacementError(
+                f"model {getattr(self, '_current_model_identifier', '?')} "
+                f"is on {dev}, refusing CPU inference"
+            )
+
     def _load_or_reuse_model(self, force: bool = False) -> None:
         """Load model, trying to reuse cached instance if present."""
         identifier = f"{self.model_name}@{self.commit_hash}"
 
         # Check if model is actually in registry AND not forced reload
         if not force and identifier in self._model_registry:
-            print(f"  ♻️  Found cached model {identifier} in registry")
-            # Pop from registry and assign
+            self.logger.debug(f"  ♻️  Reusing resident model {identifier}")
+            # Pop from registry and make it the active model
             self.model = self._model_registry.pop(identifier)
 
             # Ensure tokenizer is loaded before moving model
             self._ensure_tokenizer()
 
-            # Move to GPU if possible
-            if str(next(self.model.parameters()).device) == "cpu" and torch.cuda.is_available():
-                self._promote_cached_model_to_gpu()
+            # Promote to GPU if it was demoted to CPU under prior VRAM pressure;
+            # otherwise it is already GPU-resident — just a pointer swap.
+            dev = next(self.model.parameters()).device
+            if dev.type == "cpu" and torch.cuda.is_available():
+                self._place_model_on_gpu(self.model, self._estimate_model_size(self.model))
             else:
-                self.device = str(next(self.model.parameters()).device)
+                self.device = str(dev)
 
             # Update tracker
             self._current_model_identifier = identifier
+
+            # Refuse to run inference on CPU (turns 50s into 700s).
+            self._assert_gpu_resident()
 
             # Ensure MCA attention hooks are attached (idempotent)
             try:
@@ -1466,23 +1607,12 @@ class ProofVerifier:
                 mca_attach_attn_hooks(self.model)
             except Exception as _e:
                 self.logger.debug(f"MCA hooks attach skipped (reuse): {_e}")
-            
-            # -------------------------------------------------------------- #
-            #                   Perfrom model smell test calibration
-            # -------------------------------------------------------------- #        
-            try:
-                self._load_stats()
-            except:
-                if self.perform_smell_test:
-                    self.stats = self._collect_logits_stats(seq_length = 1,
-                                                              total_tokens= 1_000_000,
-                                                              batch_size = 40,
-                                                              inert_topk =2000,
-                                                              chunk_size=256,
-                                                             )
-                    self._save_stats(self.stats, force=True)
-                else:
-                    self.stats = None                              
+
+            # Keep an activation-memory margin free on the active GPU.
+            self._trim_coresident_models()
+
+            # Smell-test stats: load if pre-baked, never bake inline here.
+            self._load_or_defer_stats()
             return
 
         # No cached model found - need to load fresh
@@ -1493,7 +1623,42 @@ class ProofVerifier:
             )
         # Update tracker after successful load
         self._current_model_identifier = identifier
- 
+
+    def _load_or_defer_stats(self) -> None:
+        """Load pre-baked smell-test stats if present; otherwise defer.
+
+        The full-verify path never reads ``self.stats`` (only the quick/share
+        smell path does), and the warmup loop is responsible for pre-baking the
+        ``_stats.h5`` for every advertised model. So on the hot verify path we
+        NEVER run the 21-52 min ``_collect_logits_stats`` bake inline — we load
+        the cached stats or set ``self.stats = None`` and move on. Only the
+        warmup path (``self._allow_inline_stats_bake = True``) pays the bake.
+        """
+        try:
+            self._load_stats()
+            return
+        except Exception:
+            pass
+
+        if self.perform_smell_test and self._allow_inline_stats_bake:
+            self.logger.warning(
+                "Baking smell-test stats inline for %s@%s (warmup path) …",
+                self.model_name, self.commit_hash,
+            )
+            self.stats = self._collect_logits_stats(
+                seq_length=1, total_tokens=1_000_000,
+                batch_size=40, inert_topk=2000, chunk_size=256,
+            )
+            self._save_stats(self.stats, force=True)
+        else:
+            if self.perform_smell_test:
+                self.logger.warning(
+                    "Smell-test stats missing for %s@%s — deferring bake to warmup "
+                    "(full verify does not require stats)",
+                    self.model_name, self.commit_hash,
+                )
+            self.stats = None
+
     def _estimate_model_size(self, model: Optional[PreTrainedModel] = None) -> int:
         """Estimate model size in bytes: #params × dtype bytes."""
         bytes_per_elem = _DTYPE_BYTES[self.dtype]
@@ -1552,22 +1717,17 @@ class ProofVerifier:
         return mem
 
     def _ensure_clean_switch(self) -> None:
-        """Ensure GPU memory is fully cleared before model operations."""
+        """Release freed GPU allocations so mem_get_info reflects reality.
+
+        Deliberately lightweight — a synchronize + empty_cache is enough to let
+        the caching allocator return freed blocks. The old version also looped
+        reset_peak_memory_stats over every device and slept 100ms, which added
+        pure latency to every model operation for no functional benefit.
+        """
         if torch.cuda.is_available():
-            # Clear all GPU caches
-            torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
-            # Reset memory stats
-            for i in range(torch.cuda.device_count()):
-                with torch.cuda.device(i):
-                    torch.cuda.reset_peak_memory_stats()
-                    torch.cuda.empty_cache()
-
-            # Small sleep to ensure CUDA operations complete
-            import time
-            time.sleep(0.1)
-            
     # ----------------------------------------------------------------- #
     #                        Model Load / Promote                       #
     # ----------------------------------------------------------------- #
@@ -1673,18 +1833,28 @@ class ProofVerifier:
         # -------------------------------------------------------------- #
         device_map: str | Dict | None = None
         if torch.cuda.is_available():
-            gpu_mem = self._get_all_gpu_mem()
             model_bytes_est = self._estimate_model_size(None)
+            # Evict LRU parked models first so a fresh load lands directly on
+            # the GPU (avoids a CPU load + promote round-trip).
+            self._reclaim_gpu(int(model_bytes_est * 1.05))
+            gpu_mem = self._get_all_gpu_mem()
             # Pick best GPU with 20 % buffer
             best_gpu = max(
-                (idx for idx, free in gpu_mem.items() if free > model_bytes_est * 1.2),
+                (idx for idx, free in gpu_mem.items() if free > model_bytes_est * 1.05),
                 key=gpu_mem.get,
                 default=None,
             )
             if best_gpu is not None:
                 device_map = {"": best_gpu}
                 self.logger.debug(f"  🎯 Loading model directly on cuda:{best_gpu}")
-        # fallback to CPU if no gpu fits / unavailable
+        # Never silently load an 8B model on CPU and run a ~700s forward pass —
+        # fail fast so the job is re-routed to a worker that can hold it.
+        if device_map is None and torch.cuda.is_available() and not self._allow_cpu_inference:
+            raise ModelPlacementError(
+                f"model {self.model_name}@{self.commit_hash} needs "
+                f"~{int(model_bytes_est or 0) >> 20}MB but no GPU has room after eviction"
+            )
+        # fallback to CPU only when CUDA is absent (or explicitly permitted)
         if device_map is None:
             self.logger.warning("  ⚠️  Loading model on CPU (GPU insufficient or absent)")
             device_map = {"": "cpu"}
@@ -1721,22 +1891,17 @@ class ProofVerifier:
             self.logger.debug(f"MCA hooks attach skipped: {_e}")
         self.logger.debug(f"  ✅ Model loaded – dtypes: {set(p.dtype for p in self.model.parameters())}")
 
-        # -------------------------------------------------------------- #
-        #                   Perfrom model smell test calibration
-        # -------------------------------------------------------------- #        
+        # Record where the model actually landed and refuse CPU inference.
         try:
-            self._load_stats()
-        except:
-            if self.perform_smell_test:
-                self.stats = self._collect_logits_stats(seq_length = 1,
-                                                          total_tokens= 1_000_000,
-                                                          batch_size = 40,
-                                                          inert_topk =2000,
-                                                          chunk_size=256,
-                                                         )
-                self._save_stats(self.stats, force=True)
-            else:
-                self.stats = None 
+            self.device = str(next(self.model.parameters()).device)
+        except StopIteration:
+            pass
+        self._assert_gpu_resident()
+        self._trim_coresident_models()
+
+        # Smell-test stats: load if pre-baked, never bake inline on this path
+        # (full verify does not read self.stats; the warmup loop bakes).
+        self._load_or_defer_stats()
         return True
         
     def _ensure_tokenizer(self) -> None:
@@ -3161,10 +3326,13 @@ class ProofVerifier:
     def _verify_parameters(self) -> bool:
         """Verify proof parameters are within bounds."""
         with self.logger.verification_context(step="parameter_validation"):
+            # Match the live C++ Quick verifier envelope: endpoints are valid
+            # for mining proofs, so a Quick-accepted boundary proof must not be
+            # rejected by Full only because Python used stricter inequalities.
             checks = [
-                (TOPK_MIN < self.top_k <= TOPK_MAX, f"top_k out of range: {self.top_k}"),
-                (TOPP_MIN < self.top_p <= TOPP_MAX, f"top_p out of range: {self.top_p}"),
-                (TEMP_MIN < self.temperature < TEMP_MAX, f"temperature out of range: {self.temperature}"),
+                (TOPK_MIN <= self.top_k <= TOPK_MAX, f"top_k out of range: {self.top_k}"),
+                (TOPP_MIN <= self.top_p <= TOPP_MAX, f"top_p out of range: {self.top_p}"),
+                (TEMP_MIN <= self.temperature <= TEMP_MAX, f"temperature out of range: {self.temperature}"),
                 (REP_PENALTY < self.repetition_penalty <= 1, f"repetition_penalty out of range: {self.repetition_penalty}"),
             ]
             failed_checks = []
