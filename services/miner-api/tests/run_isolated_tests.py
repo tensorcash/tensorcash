@@ -95,11 +95,11 @@ def create_discriminant(seed, disc_size):
     config_constants = config_dir / "constants.py"
     config_constants.write_text('''
 """Mock configuration constants"""
-TOPK_MIN = 0
-TOPK_MAX = 100
-TOPP_MIN = 0.0
+TOPK_MIN = 5
+TOPK_MAX = 50
+TOPP_MIN = 0.1
 TOPP_MAX = 1.0
-TEMP_MIN = 0.0
+TEMP_MIN = 0.25
 TEMP_MAX = 2.0
 DEFAULT_TOP_K = 50
 DEFAULT_TOP_P = 1.0

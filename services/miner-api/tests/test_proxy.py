@@ -506,9 +506,10 @@ class TestRequestManager(AioHTTPTestCase):
         test_cases = [
             # (input, expected_top_k, expected_top_p, expected_temp)
             ({}, 50, 1.0, 1.0),  # Defaults
-            ({"top_k": 100, "top_p": 0.9, "temperature": 0.7}, 100, 0.9, 0.7),  # Valid
-            ({"top_k": -1, "top_p": 2.0, "temperature": 3.0}, 0, 1.0, 2.0),  # Out of bounds
-            ({"top_k": 1000, "top_p": -0.5, "temperature": -1}, 100, 0.0, 0.0),  # Clamped
+            ({"top_k": 5, "top_p": 0.1, "temperature": 0.25}, 5, 0.1, 0.25),  # Min endpoints
+            ({"top_k": 50, "top_p": 1.0, "temperature": 2.0}, 50, 1.0, 2.0),  # Max endpoints
+            ({"top_k": 0, "top_p": 0.0, "temperature": 0.0}, 5, 0.1, 0.25),  # Below bounds
+            ({"top_k": 1000, "top_p": 2.0, "temperature": 3.0}, 50, 1.0, 2.0),  # Above bounds
         ]
         
         for data, exp_k, exp_p, exp_t in test_cases:
