@@ -285,3 +285,35 @@ class TestFinalDigestNonceWiring:
         kwargs = helper.proof_processor.process_proof.call_args.kwargs
         assert "admission_nonce" not in kwargs["pow_hasher_data"]
         assert bytes(kwargs["digest"].tobytes()) == self._expected_digest(None)
+
+    def test_proof_version_stamp_forwarded_both_paths(self, csh_real):
+        """TIP-0003 agreement chain: the proxy's proof_version
+        stamp in pow_snapshot must reach pow_params (Python writer) and
+        pow_hasher_data (C++ ProofProcessor) so their drift checks can fire.
+        Absent stamp (old proxy) must stay absent — the checks then skip."""
+        from unittest.mock import Mock
+
+        # Python path, stamp present.
+        owner = self._owner()
+        owner.seq_params[self.SEQ]["pow_snapshot"]["proof_version"] = 3
+        helper = self._helper(owner, csh_real)
+        helper._process_solution_python(self.SEQ, self.ROW)
+        pow_params = owner.proof_writer.write_proof.call_args.args[5]
+        assert pow_params["proof_version"] == 3
+
+        # C++ path, stamp present.
+        helper.proof_processor = Mock()
+        helper.proof_processor.process_proof = Mock(return_value={"queued": True})
+        helper._process_solution_cpp(self.SEQ, self.ROW)
+        kwargs = helper.proof_processor.process_proof.call_args.kwargs
+        assert kwargs["pow_hasher_data"]["proof_version"] == 3
+
+        # Absent stamp: neither dict grows the key.
+        owner2 = self._owner()
+        helper2 = self._helper(owner2, csh_real)
+        helper2._process_solution_python(self.SEQ, self.ROW)
+        assert "proof_version" not in owner2.proof_writer.write_proof.call_args.args[5]
+        helper2.proof_processor = Mock()
+        helper2.proof_processor.process_proof = Mock(return_value={"queued": True})
+        helper2._process_solution_cpp(self.SEQ, self.ROW)
+        assert "proof_version" not in helper2.proof_processor.process_proof.call_args.kwargs["pow_hasher_data"]

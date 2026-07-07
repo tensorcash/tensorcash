@@ -143,6 +143,34 @@ void normalize_field_names(std::unordered_map<std::string, std::any>& dict) {
     if (dict.count("model_config_diff") && !dict.count("extra_flags")) {
         dict["extra_flags"] = dict["model_config_diff"];
     }
+
+    // Reverse mapping: dict_to_proof_data() reads ONLY model_config_diff and
+    // pack_proof() serializes it as the FlatBuffer extra_flags field, so a
+    // dict that carries only extra_flags (e.g. produced by unpack, which
+    // emits the wire field name) would otherwise repack with an EMPTY
+    // carrier — silently dropping the v3 admission nonce that rides inside
+    // extra_flags (TIP-0003). Make unpack -> pack lossless.
+    if (dict.count("extra_flags") && !dict.count("model_config_diff")) {
+        dict["model_config_diff"] = dict["extra_flags"];
+    }
+
+    // Both keys present: model_config_diff is authoritative (it is what gets
+    // serialized). No legitimate producer emits both with DIFFERENT values
+    // (proof_processor sets only model_config_diff; unpack emits only
+    // extra_flags), so a divergent pair means two sources were mixed — the
+    // extra_flags copy (possibly carrying a v3 nonce) would be silently
+    // discarded. Reject rather than guess.
+    if (dict.count("extra_flags") && dict.count("model_config_diff")) {
+        const std::string* ef = std::any_cast<std::string>(&dict.at("extra_flags"));
+        const std::string* mcd = std::any_cast<std::string>(&dict.at("model_config_diff"));
+        if (ef && mcd && *ef != *mcd) {
+            throw std::invalid_argument(
+                "proofpack: conflicting extra_flags vs model_config_diff values; "
+                "model_config_diff is the authoritative carrier — do not mix "
+                "sources (the divergent extra_flags copy may carry a v3 "
+                "admission nonce that would be dropped)");
+        }
+    }
 }
 
 // Template implementations
@@ -366,6 +394,18 @@ std::vector<uint8_t> pack_proof(const ProofData& data) {
 }
 
 std::vector<uint8_t> pack_proof_from_dict(const std::unordered_map<std::string, std::any>& proof_dict) {
+    // Same boundary rule as pfunpack.cpp:pack_proof_internal (TIP-0003):
+    // this is a DUMB packer — the v3 admission nonce rides
+    // inside extra_flags/model_config_diff, merged by the shared helper
+    // (pow_v3::merge_extra_flags_v3) at the writer layer. A side
+    // "admission_nonce" key would be a second, silent v3 writer path this
+    // packer ignores, emitting a proof missing the nonce. Fail loudly.
+    if (proof_dict.count("admission_nonce")) {
+        throw std::invalid_argument(
+            "proofpack::pack_proof_from_dict does not accept a side "
+            "'admission_nonce'; merge it into extra_flags via "
+            "pow_v3::merge_extra_flags_v3 at the writer layer before packing");
+    }
     ProofData data = dict_to_proof_data(proof_dict);
     return pack_proof(data);
 }

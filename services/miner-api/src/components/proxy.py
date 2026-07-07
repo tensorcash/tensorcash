@@ -742,6 +742,14 @@ class RequestManager:
                     'ipfs_cid': model_config.ipfs_cid or "QmDefault",
                     'request_id': snapshot.request_id,
                     'difficulty': model_config.difficulty,
+                    # Agreement stamp: the sampler process reads its OWN
+                    # POW_PROOF_VERSION env; the v3 fixed-profile force above
+                    # keys off THIS process's env. If the two drift, every
+                    # emitted proof is verifier-rejected — the proof writer
+                    # cross-checks this stamp and fails loudly instead
+                    # (pow_utils.ProofWriter.write_proof). Older sampler
+                    # images ignore the extra key.
+                    'proof_version': int(os.getenv("POW_PROOF_VERSION", "2")),
                 }
             }
             # Slice 11 dual-threshold emission: pass the model-adjusted
