@@ -642,7 +642,7 @@ jobs:
         sudo apt-get install -y \
           build-essential g++ cmake ninja-build pkg-config \
           libssl-dev libzmq3-dev libboost-all-dev \
-          libflint-dev libgmp-dev \
+          libflint-dev libgmp-dev libargon2-dev \
           lcov
 
     - name: Cache Python dependencies
@@ -748,7 +748,22 @@ jobs:
           -I"../" \
           "../pow_utils.cpp" \
           -o "build/pow_utils.o"
-        
+
+        # Build pow_v3 (v3 admission/prompt-binding/B_cred helpers; needs argon2 + openssl)
+        g++ -O3 -Wall -std=c++17 -fPIC -c \
+          -I"build/flatbuffers-headers" \
+          -I"build/generated-cpp" \
+          -I"/usr/include" \
+          -I"../" \
+          "../pow_v3.cpp" \
+          -o "build/pow_v3.o"
+
+        # Build bcred_table_r1024 (generated R=1024 B_cred credit-threshold table)
+        g++ -O3 -Wall -std=c++17 -fPIC -c \
+          -I"../" \
+          "../bcred_table_r1024.cpp" \
+          -o "build/bcred_table_r1024.o"
+
         # Build proof_processor module
         g++ -O3 -Wall -shared -std=c++17 -fPIC \
           -I"${PYTHON_INCLUDE}" \
@@ -763,10 +778,12 @@ jobs:
           "build/libproofpack.o" \
           "build/pow_zmq_writer.o" \
           "build/pow_utils.o" \
+          "build/pow_v3.o" \
+          "build/bcred_table_r1024.o" \
           -o "build/proof_processor.so" \
           $(python3.11 -m pybind11 --includes) \
           $(python3.11-config --ldflags) \
-          -lzmq -lssl -lcrypto
+          -lzmq -lssl -lcrypto -largon2
         
         echo "✓ C++ ProofProcessor built successfully"
 
