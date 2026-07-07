@@ -166,7 +166,7 @@ jobs:
           # Update each submodule individually
           for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
             echo "Updating submodule: $submodule"
-            git submodule update --init --recursive "$submodule" || {
+            git submodule update --init --recursive --force "$submodule" || {
               echo "Warning: Failed to update $submodule, continuing..."
             }
           done
@@ -1425,7 +1425,7 @@ jobs:
           for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
 
             echo "Updating submodule: $submodule"
-            git submodule update --init --recursive "$submodule"
+            git submodule update --init --recursive --force "$submodule"
           done
 
           REQUIRED_SUBMODULES=(
@@ -1875,7 +1875,7 @@ jobs:
           git config --global --add safe.directory '*'
           git submodule init
           for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
-            git submodule update --init --recursive "$submodule"
+            git submodule update --init --recursive --force "$submodule"
           done
 
       - name: Restore depends from cache
@@ -1948,7 +1948,7 @@ jobs:
           for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
 
             echo "Updating submodule: $submodule"
-            git submodule update --init --recursive "$submodule"
+            git submodule update --init --recursive --force "$submodule"
           done
 
           # Ensure required submodules are present; fail fast with a clear message
@@ -2197,7 +2197,7 @@ jobs:
           # Update each submodule individually
           for submodule in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
             echo "Updating submodule: $submodule"
-            git submodule update --init --recursive "$submodule" || {
+            git submodule update --init --recursive --force "$submodule" || {
               echo "Warning: Failed to update $submodule, continuing..."
             }
           done
