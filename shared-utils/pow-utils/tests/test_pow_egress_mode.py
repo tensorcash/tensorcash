@@ -2,8 +2,8 @@
 """POW_EGRESS_MODE env parsing + broker-mode safety checks.
 
 These tests cover only ``MiningResponseWriter.__init__`` — the
-env-driven config + validation surface introduced in slice 3 of
-COMPUTE_BROKER_IMPROV.md §"PoW writer egress envvar contract".
+env-driven config + validation surface of the PoW writer egress
+envvar contract.
 
 They do NOT start the writer thread (no ZMQ sockets bound, no actual
 network egress) so the suite is fast and side-effect-free.
