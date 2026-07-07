@@ -73,6 +73,17 @@ class BrokerWorkerClient:
         self.active_jobs: set = set()
         self.heartbeat_interval = 15  # will be updated from ACK
         self.heartbeat_task: Optional[asyncio.Task] = None
+        self.connection_attempts = 0
+        self.last_connect_attempt_at: Optional[float] = None
+        self.last_connected_at: Optional[float] = None
+        self.last_disconnected_at: Optional[float] = None
+        self.last_message_at: Optional[float] = None
+        self.last_ack_at: Optional[float] = None
+        self.last_heartbeat_sent_at: Optional[float] = None
+        self.last_reconnect_error: Optional[str] = None
+        self.heartbeat_send_timeout = float(
+            os.getenv("BROKER_HEARTBEAT_SEND_TIMEOUT_SECONDS", "10")
+        )
 
         # W2: Confidential mode crypto service
         self.crypto_service: Optional[ConfidentialCryptoService] = None
@@ -382,7 +393,8 @@ class BrokerWorkerClient:
     async def start(self):
         """Connect to broker and start worker loop"""
         self.running = True
-        self.http_session = aiohttp.ClientSession()
+        if self.http_session is None or self.http_session.closed:
+            self.http_session = aiohttp.ClientSession()
         await self._refresh_worker_tools_from_discovery()
         reconnect_delay = 1  # Start with 1 second, exponential backoff
         max_reconnect_delay = 60  # Cap at 60 seconds
@@ -406,43 +418,51 @@ class BrokerWorkerClient:
         if self.crypto_service:
             await self._ensure_public_key_registered()
 
-        while self.running:
-            try:
-                await self._connect_and_run()
-                # If _connect_and_run returns normally, the connection was closed
-                # This happens when broker closes connection gracefully
-                logger.warning("WebSocket connection closed normally, reconnecting...")
-                reconnect_delay = 1  # Reset delay - this was a clean disconnect
-            except websockets.exceptions.ConnectionClosed as e:
-                # Connection closed by broker (graceful or error)
-                logger.warning(f"WebSocket connection closed: code={e.code}, reason={e.reason}")
-                reconnect_delay = 1  # Fast reconnect on clean close
-            except websockets.exceptions.InvalidStatusCode as e:
-                logger.error(f"WebSocket connection rejected: HTTP {e.status_code}")
-                if self.running:
-                    logger.info(f"Reconnecting in {reconnect_delay} seconds...")
-                    await asyncio.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
-                continue
-            except (websockets.exceptions.WebSocketException, ConnectionError, OSError) as e:
-                logger.error(f"WebSocket connection error: {e}")
-                if self.running:
-                    logger.info(f"Reconnecting in {reconnect_delay} seconds...")
-                    await asyncio.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
-                continue
-            except Exception as e:
-                logger.error(f"Unexpected worker error: {type(e).__name__}: {e}")
-                if self.running:
-                    await asyncio.sleep(min(reconnect_delay, 10))
-                continue
+        try:
+            while self.running:
+                backoff = False
+                try:
+                    self.connection_attempts += 1
+                    self.last_connect_attempt_at = time.time()
+                    await self._connect_and_run()
+                    # If _connect_and_run returns normally, the connection was closed
+                    # This happens when broker closes connection gracefully
+                    logger.warning("WebSocket connection closed normally, reconnecting...")
+                    reconnect_delay = 1  # Reset delay - this was a clean disconnect
+                except asyncio.CancelledError:
+                    logger.warning("Broker worker client start task cancelled")
+                    raise
+                except websockets.exceptions.ConnectionClosed as e:
+                    # Connection closed by broker (graceful or error)
+                    logger.warning(f"WebSocket connection closed: code={e.code}, reason={e.reason}")
+                    self.last_reconnect_error = f"ConnectionClosed:{e.code}:{e.reason}"
+                    reconnect_delay = 1  # Fast reconnect on clean close
+                except websockets.exceptions.InvalidStatusCode as e:
+                    logger.error(f"WebSocket connection rejected: HTTP {e.status_code}")
+                    self.last_reconnect_error = f"InvalidStatusCode:{e.status_code}"
+                    backoff = True
+                except (websockets.exceptions.WebSocketException, ConnectionError, OSError) as e:
+                    logger.error(f"WebSocket connection error: {e}")
+                    self.last_reconnect_error = f"{type(e).__name__}:{e}"
+                    backoff = True
+                except Exception as e:
+                    logger.exception(f"Unexpected worker error: {type(e).__name__}: {e}")
+                    self.last_reconnect_error = f"{type(e).__name__}:{e}"
+                    backoff = True
+                finally:
+                    self.last_disconnected_at = time.time()
+                    self._cleanup_connection()
 
-            # Clean up before reconnecting
+                if self.running:
+                    delay = reconnect_delay if backoff else 1
+                    logger.info(f"Reconnecting in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                    if backoff:
+                        reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+                    else:
+                        reconnect_delay = 1
+        finally:
             self._cleanup_connection()
-
-            if self.running:
-                logger.info(f"Reconnecting in {reconnect_delay} seconds...")
-                await asyncio.sleep(reconnect_delay)
 
     def _cleanup_connection(self):
         """Clean up connection state before reconnecting"""
@@ -463,6 +483,7 @@ class BrokerWorkerClient:
         """Stop the worker client gracefully"""
         logger.info("Stopping broker worker client...")
         self.running = False
+        ws = self.ws
 
         # W3: Unregister tools before disconnecting
         if self.ws and self.registered_tools:
@@ -479,14 +500,15 @@ class BrokerWorkerClient:
 
         self._cleanup_connection()
 
-        if self.ws:
+        if ws:
             try:
-                await self.ws.close()
+                await ws.close()
             except Exception:
                 pass
 
         if self.http_session:
             await self.http_session.close()
+            self.http_session = None
 
         logger.info("Broker worker client stopped")
 
@@ -515,10 +537,12 @@ class BrokerWorkerClient:
             self.broker_url,
             additional_headers=headers,
             ping_interval=20,  # Send ping every 20s
-            ping_timeout=10,   # Wait 10s for pong
+            ping_timeout=30,   # Wait 30s for pong; app heartbeat handles stale sockets
             close_timeout=5,
         ) as ws:
             self.ws = ws
+            self.last_connected_at = time.time()
+            self.last_message_at = self.last_connected_at
             logger.info(f"Connected to broker as worker {self.worker_id}")
 
             # Send HELLO registration
@@ -528,6 +552,7 @@ class BrokerWorkerClient:
             try:
                 async for message in ws:
                     try:
+                        self.last_message_at = time.time()
                         msg = json.loads(message)
                         await self._handle_message(msg)
                     except json.JSONDecodeError as e:
@@ -844,6 +869,7 @@ class BrokerWorkerClient:
         logger.debug(f"Received message type: {msg_type}")
 
         if msg_type == "ACK":
+            self.last_ack_at = time.time()
             # Broker ACK may include authoritative agent_id resolved from worker API key.
             # This removes the need for users to manually set AGENT_ID.
             ack_agent_id = (msg.get("agent_id") or "").strip()
@@ -867,7 +893,7 @@ class BrokerWorkerClient:
             logger.info(f"Received ACK, starting heartbeat with interval {self.heartbeat_interval}s")
             if self.heartbeat_task:
                 self.heartbeat_task.cancel()
-            self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self.heartbeat_task = asyncio.create_task(self._heartbeat_loop(self.ws))
 
             # Ensure key registration once agent_id is known.
             if self.crypto_service and not self.public_key_registered:
@@ -3604,52 +3630,71 @@ class BrokerWorkerClient:
                 pass
             logger.error(f"Error fetching proof for {cid}: {e}")
 
-    async def _heartbeat_loop(self):
+    async def _heartbeat_loop(self, ws=None):
         """Send periodic metrics to broker"""
         consecutive_failures = 0
         max_failures = 3
+        ws = ws or self.ws
+        exit_reason = "loop_condition_false"
 
-        while self.ws and self.running:
-            try:
-                # Check if websocket is still open
+        try:
+            while ws and self.ws is ws and self.running:
                 try:
-                    from websockets.protocol import State
-                    if self.ws.state != State.OPEN:
-                        logger.warning("Heartbeat detected closed connection")
-                        break
-                except (AttributeError, ImportError):
-                    pass
+                    # Check if websocket is still open
+                    try:
+                        from websockets.protocol import State
+                        if ws.state != State.OPEN:
+                            exit_reason = "websocket_not_open"
+                            logger.warning("Heartbeat detected closed connection")
+                            break
+                    except (AttributeError, ImportError):
+                        pass
 
-                heartbeat = {
-                    "type": "HEARTBEAT",
-                    "busy": len(self.active_jobs),
-                    "input_tokens_per_sec": await self._get_input_tps(),
-                    "output_tokens_per_sec": await self._get_output_tps(),
-                    "error_rate": 0.0,
-                    "queue_depth": 0
-                }
-                await self.ws.send(json.dumps(heartbeat))
-                logger.debug(f"Sent heartbeat: busy={heartbeat['busy']}")
-                consecutive_failures = 0  # Reset on success
+                    heartbeat = {
+                        "type": "HEARTBEAT",
+                        "busy": len(self.active_jobs),
+                        "input_tokens_per_sec": await self._get_input_tps(),
+                        "output_tokens_per_sec": await self._get_output_tps(),
+                        "error_rate": 0.0,
+                        "queue_depth": 0
+                    }
+                    await asyncio.wait_for(
+                        ws.send(json.dumps(heartbeat)),
+                        timeout=self.heartbeat_send_timeout,
+                    )
+                    self.last_heartbeat_sent_at = time.time()
+                    logger.debug(f"Sent heartbeat: busy={heartbeat['busy']}")
+                    consecutive_failures = 0  # Reset on success
 
-                try:
-                    self._purge_stale_mining_jobs()
-                except Exception as purge_exc:  # noqa: BLE001
-                    logger.warning(f"Stale mining-job purge failed: {purge_exc}")
+                    try:
+                        self._purge_stale_mining_jobs()
+                    except Exception as purge_exc:  # noqa: BLE001
+                        logger.warning(f"Stale mining-job purge failed: {purge_exc}")
 
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(f"Heartbeat failed - connection closed: code={e.code}")
-                break
-            except Exception as e:
-                consecutive_failures += 1
-                logger.error(f"Error sending heartbeat ({consecutive_failures}/{max_failures}): {e}")
-                if consecutive_failures >= max_failures:
-                    logger.error("Too many heartbeat failures, connection likely dead")
+                except asyncio.CancelledError:
+                    exit_reason = "cancelled"
+                    raise
+                except websockets.exceptions.ConnectionClosed as e:
+                    exit_reason = f"connection_closed:{e.code}"
+                    logger.warning(f"Heartbeat failed - connection closed: code={e.code}")
                     break
+                except Exception as e:
+                    consecutive_failures += 1
+                    exit_reason = f"{type(e).__name__}:{e}"
+                    logger.error(f"Error sending heartbeat ({consecutive_failures}/{max_failures}): {e}")
+                    if consecutive_failures >= max_failures:
+                        logger.error("Too many heartbeat failures, forcing broker reconnect")
+                        break
 
-            await asyncio.sleep(self.heartbeat_interval)
+                await asyncio.sleep(self.heartbeat_interval)
 
-        logger.info("Heartbeat loop exited")
+        finally:
+            logger.info("Heartbeat loop exited: %s", exit_reason)
+            if exit_reason != "cancelled" and self.running and self.ws is ws and ws is not None:
+                try:
+                    await ws.close(code=1011, reason=f"heartbeat_failed:{exit_reason}"[:120])
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"Failed to close websocket after heartbeat exit: {exc}")
 
     _MINING_JOB_TTL_SEC = 900.0
 
@@ -3718,6 +3763,13 @@ class BrokerWorkerClient:
 
     def get_status(self) -> Dict[str, Any]:
         """Get current worker status"""
+        now = time.time()
+
+        def age(ts: Optional[float]) -> Optional[float]:
+            if ts is None:
+                return None
+            return round(max(0.0, now - ts), 1)
+
         # websockets library uses .state instead of .closed
         connected = False
         if self.ws is not None:
@@ -3736,7 +3788,19 @@ class BrokerWorkerClient:
             "active_mining_jobs": len(self.mining_job_mapping),
             "registered_tools": list(self.registered_tools),
             "mining_enabled": self.mining_enabled,
-            "running": self.running
+            "running": self.running,
+            "heartbeat_task_running": (
+                self.heartbeat_task is not None and not self.heartbeat_task.done()
+            ),
+            "heartbeat_interval_seconds": self.heartbeat_interval,
+            "connection_attempts": self.connection_attempts,
+            "last_reconnect_error": self.last_reconnect_error,
+            "last_connect_attempt_age_seconds": age(self.last_connect_attempt_at),
+            "last_connected_age_seconds": age(self.last_connected_at),
+            "last_disconnected_age_seconds": age(self.last_disconnected_at),
+            "last_message_age_seconds": age(self.last_message_at),
+            "last_ack_age_seconds": age(self.last_ack_at),
+            "last_heartbeat_sent_age_seconds": age(self.last_heartbeat_sent_at),
         }
 
     # =========================================================================

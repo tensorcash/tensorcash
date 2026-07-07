@@ -5,6 +5,7 @@ Tests individual methods and logic without external dependencies
 import pytest
 import asyncio
 import json
+import time
 import uuid
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from aioresponses import aioresponses
@@ -726,6 +727,58 @@ class TestDirectToolInvoke:
         assert payload["invoke_id"] == "inv_conf_1"
         assert payload["status"] == "success"
         assert payload["result_b64"] == "encrypted-tool-result"
+
+
+class TestBrokerConnectionResilience:
+    """Regression coverage for broker-client liveness failures."""
+
+    @pytest.fixture
+    def client(self):
+        client = BrokerWorkerClient()
+        client.heartbeat_interval = 0
+        client.heartbeat_send_timeout = 0.01
+        client.running = True
+        return client
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_failure_closes_websocket(self, client):
+        """A dead heartbeat must force the recv loop to unblock and reconnect."""
+        from websockets.protocol import State
+
+        ws = AsyncMock()
+        ws.state = State.OPEN
+        ws.send.side_effect = RuntimeError("send wedged")
+        client.ws = ws
+
+        await client._heartbeat_loop(ws)
+
+        assert ws.send.await_count == 3
+        ws.close.assert_awaited_once()
+        _, kwargs = ws.close.await_args
+        assert kwargs["code"] == 1011
+        assert "heartbeat_failed" in kwargs["reason"]
+
+    def test_status_exposes_broker_liveness_ages(self, client):
+        """Status should make up-but-disconnected workers externally visible."""
+        now = time.time()
+        client.connection_attempts = 3
+        client.last_connect_attempt_at = now - 20
+        client.last_connected_at = now - 15
+        client.last_ack_at = now - 14
+        client.last_message_at = now - 13
+        client.last_heartbeat_sent_at = now - 12
+        client.last_reconnect_error = "ConnectionClosed:1011:keepalive"
+
+        status = client.get_status()
+
+        assert status["connection_attempts"] == 3
+        assert status["last_reconnect_error"] == "ConnectionClosed:1011:keepalive"
+        assert status["last_connect_attempt_age_seconds"] >= 19
+        assert status["last_connected_age_seconds"] >= 14
+        assert status["last_ack_age_seconds"] >= 13
+        assert status["last_message_age_seconds"] >= 12
+        assert status["last_heartbeat_sent_age_seconds"] >= 11
+        assert "heartbeat_task_running" in status
 
 
 if __name__ == "__main__":
