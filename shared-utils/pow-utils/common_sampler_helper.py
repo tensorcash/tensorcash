@@ -125,7 +125,9 @@ class CommonSamplerHelper:
     def update_caches(self, seq_ids, tokens):
         now = time.time()
         if _POW_DEBUG_ASSERTS:
-            assert tokens.min() >= 0, f"Negative token found: {tokens.min().item()}"
+            min_token = tokens.min()
+            if min_token < 0:
+                raise AssertionError(f"Negative token found: {min_token.item()}")
 
         toks_cpu = tokens.detach().cpu().tolist()
         max_len = 1
