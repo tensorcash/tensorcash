@@ -69,6 +69,7 @@ echo "[vLLM] PoW publishing to tcp://${ZMQ_PUSH_HOST}:${ZMQ_PUSH_PORT} (processo
 : ${CHAT_TEMPLATE_PATH:=/opt/chat-template/qwen3.5-enhanced.jinja}
 
 VLLM_CMD="vllm serve $MODEL_NAME \
+  --served-model-name $MODEL_NAME \
   --trust-remote-code \
   --tensor-parallel-size 1 \
   --max-num-seqs 32 \

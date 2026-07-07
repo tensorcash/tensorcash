@@ -62,6 +62,7 @@ echo "[vLLM-mining] PoW publishing to tcp://${ZMQ_PUSH_HOST}:${ZMQ_PUSH_PORT} (p
 # the miner-proxy's dummy mining requests plus optional plaintext Qwen3-8B
 # inference dispatched by the broker.
 VLLM_CMD="vllm serve $MINING_MODEL_NAME \
+  --served-model-name $MINING_MODEL_NAME \
   --trust-remote-code \
   --tensor-parallel-size 1 \
   --max-num-seqs 32 \
