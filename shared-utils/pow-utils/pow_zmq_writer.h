@@ -31,9 +31,8 @@
  * Core Node primary destination still set, or POW_PROXY_ENABLE
  * truthy. Operators MUST fix the env; catching this and proceeding
  * would let solutions leak from a worker that thinks it's in
- * broker mode.
- *
- * See COMPUTE_BROKER_IMPROV.md §"PoW writer egress envvar contract".
+ * broker mode. The egress-mode contract is documented on the
+ * egress_mode_ member below.
  */
 class PowEgressConfigError : public std::runtime_error {
 public:
@@ -107,8 +106,8 @@ public:
 private:
     // Configuration
     size_t max_queue_size_;
-    // PoW writer egress topology (COMPUTE_BROKER_IMPROV.md §"PoW writer
-    // egress envvar contract"). One of "local_miner" or "broker".
+    // PoW writer egress topology (the egress envvar contract).
+    // One of "local_miner" or "broker".
     // local_miner: primary = Core Node, optional proxy dual-publish.
     // broker:      primary = miner-proxy ProofCollector, no proxy.
     // Parsed from POW_EGRESS_MODE at construction; mode is immutable
