@@ -275,13 +275,19 @@ class TestCommonSamplerHelper:
         assert mock_owner.prev_max_seq_len == 512
     
     def test_update_caches_negative_token_assertion(self, helper, mock_owner):
-        """Test that negative tokens trigger assertion error"""
+        """Negative tokens trigger the assertion when debug asserts are on.
+
+        The guard is gated behind _POW_DEBUG_ASSERTS (POW_DEBUG_ASSERTS env,
+        read at import) so the hot path skips it in production; patch the module
+        constant on so the test exercises the guard it names."""
+        import common_sampler_helper
         seq_id = "seq_neg"
         helper.init_sequence_cache(seq_id, [1, 2])
-        
+
         tokens = torch.tensor([-1])
-        with pytest.raises(AssertionError, match="Negative token found"):
-            helper.update_caches([seq_id], tokens)
+        with patch.object(common_sampler_helper, "_POW_DEBUG_ASSERTS", True):
+            with pytest.raises(AssertionError, match="Negative token found"):
+                helper.update_caches([seq_id], tokens)
     
     def test_free_sequence_complete(self, helper, mock_owner):
         """Test complete sequence cleanup"""
