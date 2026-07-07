@@ -58,6 +58,32 @@ class TestRingBuffers:
         
         # Check other rows unchanged (row 0 should still be zeros)
         assert torch.all(rb._float_block[:, 0, :] == 0)
+
+    def test_pow_length_host_mirrors(self):
+        """PoW message-width host mirrors track GPU length tensors."""
+        rb = RingBuffers(window_size=256, max_rows=3, device="cpu")
+        snapshot = {
+            "tick": 1,
+            "header_prefix": "ab" * 76,
+            "vdf": "cd" * 48,
+            "block_hash": "ef" * 32,
+            "target": "00" * 8 + "ff" * 24,
+            "request_id": 7,
+        }
+
+        rb.write_pow_params(1, snapshot)
+
+        assert rb.pow_header_len[1].item() == 76
+        assert rb.pow_vdf_len[1].item() == 48
+        assert rb.pow_header_len_host[1] == 76
+        assert rb.pow_vdf_len_host[1] == 48
+
+        rb.clear_row(1)
+
+        assert rb.pow_header_len[1].item() == 0
+        assert rb.pow_vdf_len[1].item() == 0
+        assert rb.pow_header_len_host[1] == 0
+        assert rb.pow_vdf_len_host[1] == 0
     
     def test_increment_single_row(self):
         """Test incrementing window position for a single row."""

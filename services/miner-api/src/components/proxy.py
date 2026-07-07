@@ -591,7 +591,7 @@ class RequestManager:
             if value is None:
                 logger.info(f"[RequestManager] {name} not provided, using default: {default}")
                 return default
-            if not (minv < value <= maxv):
+            if not (minv <= value <= maxv):
                 logger.warning(f"[RequestManager] {name}={value} out of bounds, clamping to [{minv}, {maxv}]")
                 return max(minv, min(value, maxv))
             return value

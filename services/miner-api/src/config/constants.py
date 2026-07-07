@@ -14,12 +14,12 @@ except Exception:  # pragma: no cover - optional for tests
 
 
 POW_WINDOW_SIZE = 256
-# Relaxed bounds for local testing; Docker build overwrites with shared-utils
-TOPK_MIN        = 0
-TOPK_MAX        = 100
-TOPP_MIN        = 0.0
+# Keep local runs aligned with shared-utils and the C++ Quick verifier.
+TOPK_MIN        = 5
+TOPK_MAX        = 50
+TOPP_MIN        = 0.1
 TOPP_MAX        = 1.0
-TEMP_MIN        = 0.0
+TEMP_MIN        = 0.25
 TEMP_MAX        = 2.0
 ENTROPY_FILT    = .925
 REP_PENALTY     = 0.1
