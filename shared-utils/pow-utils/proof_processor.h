@@ -31,7 +31,13 @@ private:
     std::string model_identifier_;
     std::string compute_precision_;
     std::string model_config_diff_;
-    
+
+    // Proof schema version: 2 = legacy, >= 3 enables the v3 carrier rules
+    // (TIP-0003: admission nonce merged into extra_flags). Wired
+    // into the serialized Proof.version by pow_zmq_writer/pfunpack via the
+    // proof dict — never hardcoded there.
+    int proof_version_ = 2;
+
 public:
     ProofProcessor();
     explicit ProofProcessor(bool proxy_audit_enabled);
@@ -59,7 +65,9 @@ public:
     void set_model_identifier(const std::string& identifier) { model_identifier_ = identifier; }
     void set_compute_precision(const std::string& precision) { compute_precision_ = precision; }
     void set_model_config_diff(const std::string& config_diff) { model_config_diff_ = config_diff; }
-    
+    void set_proof_version(int version) { proof_version_ = version; }
+    int get_proof_version() const { return proof_version_; }
+
 private:
     // Helper functions
     std::unordered_map<std::string, std::any> assemble_proof_dict(

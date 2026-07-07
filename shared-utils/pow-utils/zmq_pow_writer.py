@@ -16,6 +16,13 @@ from typing import Optional, Dict, Any
 # Production-safe imports expect the package `proof` to be on PYTHONPATH
 from proof import MiningResponse, Proof, FloatArray, UIntArray
 
+# V3 prompt-binding helpers (TIP-0003) — deployed next to this
+# file everywhere it is copied.
+try:
+    import pow_v3
+except ImportError:
+    from . import pow_v3
+
 logger = logging.getLogger(__name__)
 
 # Mutually-exclusive PoW egress modes (the PoW writer egress envvar
@@ -395,10 +402,25 @@ class MiningResponseWriter:
         # === SERIALIZE PROOF TABLE FIRST ===
         
         # Create strings for Proof
+        proof_version = int(obj.get('version', 2))
         mid_off = builder.CreateString(obj.get('model_identifier', ''))
         cp_off = builder.CreateString(obj.get('compute_precision', ''))
         ipfs_off = builder.CreateString(obj.get('ipfs_cid', ''))
-        extra_off = builder.CreateString(to_python_string(obj.get('model_config_diff', {})))
+        if proof_version >= pow_v3.V3_PROOF_VERSION:
+            # v3 carrier (TIP-0003): canonical JSON; merge a
+            # sampler-selected admission nonce (side key, bytes or 64-hex)
+            # through the shared helper just before serialization.
+            mcd = obj.get('model_config_diff', {})
+            nonce = obj.get('admission_nonce')
+            if nonce is not None:
+                nonce_hex = (nonce.hex() if isinstance(nonce, (bytes, bytearray))
+                             else str(nonce))
+                extra_str = pow_v3.merge_extra_flags_v3(mcd, nonce_hex)
+            else:
+                extra_str = mcd if isinstance(mcd, str) else pow_v3.canonical_json(mcd or {})
+            extra_off = builder.CreateString(extra_str)
+        else:
+            extra_off = builder.CreateString(to_python_string(obj.get('model_config_diff', {})))
         
         # Create byte vectors for Proof
         tgt_off = builder.CreateByteVector(_to_bytes(obj['target']))
@@ -491,7 +513,7 @@ class MiningResponseWriter:
         
         # Build the Proof table
         Proof.Start(builder)
-        Proof.AddVersion(builder, int(2))
+        Proof.AddVersion(builder, proof_version)
         Proof.AddTick(builder, int(obj['tick']) & 0xFFFFFFFFFFFFFFFF)
         Proof.AddTimestamp(builder, int(obj['timestamp']) & 0xFFFFFFFFFFFFFFFF)
         Proof.AddIsSolution(builder, 1 if obj['is_solution'] else 0)

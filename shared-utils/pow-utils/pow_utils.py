@@ -31,6 +31,14 @@ from collections import deque
 from pprint import pformat
 import binascii
 
+# V3 prompt-binding / admission helpers (TIP-0003). pow_v3.py is
+# deployed next to this file everywhere pow_utils.py is copied (top-level in
+# pow-utils, utils/ package in verification-api), hence the dual import.
+try:
+    import pow_v3
+except ImportError:
+    from . import pow_v3
+
 
 def proof_snapshot(proof_logits, logsumexp_full, device):
     """Pre-temperature proof ring-buffer snapshot from full-vocab logits.
@@ -389,6 +397,19 @@ class RingBuffers:
         self.pow_header_len_host = [0] * max_rows
         self.pow_vdf_len_host = [0] * max_rows
 
+        # --- V3 admission state per row (TIP-0003) ---
+        # The sampler grinds the Argon2id admission nonce at prefill / each
+        # 256-step window boundary (native admission_grind, GIL released),
+        # stores the selected 32 bytes here BEFORE the window's first sampled
+        # token, and batch_sample_tokens appends them to every v3 step
+        # preimage while pow_admission_valid[row] is set. Rows mined for the
+        # free tier keep the flag False and the legacy v2 message shape —
+        # the miner commits to with/without before decoding (§7). Host
+        # mirror keeps the hot path free of GPU->CPU syncs.
+        self.pow_admission_nonce = torch.zeros((max_rows, 32), dtype=torch.uint8, device=device)
+        self.pow_admission_valid = torch.zeros(max_rows, dtype=torch.bool, device=device)
+        self.pow_admission_valid_host = [False] * max_rows
+
         # --- legacy-compatible views on top of packed blocks ---
         # float views
         self.topk_logits         = self._float_block[..., :70]                # (W, R, 70) fp32
@@ -428,6 +449,29 @@ class RingBuffers:
         self.pow_header_len_host[row] = 0
         self.pow_vdf_len_host[row] = 0
         self.pow_valid[row] = False
+        self.pow_admission_nonce[row].zero_()
+        self.pow_admission_valid[row] = False
+        self.pow_admission_valid_host[row] = False
+
+    def write_admission_nonce(self, row: int, nonce: "bytes | None"):
+        """Store (or clear, with None) the row's v3 admission nonce.
+
+        Must be called BEFORE the first sampled token of the window the nonce
+        admits (TIP-0003: admission is pre-decode — the nonce
+        enters every step u of the window).
+        """
+        if nonce is None:
+            self.pow_admission_nonce[row].zero_()
+            self.pow_admission_valid[row] = False
+            self.pow_admission_valid_host[row] = False
+            return
+        nonce = bytes(nonce)
+        if len(nonce) != 32:
+            raise ValueError("admission nonce must be exactly 32 bytes")
+        self.pow_admission_nonce[row] = torch.frombuffer(
+            bytearray(nonce), dtype=torch.uint8).to(self.device)
+        self.pow_admission_valid[row] = True
+        self.pow_admission_valid_host[row] = True
 
     def write_pow_params(self, row: int, pow_snapshot: dict):
         """Write pow params to GPU arrays for a specific row.
@@ -517,31 +561,48 @@ class RingBuffers:
         if not rows:
             return
         r = torch.as_tensor(rows, device=self.device, dtype=torch.long)
-        self.topk_logits[:, r].zero_()
-        self.topk_indices[:, r].zero_()
-        self.chosen_probs[:, r].zero_()
-        self.chosen_tokens[:, r].zero_()
-        self.attention_mask[:, r].zero_()
-        self.sampling_u[:, r].zero_()
-        self.softmax_normalizers[:, r].zero_()
-        self.logsumexp_stats[:, r].zero_()
+        # NOTE: advanced indexing (tensor index) returns a COPY, so
+        # `buf[r].zero_()` / `buf[:, r].zero_()` silently zeroes the copy and
+        # leaves the buffer stale. Assignments dispatch to index_put_ and DO
+        # write through — use only those here.
+        self.topk_logits[:, r] = 0
+        self.topk_indices[:, r] = 0
+        self.chosen_probs[:, r] = 0
+        self.chosen_tokens[:, r] = 0
+        self.attention_mask[:, r] = False
+        self.sampling_u[:, r] = 0
+        self.softmax_normalizers[:, r] = 0
+        self.logsumexp_stats[:, r] = 0
         self.steps[r] = 0
         # Clear pow params for these rows
         self.pow_tick[r] = 0
         self.pow_request_id[r] = 0
-        self.pow_header[r].zero_()
-        self.pow_vdf[r].zero_()
+        self.pow_header[r] = 0
+        self.pow_vdf[r] = 0
         self.pow_vdf_len[r] = 0
-        self.pow_target[r].zero_()
-        self.pow_block_hash[r].zero_()
+        self.pow_target[r] = 0
+        # Share target must clear with the row too: a recycled row keeping a
+        # stale share_target would emit shares against a target from its
+        # PRIOR occupant (matches clear_row).
+        self.pow_share_target[r] = 0
+        self.pow_block_hash[r] = 0
         self.pow_header_len[r] = 0
+        # A cleared row must not read back as valid (matches clear_row).
+        self.pow_valid[r] = False
+        # V3 admission state must clear with the row (a stale nonce leaking
+        # into a reallocated row would corrupt every u of its first window).
+        self.pow_admission_nonce[r] = 0
+        self.pow_admission_valid[r] = False
         if isinstance(rows, torch.Tensor):
             rows_iter = rows.detach().cpu().tolist()
         else:
             rows_iter = rows
         for row in rows_iter:
             self.pow_header_len_host[int(row)] = 0
+            # Host mirror of the admission flag clears with the tensor.
+            self.pow_admission_valid_host[int(row)] = False
             self.pow_vdf_len_host[int(row)] = 0
+            self.pow_admission_valid_host[int(row)] = False
         self.pow_valid[r] = False
 
     def _write_buffers(self, pos, rows, logits, indices, tokens, probs, u, mask, normalizers, stats):
@@ -691,6 +752,7 @@ class PowHasher:
             T8_batch = _u32le(ticks.to(torch.uint32))  # (B, 4)
 
             host_lengths = None
+            host_admission = None
             if rows_host is not None:
                 rows_host = [int(r) for r in rows_host]
                 if len(rows_host) != B:
@@ -701,40 +763,56 @@ class PowHasher:
                      ring_buffers.pow_vdf_len_host[r])
                     for r in rows_host
                 ]
+                # V3 admission flags (TIP-0003): a row with a
+                # stored nonce gets 32 extra preimage bytes, so admission
+                # participates in the same-message-width gating below.
+                host_admission = [
+                    ring_buffers.pow_admission_valid_host[r] for r in rows_host
+                ]
 
             if compute_precision != self.prior_precision:
                 self.precision_bytes = _str_bytes(compute_precision, batch_size=1, device=self.device)
                 self.prior_precision = compute_precision
 
             if host_lengths is not None:
-                same_lengths = all(lengths == host_lengths[0]
-                                   for lengths in host_lengths)
+                same_lengths = (
+                    all(lengths == host_lengths[0] for lengths in host_lengths)
+                    and all(a == host_admission[0] for a in host_admission)
+                )
             else:
                 # Fallback for old callers: this path has the original
                 # per-step GPU->CPU sync and should not be used by V1.
                 unique_hlens = header_lens.unique()
                 unique_vlens = vdf_lens.unique()
-                same_lengths = len(unique_hlens) == 1 and len(unique_vlens) == 1
+                unique_adm = ring_buffers.pow_admission_valid[rows_tensor].unique()
+                same_lengths = (len(unique_hlens) == 1 and len(unique_vlens) == 1
+                                and len(unique_adm) == 1)
 
             if same_lengths:
                 # All same lengths - fast batched path
                 if host_lengths is not None:
                     hlen, vlen = host_lengths[0]
+                    with_admission = host_admission[0]
                 else:
                     hlen = unique_hlens[0].item()
                     vlen = unique_vlens[0].item()
+                    with_admission = bool(unique_adm[0].item())
                 header_data = headers[:, :hlen]  # (B, hlen)
                 vdf_data = vdfs[:, :vlen]  # (B, vlen)
                 pb = self.precision_bytes.expand(B, -1)
 
-                msg = torch.cat([
+                parts = [
                     header_data,           # (B, hlen)
                     vdf_data,              # (B, vlen)
                     T8_batch,              # (B, 4)
                     j4,                    # (B, 4)
                     ctx_bytes,             # (B, L*8)
                     pb,                    # (B, precision_len)
-                ], dim=1)
+                ]
+                if with_admission:
+                    # V3: nonce appended after precision on every step (§7)
+                    parts.append(ring_buffers.pow_admission_nonce[rows_tensor])
+                msg = torch.cat(parts, dim=1)
 
                 digests = sha256_many(msg)
                 us = _digest_to_u(digests)
@@ -749,9 +827,11 @@ class PowHasher:
                 for i in range(B):
                     if host_lengths is not None:
                         hlen, vlen = host_lengths[i]
+                        adm_i = host_admission[i]
                     else:
                         hlen = header_lens[i].item()
                         vlen = vdf_lens[i].item()
+                        adm_i = bool(ring_buffers.pow_admission_valid[rows_tensor[i]].item())
                     header_i = headers[i, :hlen].unsqueeze(0)  # (1, hlen)
                     vdf_i = vdfs[i, :vlen].unsqueeze(0)  # (1, vlen)
                     T8_i = T8_batch[i].unsqueeze(0)  # (1, 4)
@@ -759,7 +839,11 @@ class PowHasher:
                     ctx_i = ctx_bytes[i].unsqueeze(0)  # (1, L*8)
                     pb_i = self.precision_bytes  # (1, len)
 
-                    msg_i = torch.cat([header_i, vdf_i, T8_i, j4_i, ctx_i, pb_i], dim=1)
+                    parts_i = [header_i, vdf_i, T8_i, j4_i, ctx_i, pb_i]
+                    if adm_i:
+                        parts_i.append(
+                            ring_buffers.pow_admission_nonce[rows_tensor[i]].unsqueeze(0))
+                    msg_i = torch.cat(parts_i, dim=1)
                     digest_i = sha256_many(msg_i)
                     u_i = _digest_to_u(digest_i)
                     tok_i = torch.searchsorted(cdfs[i:i+1], u_i.unsqueeze(-1)).squeeze(-1)
@@ -975,6 +1059,9 @@ class ProofWriter:
         self.model_config_diff = None
         self.sampling_params_diff = None
         self.ipfs_cid = None
+        # Proof schema version: 2 = legacy, >= 3 enables the v3 carrier
+        # (canonical-JSON extra_flags + admission nonce, TIP-0003).
+        self.proof_version = 2
 
     def set_callback(self, callback):
         """Set callback for when a solution is found."""
@@ -998,10 +1085,15 @@ class ProofWriter:
 
     def set_compute_precision(self, precision: str):
         """Attach compute-precision (fp16 / int8-awq / …) to all proofs."""
-        self.compute_precision = precision        
+        self.compute_precision = precision
 
-    def write_proof(self, seq_id, step_num, window_data, digest, 
-                  is_solution, pow_params, seq_info, completion_id: str | None = None):
+    def set_proof_version(self, version: int):
+        """Set the proof schema version (2 = legacy, >= 3 = v3 carrier)."""
+        self.proof_version = int(version)
+
+    def write_proof(self, seq_id, step_num, window_data, digest,
+                  is_solution, pow_params, seq_info, completion_id: str | None = None,
+                  admission_nonce: bytes | None = None):
         """Write a proof to disk."""
         # Create proof dictionary
         proof = {
@@ -1073,6 +1165,25 @@ class ProofWriter:
             if completion_id:
                 self.model_config_diff = {"completion_id": completion_id}
 
+        # V3 carrier (TIP-0003). proof["model_config_diff"] was
+        # captured BEFORE the completion-id mutation above (by reference), so
+        # for v3 rebuild it from the post-mutation value and merge the
+        # admission nonce through the shared helper — the nonce and the
+        # completion_id must both land on THIS proof. serialize_proof emits
+        # the resulting string verbatim (canonical JSON) for version >= 3.
+        proof["version"] = self.proof_version
+        if self.proof_version >= pow_v3.V3_PROOF_VERSION:
+            if admission_nonce is not None:
+                proof["model_config_diff"] = pow_v3.merge_extra_flags_v3(
+                    self.model_config_diff, bytes(admission_nonce).hex())
+            else:
+                _mcd = self.model_config_diff
+                proof["model_config_diff"] = (
+                    _mcd if isinstance(_mcd, str)
+                    else pow_v3.canonical_json(_mcd or {}))
+        elif admission_nonce is not None:
+            raise ValueError("admission_nonce requires proof_version >= 3")
+
         # Generate filename
         filename = f"pow_proof_{seq_id}_{step_num}_{uuid.uuid4().hex[:8]}.json"
         filepath = os.path.join(self.output_dir, filename)
@@ -1115,10 +1226,21 @@ def _to_bytes(x):
 def serialize_proof(obj: dict) -> bytes:
     b = flatbuffers.Builder(1024)
 
+    proof_version = int(obj.get('version', 2))
+
     mid_off = b.CreateString(obj['model_identifier'])
     cp_off  = b.CreateString(obj['compute_precision'])
     ipfs_off  = b.CreateString(obj['ipfs_cid'])
-    extra_off  = b.CreateString(to_python_string(obj['model_config_diff']))
+    if proof_version >= pow_v3.V3_PROOF_VERSION:
+        # v3 producer convention (TIP-0003): extra_flags is
+        # canonical JSON, never pformat. A str is emitted verbatim (it is the
+        # already-merged canonical JSON from the v3 merge helper).
+        mcd = obj['model_config_diff']
+        extra_str = mcd if isinstance(mcd, str) else pow_v3.canonical_json(mcd or {})
+        extra_off = b.CreateString(extra_str)
+    else:
+        # v2 path untouched: legacy pformat blob, consensus-opaque.
+        extra_off = b.CreateString(to_python_string(obj['model_config_diff']))
     
     # — raw bytes —
     tgt_off  = b.CreateByteVector(_to_bytes(obj['target']))
@@ -1215,7 +1337,7 @@ def serialize_proof(obj: dict) -> bytes:
     
     # — root table with explicit uint64 masking —
     Proof.Start(b)
-    Proof.AddVersion(b,      int(2) )
+    Proof.AddVersion(b,      proof_version )
     Proof.AddTick(b,      int(obj['tick'])      & 0xFFFFFFFFFFFFFFFF)
     Proof.AddTimestamp(b, int(obj['timestamp']) & 0xFFFFFFFFFFFFFFFF)
     Proof.AddIsSolution(b, 1 if obj['is_solution'] else 0)
@@ -1586,29 +1708,37 @@ def _str_bytes(s: str,
     return arr.unsqueeze(0).expand(batch_size, -1)  # (B, len(s))
 
 # @pow_profiler
-def _build_msg(header_prefix, v, T8, j4, ctx_bytes, precision):
+def _build_msg(header_prefix, v, T8, j4, ctx_bytes, precision, nonce=None):
     """Build the message for SHA-256 hashing.
-    
+
     Args:
         header_prefix: (76,) ByteTensor of block header prefix (or (32,) for legacy block hash)
         v: (32,) ByteTensor of VDF
         T8: (8,) ByteTensor of tick
         j4: (B, 4) ByteTensor of step counter
-        ctx_bytes: (B, L) ByteTensor of context tokens       
+        ctx_bytes: (B, L) ByteTensor of context tokens
         precision: (8,) ByteTensor of precision
-        
+        nonce: optional (32,) or (B, 32) ByteTensor — the v3 admission nonce,
+            appended after precision for version >= 3 proofs mined with
+            admission (TIP-0003). None preserves the v2 preimage
+            byte-for-byte.
+
     Returns:
         (B, 76/32+32+8+4+L) ByteTensor of message
     """
     B = ctx_bytes.size(0)
-    return torch.cat([
+    parts = [
         header_prefix.view(1, -1).expand(B, -1),
         v.view(1, -1).expand(B, -1),
         T8.view(1, -1).expand(B, -1),
         j4,
         ctx_bytes,
         precision,
-    ], dim=1)
+    ]
+    if nonce is not None:
+        parts.append(nonce.view(-1, nonce.size(-1)).expand(B, -1)
+                     if nonce.dim() > 1 else nonce.view(1, -1).expand(B, -1))
+    return torch.cat(parts, dim=1)
 
 def _digest_to_u(digest: torch.ByteTensor) -> torch.Tensor:
     """

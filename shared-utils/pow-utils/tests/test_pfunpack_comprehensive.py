@@ -250,5 +250,60 @@ class TestPfunpackComprehensive:
         assert unpacked['extra_flags'] == proof_dict['model_config_diff']
 
 
+@pytest.mark.skipif(not HAS_PFUNPACK, reason="pfunpack not available")
+class TestPfunpackV3Carrier:
+    """v3 admission carrier (TIP-0003): the nonce rides inside
+    extra_flags; the packer preserves extra_flags verbatim across pack/unpack/
+    repack, and rejects a SIDE admission_nonce (which would be a silent second
+    v3 writer path). Exercises the LIVE pfunpack.pack_proof path (the repack
+    path used by pack_mining_response_with_proof_bytes)."""
+
+    def _full_proof_dict(self, *, version, model_config_diff):
+        return {
+            'version': version, 'tick': 100000, 'timestamp': 1700000000,
+            'is_solution': True, 'temperature': 1.0, 'top_p': 1.0,
+            'top_k': 50, 'repetition_penalty': 1.0,
+            'target': "00" * 30 + "ffff", 'vdf': "aa" * 32, 'hash': "bb" * 32,
+            'block_hash': "cc" * 32, 'header_prefix': "dd" * 76,
+            'model_identifier': 'model@commit', 'compute_precision': 'fp16',
+            'ipfs_cid': '', 'model_config_diff': model_config_diff,
+            'chosen_tokens': [101, 102, 103], 'chosen_probs': [0.5, 0.3, 0.2],
+            'sampling_u': [0.1, 0.2, 0.3], 'softmax_normalizers': [1.0, 1.1, 1.2],
+            'prompt_tokens': [1, 2, 3], 'pad_mask': [1, 1, 0],
+            'topk_logits': [[0.1, 0.2]], 'topk_indices': [[1, 2]],
+            'logsumexp_stats': [[1.0, 2.0]],
+        }
+
+    def test_v3_nonce_in_extra_flags_survives_repack(self):
+        import json
+        nonce_hex = "ab" * 32
+        carrier = json.dumps({"v3": {"admission_nonce": nonce_hex}},
+                             separators=(",", ":"))
+        proof_dict = self._full_proof_dict(version=3, model_config_diff=carrier)
+
+        # Producer path: serialize_proof serializes model_config_diff (carrier)
+        # into the FB extra_flags field; unpack surfaces it as the extra_flags
+        # key with the nonce intact.
+        u0 = pfunpack.unpack_proof(serialize_proof(proof_dict))
+        assert u0['extra_flags'] == carrier
+        assert json.loads(u0['extra_flags'])["v3"]["admission_nonce"] == nonce_hex
+
+        # LIVE repack: pack_proof reads the extra_flags key and preserves it,
+        # so the nonce survives an unpack -> pack -> unpack round-trip.
+        u1 = pfunpack.unpack_proof(pfunpack.pack_proof(u0))
+        assert u1['extra_flags'] == carrier
+        assert json.loads(u1['extra_flags'])["v3"]["admission_nonce"] == nonce_hex
+
+    def test_side_admission_nonce_rejected(self):
+        # A caller passing admission_nonce as a SIDE field (instead of merging
+        # it into extra_flags) must fail loudly, not silently emit a proof
+        # missing the nonce.
+        u0 = pfunpack.unpack_proof(
+            serialize_proof(self._full_proof_dict(version=3, model_config_diff="{}")))
+        u0['admission_nonce'] = bytes.fromhex("ab" * 32)
+        with pytest.raises(Exception):
+            pfunpack.pack_proof(u0)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

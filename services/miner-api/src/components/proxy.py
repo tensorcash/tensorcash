@@ -607,6 +607,24 @@ class RequestManager:
         # Validate and set temperature
         temperature = data.get("temperature")
         data["temperature"] = clamp_param("temperature", temperature, TEMP_MIN, TEMP_MAX, DEFAULT_TEMP)
+
+        # v3 mining (TIP-0003): the sampler profile is
+        # consensus-FIXED. The verifier REJECTS any v3 proof not sampled with
+        # EXACTLY temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0
+        # (quick_verifier VerifyV3SamplerProfile / proof_verifier). Clamping is
+        # not enough — repetition_penalty is not clamped above, and a merely
+        # in-bounds top_k/top_p still fails the exact-equality check. This is
+        # the PoW-mining ingress (not user inference: non-mining requests are
+        # routed to the audit path before here), so force the fixed profile
+        # rather than emit work the verifier will discard.
+        if int(os.getenv("POW_PROOF_VERSION", "2")) >= 3:
+            fixed_profile = {"temperature": 1.0, "top_k": 50, "top_p": 1.0,
+                             "repetition_penalty": 1.0}
+            for name, value in fixed_profile.items():
+                if data.get(name) != value:
+                    logger.info(f"[RequestManager] v3 fixed profile: forcing "
+                                f"{name}={value} (was {data.get(name)})")
+                data[name] = value
         return data
 
     def _backend_base_url(self, model_name) -> str:

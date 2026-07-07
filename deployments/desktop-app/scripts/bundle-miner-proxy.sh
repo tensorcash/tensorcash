@@ -72,6 +72,8 @@ cp -r "${MINER_API_DIR}/src/"* "${BUNDLE_SRC}/"
 # Copy shared utils
 mkdir -p "${BUNDLE_SRC}/utils"
 cp "${SHARED_UTILS_DIR}/pow-utils/pow_utils.py" "${BUNDLE_SRC}/utils/"
+cp "${SHARED_UTILS_DIR}/pow-utils/pow_v3.py" "${BUNDLE_SRC}/utils/"
+cp "${SHARED_UTILS_DIR}/pow-utils/bcred_table_r1024.py" "${BUNDLE_SRC}/utils/"
 cp "${SHARED_UTILS_DIR}/pow-utils/uint256_arithmetics.py" "${BUNDLE_SRC}/utils/"
 
 mkdir -p "${BUNDLE_SRC}/config"

@@ -75,11 +75,18 @@ class TestCommonSamplerHelper:
         owner._process_solution = Mock()
         
         # Setup ring buffer attributes
-        for attr in ("topk_logits", "topk_indices", "chosen_probs", 
+        for attr in ("topk_logits", "topk_indices", "chosen_probs",
                     "chosen_tokens", "attention_mask", "sampling_u",
                     "softmax_normalizers", "steps"):
             setattr(owner.ring_buffers, attr, torch.zeros(10, 128))
-            
+
+        # V3 admission state (real containers, not Mock: the solution path
+        # subscripts the host mirror and reset re-creates it from max_rows)
+        owner.ring_buffers.max_rows = 10
+        owner.ring_buffers.pow_admission_nonce = torch.zeros(10, 32, dtype=torch.uint8)
+        owner.ring_buffers.pow_admission_valid = torch.zeros(10, dtype=torch.bool)
+        owner.ring_buffers.pow_admission_valid_host = [False] * 10
+
         return owner
     
     @pytest.fixture
@@ -383,7 +390,10 @@ class TestCommonSamplerHelper:
                     "softmax_normalizers", "steps"):
             tensor = getattr(mock_owner.ring_buffers, attr)
             tensor.zero_ = Mock()
-        
+        # Share target must reset with the pow param arrays — regression guard
+        # (it was previously omitted, leaving a stale share target on reset).
+        mock_owner.ring_buffers.pow_share_target.zero_ = Mock()
+
         result = helper.reset_sampler_state()
         
         assert result is True
@@ -398,6 +408,8 @@ class TestCommonSamplerHelper:
                     "softmax_normalizers", "steps"):
             tensor = getattr(mock_owner.ring_buffers, attr)
             tensor.zero_.assert_called_once()
+        # Share target must have been cleared with the rest.
+        mock_owner.ring_buffers.pow_share_target.zero_.assert_called_once()
         
         assert mock_owner.logger.log.call_count >= 2
         mock_owner.logger.log.assert_any_call(

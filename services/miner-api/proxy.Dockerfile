@@ -117,6 +117,8 @@ RUN cp -r /app/proof/* /app/src/proof/
 
 # Copy any helper utils
 COPY shared-utils/pow-utils/pow_utils.py /app/src/utils/
+COPY shared-utils/pow-utils/pow_v3.py /app/src/utils/
+COPY shared-utils/pow-utils/bcred_table_r1024.py /app/src/utils/
 COPY shared-utils/pow-utils/uint256_arithmetics.py /app/src/utils/uint256_arithmetics.py
 COPY shared-utils/chiavdf/tests/test_streaming_verifier.py /app/src/test_streaming_verifier.py 
 COPY shared-utils/config/constants.py /app/src/config/constants.py 

@@ -179,8 +179,15 @@ class BlockValidation(object):
             return obj
         return None
 
+    # BlockValidation
+    def Difficulty(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(24))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Int64Flags, o + self._tab.Pos)
+        return 0
+
 def BlockValidationStart(builder):
-    builder.StartObject(10)
+    builder.StartObject(11)
 
 def Start(builder):
     BlockValidationStart(builder)
@@ -268,6 +275,12 @@ def BlockValidationAddPowBlob(builder, powBlob):
 
 def AddPowBlob(builder, powBlob):
     BlockValidationAddPowBlob(builder, powBlob)
+
+def BlockValidationAddDifficulty(builder, difficulty):
+    builder.PrependInt64Slot(10, difficulty, 0)
+
+def AddDifficulty(builder, difficulty):
+    BlockValidationAddDifficulty(builder, difficulty)
 
 def BlockValidationEnd(builder):
     return builder.EndObject()

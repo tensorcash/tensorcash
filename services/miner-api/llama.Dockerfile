@@ -62,7 +62,8 @@ FROM debian:${DEBIAN_VERSION}-slim AS llama-builder-cpu
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake curl git libomp-dev libcurl4-openssl-dev \
-        libzmq3-dev libzmq5 cppzmq-dev pkg-config libssl-dev ca-certificates && \
+        libzmq3-dev libzmq5 cppzmq-dev pkg-config libssl-dev ca-certificates \
+        libargon2-dev && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=flatbuffers-builder /usr/local /usr/local
@@ -92,7 +93,8 @@ ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:/usr/local/cuda/targets/x86_64-linu
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake curl git libomp-dev libcurl4-openssl-dev \
-        libzmq3-dev libzmq5 pkg-config libssl-dev ca-certificates && \
+        libzmq3-dev libzmq5 pkg-config libssl-dev ca-certificates \
+        libargon2-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Ubuntu 22.04 CUDA images do not ship a cppzmq package; install the single header directly.
@@ -121,7 +123,8 @@ FROM debian:${DEBIAN_VERSION}-slim AS llama-cpu
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        bash ca-certificates curl python3 libcurl4 libgomp1 libomp5 libssl3 libzmq5 && \
+        bash ca-certificates curl python3 libcurl4 libgomp1 libomp5 libssl3 libzmq5 \
+        libargon2-1 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=llama-builder-cpu /app/llama.cpp/build/bin /tmp/llama-bin
@@ -160,7 +163,8 @@ FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS llama-cuda
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl python3 libcurl4 libgomp1 libomp5 libssl3 libzmq5 && \
+        ca-certificates curl python3 libcurl4 libgomp1 libomp5 libssl3 libzmq5 \
+        libargon2-1 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=llama-builder-cuda /app/llama.cpp/build/bin /tmp/llama-bin

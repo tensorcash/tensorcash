@@ -65,7 +65,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git wget unzip \
         libzmq3-dev pkg-config \
         python3.10 python3.10-dev python3-pip \
-        libssl-dev libcrypto++-dev && \
+        libssl-dev libcrypto++-dev libargon2-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Install cppzmq header (single header file, not packaged in Ubuntu 22.04)
@@ -116,7 +116,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.10 python3.10-dev python3-pip \
         git unzip ca-certificates rsync wget \
-        libboost-all-dev libflint-dev libzmq3-dev && \
+        libboost-all-dev libflint-dev libzmq3-dev libargon2-1 && \
     rm -rf /var/lib/apt/lists/*
     
 # Install FlatBuffers from official release (still needed for runtime FlatBuffer generation)
@@ -172,6 +172,8 @@ COPY --from=proof-processor-builder /build/tests/build/proof_processor.so /usr/l
 # Copy pow_utils.py to vllm/sampling
 COPY shared-utils/pow-utils/common_sampler_helper.py /app/vllm/vllm/sampling/
 COPY shared-utils/pow-utils/pow_utils.py /app/vllm/vllm/sampling/
+COPY shared-utils/pow-utils/pow_v3.py /app/vllm/vllm/sampling/
+COPY shared-utils/pow-utils/bcred_table_r1024.py /app/vllm/vllm/sampling/
 COPY shared-utils/pow-utils/zmq_pow_writer.py /app/vllm/vllm/sampling/
 COPY shared-utils/pow-utils/uint256_arithmetics.py /app/vllm/vllm/sampling/
 COPY shared-utils/pow-utils/test/zmq_test_listener.py /app/vllm/vllm/sampling/

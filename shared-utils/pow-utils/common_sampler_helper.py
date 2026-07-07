@@ -6,6 +6,12 @@ from collections import deque
 from vllm.sampling.pow_utils import PowState, sha256_many, _tok_le_bytes, _u32le, _str_bytes, _build_msg, _digest_to_u, POW_WINDOW_SIZE, check_hash_against_target, SequenceCache, Logger,RowManager,RingBuffers,PowHasher,ProofWriter, hex_to_bytes_tensor
 from vllm.sampling.zmq_pow_writer import MiningResponseSubmitter
 from vllm.sampling.uint256_arithmetics import get_compact
+# V3 prompt-binding / admission helpers (TIP-0003) — deployed next
+# to pow_utils.py in every image.
+try:
+    from vllm.sampling import pow_v3
+except ImportError:
+    import pow_v3
 
 # tokens.min()>=0 is a per-step host sync (bool(tensor)); it's a validation guard,
 # not a correctness requirement, so it's off by default and gated behind a flag.
@@ -57,6 +63,174 @@ class CommonSamplerHelper:
                 self.use_cpp_processor = False
         else:
             self.use_cpp_processor = False
+
+        # ---- V3 admission grind scheduling (TIP-0003) ----
+        # POW_V3_ADMISSION_MODE:
+        #   always (default) — speculatively grind admission for EVERY window
+        #           at its boundary (pay ~ELIG_ALPHA of decode even on windows
+        #           that turn out free). Only takes effect for proof version
+        #           >= 3, so v2 miners never grind. Always-include is the
+        #           testnet policy: simpler, and avoids the free-tier
+        #           no-nonce ambiguity against old nodes.
+        #   off    — never grind; v3 windows landing in [B_FLOOR, B_FREE)
+        #           are forfeited (nonce-less mining).
+        # The tier is only known post-decode, so these are the two honest
+        # strategies (§6 overhead note). Grinding runs in the native
+        # admission_grind (C++/libargon2, GIL released) — never a Python
+        # nonce loop (§9).
+        self.admission_mode = os.environ.get(
+            'POW_V3_ADMISSION_MODE', 'always').strip().lower()
+        try:
+            self.admission_max_tries_factor = max(1, int(os.environ.get(
+                'POW_V3_GRIND_MAX_TRIES_FACTOR', '16')))
+        except ValueError:
+            self.admission_max_tries_factor = 16
+        self._admission_grind_fn = None       # injectable for tests
+        self._admission_grind_resolved = False
+        self._admission_warned_no_grinder = False
+
+    def assert_v3_ready(self):
+        """Startup self-test for v3 mining (fail fast, never at the first
+        window boundary): the native Argon2 grinder must exist AND find a
+        nonce against the easiest possible target. Raises RuntimeError —
+        callers invoke this when POW_PROOF_VERSION >= 3 and must let it
+        propagate; a v3 miner without Argon2 would silently forfeit every
+        admission-band window."""
+        grind_fn = self._resolve_admission_grind_fn()
+        if grind_fn is None:
+            raise RuntimeError(
+                "POW_PROOF_VERSION >= 3 but the native admission_grind is "
+                "unavailable (proof_processor.so missing or built without "
+                "libargon2 / POW_V3_HAVE_ARGON2). Rebuild with libargon2 or "
+                "mine v2.")
+        # All-0xff little-endian target = max uint256: any digest except
+        # all-0xff passes the strict <, so the first try wins.
+        msg_w = pow_v3.build_step_message(
+            bytes(76), bytes(32), 0, 0, [], "selftest")
+        commitment = pow_v3.prompt_commitment([], [])
+        try:
+            nonce = grind_fn(bytes(msg_w), "v3-selftest", b"\xff" * 32, 4,
+                             bytes(commitment))
+        except Exception as exc:
+            raise RuntimeError(
+                f"v3 startup self-test: native admission_grind failed: {exc}"
+            ) from exc
+        if nonce is None or len(bytes(nonce)) != 32:
+            raise RuntimeError(
+                "v3 startup self-test: admission_grind found no nonce against "
+                "the trivial target — Argon2 backend is broken.")
+        self.s.logger.log("v3 startup self-test passed: native Argon2 "
+                          "admission grinder operational", "INFO")
+
+    def _resolve_admission_grind_fn(self):
+        """Resolve the native grind loop once. Returns a callable
+        (msg_w: bytes, model_identifier: str, target_le: bytes32,
+        max_tries: int, prompt_commitment: bytes32) -> bytes32 | None,
+        or None when no native module is importable — we then mine
+        nonce-less rather than run a Python nonce loop (§9)."""
+        if not self._admission_grind_resolved:
+            self._admission_grind_resolved = True
+            if self._admission_grind_fn is None:
+                try:
+                    import proof_processor
+                    self._admission_grind_fn = getattr(
+                        proof_processor, "admission_grind", None)
+                except ImportError:
+                    self._admission_grind_fn = None
+        return self._admission_grind_fn
+
+    def ensure_admission_for_rows(self, seq_ids, rows, steps, contexts,
+                                  compute_precision):
+        """Grind + store admission for every row whose NEXT sampled token is
+        a window-first step (steps is already window-relative: boundary ==
+        0). Must run BEFORE batch_sample_tokens hashes those steps — the
+        nonce enters every u of the window (§6: admission is pre-decode).
+        No-op unless POW_V3_ADMISSION_MODE=always and proof version >= 3,
+        so the default hot path pays nothing."""
+        if self.admission_mode != 'always':
+            return
+        if int(getattr(self.s.proof_writer, 'proof_version', 2) or 2) < pow_v3.V3_PROOF_VERSION:
+            return
+        boundary = (steps == 0).nonzero(as_tuple=False).flatten().tolist()
+        for i in boundary:
+            row = rows[i]
+            if row is None:
+                continue
+            self.ensure_admission_for_window(
+                seq_ids[i], row, contexts[i].tolist(), 0, compute_precision)
+
+    def ensure_admission_for_window(self, seq_id, row, context_tokens,
+                                    step_idx, compute_precision):
+        """Decide THIS window's admission for one row: clear any stale nonce
+        (a nonce admits exactly one window — msg_w changes at every
+        boundary), grind against the registered-difficulty target, and store
+        the selected 32 bytes in RingBuffers before the window's first
+        sampled token. Returns True iff an admissible nonce was stored."""
+        rb = self.s.ring_buffers
+        rb.write_admission_nonce(row, None)
+
+        snapshot = self.s.seq_params.get(seq_id, {}).get("pow_snapshot")
+        if not snapshot:
+            self.s.logger.log(
+                f"v3 admission skipped for seq {seq_id}: no pow_snapshot", "WARN")
+            return False
+        difficulty = snapshot.get("difficulty")
+        try:
+            difficulty = int(difficulty)
+        except (TypeError, ValueError):
+            difficulty = 0
+        if difficulty <= 0:
+            self.s.logger.log(
+                f"v3 admission skipped for seq {seq_id}: no registered "
+                f"difficulty on snapshot", "WARN")
+            return False
+
+        grind_fn = self._resolve_admission_grind_fn()
+        if grind_fn is None:
+            if not self._admission_warned_no_grinder:
+                self._admission_warned_no_grinder = True
+                self.s.logger.log(
+                    "v3 admission requested but native admission_grind is "
+                    "unavailable (proof_processor.so without argon2?) — "
+                    "mining nonce-less; [B_FLOOR, B_FREE) windows will be "
+                    "forfeited", "ERROR")
+            return False
+
+        # msg_w: the SAME preimage batch_sample_tokens will hash for this
+        # window's first step, without the nonce (§6). Header falls back to
+        # block_hash exactly like the sampling path.
+        header_hex = snapshot.get("header_prefix") or snapshot.get("block_hash")
+        msg_w = pow_v3.build_step_message(
+            bytes.fromhex(header_hex),
+            bytes.fromhex(snapshot["vdf"]),
+            int(snapshot["tick"]),
+            int(step_idx),
+            context_tokens,
+            compute_precision,
+        )
+        # Full pre-window prefix (§6): the archive at the boundary IS
+        # prompt_tokens of the eventual proof (archive[:-256] at emission).
+        cache = self.s.seq_caches.get(seq_id, {})
+        commitment = pow_v3.prompt_commitment(
+            cache.get("archive_list", []) or [],
+            cache.get("pad_mask_list", []) or [],
+        )
+        target_le = pow_v3.admission_target(difficulty).to_bytes(32, "little")
+        max_tries = (pow_v3.admission_expected_tries(difficulty)
+                     * self.admission_max_tries_factor)
+        model_identifier = (getattr(self.s.proof_writer, "model_identifier",
+                                    None) or "unknown")
+
+        nonce = grind_fn(bytes(msg_w), model_identifier, target_le,
+                         int(max_tries), bytes(commitment))
+        if nonce is None:
+            self.s.logger.log(
+                f"v3 admission grind exhausted {max_tries} tries for seq "
+                f"{seq_id} (difficulty {difficulty}) — window mined "
+                f"nonce-less", "WARN")
+            return False
+        rb.write_admission_nonce(row, bytes(nonce))
+        return True
 
     def init_sequence_cache(self, seq_id, prompt_tokens):
         W = self.s.window_size
@@ -272,8 +446,12 @@ class CommonSamplerHelper:
             getattr(self.s.ring_buffers, attr).zero_()
         # Also clear pow param arrays
         for attr in ("pow_tick", "pow_request_id", "pow_header", "pow_vdf", "pow_vdf_len",
-                     "pow_target", "pow_block_hash", "pow_header_len", "pow_valid"):
+                     "pow_target", "pow_share_target", "pow_block_hash", "pow_header_len",
+                     "pow_valid", "pow_admission_nonce", "pow_admission_valid"):
             getattr(self.s.ring_buffers, attr).zero_()
+        # host mirror of the v3 admission flags must reset with the tensors
+        self.s.ring_buffers.pow_admission_valid_host = (
+            [False] * self.s.ring_buffers.max_rows)
         self.s._pre_temp_logits = None
         self.s._log_Z = None
         self.s._sampling_tensors = None
@@ -425,7 +603,16 @@ class CommonSamplerHelper:
             batch_size=tokens_bytes.size(0),
             device=self.s.device
         )
-        msg = _build_msg(header_data, vdf_data, T8, j4, tokens_bytes, precision_bytes)
+        # V3 (TIP-0003): the final target-critical digest is the
+        # SAME construction as every step u — when this row sampled with an
+        # admission nonce, the nonce must be appended here too, or the derived
+        # header nonce disagrees with verifier replay.
+        admission_nonce_t = (
+            self.s.ring_buffers.pow_admission_nonce[row]
+            if self.s.ring_buffers.pow_admission_valid_host[row] else None
+        )
+        msg = _build_msg(header_data, vdf_data, T8, j4, tokens_bytes, precision_bytes,
+                         nonce=admission_nonce_t)
         digest = sha256_many(msg)
         # Slice 11.4 — dual-threshold classification. ``check_solution``
         # gates on the block target; ``check_share_solution`` gates on
@@ -478,6 +665,12 @@ class CommonSamplerHelper:
             "difficulty": difficulty,
             "window_size": self.s.window_size
         }
+        if admission_nonce_t is not None:
+            # 32 raw bytes; ProofProcessor merges them into
+            # extra_flags.v3.admission_nonce via the shared helper (§3/§9) —
+            # it never re-grinds and never infers from the digest.
+            pow_hasher_data["admission_nonce"] = (
+                admission_nonce_t.contiguous().cpu().numpy().tobytes())
 
         completion_id = seq_params.get("completion_id")
         
@@ -559,7 +752,15 @@ class CommonSamplerHelper:
             batch_size=tokens_bytes.size(0),
             device=self.s.device
         )
-        msg = _build_msg(header_data, vdf_data, T8, j4, tokens_bytes, precision_bytes)
+        # V3 (TIP-0003): final digest must include the row's
+        # admission nonce when one was sampled with — same rule as the cpp
+        # branch above.
+        admission_nonce_t = (
+            self.s.ring_buffers.pow_admission_nonce[row]
+            if self.s.ring_buffers.pow_admission_valid_host[row] else None
+        )
+        msg = _build_msg(header_data, vdf_data, T8, j4, tokens_bytes, precision_bytes,
+                         nonce=admission_nonce_t)
         digest = sha256_many(msg)
         # Slice 11.4 — dual-threshold classification, mirroring the
         # cpp branch (see _process_solution_cpp above for the full
@@ -615,7 +816,10 @@ class CommonSamplerHelper:
 
         pow_blob, pow_dic = self.s.proof_writer.write_proof(
             seq_id, step_num, window_data, digest,
-            is_solution.any().item(), pow_params, seq_info, completion_id=completion_id
+            is_solution.any().item(), pow_params, seq_info, completion_id=completion_id,
+            admission_nonce=(
+                bytes(admission_nonce_t.cpu().numpy().tobytes())
+                if admission_nonce_t is not None else None),
         )
         pow_blob_hash = hashlib.sha256(pow_blob).digest()
         nonce = struct.unpack('<I', digest[0, :4].cpu().numpy().tobytes())[0]
