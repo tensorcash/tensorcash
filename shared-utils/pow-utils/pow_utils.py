@@ -1095,6 +1095,21 @@ class ProofWriter:
                   is_solution, pow_params, seq_info, completion_id: str | None = None,
                   admission_nonce: bytes | None = None):
         """Write a proof to disk."""
+        # Proof-version agreement (TIP-0003): the miner-api proxy
+        # stamps its own POW_PROOF_VERSION into the pow payload (it forces the
+        # v3 fixed sampler profile keyed off THAT env), while this writer's
+        # proof_version comes from the sampler process's env. Drift between
+        # the two means every emitted proof is verifier-rejected (wrong
+        # profile or wrong carrier) — fail loudly on the first proof instead.
+        # Absent stamp (old proxy image / direct callers) skips the check.
+        stamped = pow_params.get("proof_version") if isinstance(pow_params, dict) else None
+        if stamped is not None and int(stamped) != int(self.proof_version):
+            raise ValueError(
+                f"POW_PROOF_VERSION disagreement: miner-api ingress stamped "
+                f"proof_version={int(stamped)} but this sampler process is "
+                f"configured for {int(self.proof_version)}; align the env on "
+                f"both processes (proxy forces the v3 fixed profile only when "
+                f"ITS env is >= 3)")
         # Create proof dictionary
         proof = {
             "ipfs_cid": pow_params["ipfs_cid"],

@@ -665,6 +665,12 @@ class CommonSamplerHelper:
             "difficulty": difficulty,
             "window_size": self.s.window_size
         }
+        # Forward the miner-api ingress proof-version stamp (TIP-0003
+        # §9 agreement check): ProofProcessor::assemble_proof_dict compares it
+        # against its own configured proof_version_ and fails loudly on env
+        # drift between the proxy and this process. Absent on old proxies.
+        if pow_snapshot and pow_snapshot.get("proof_version") is not None:
+            pow_hasher_data["proof_version"] = int(pow_snapshot["proof_version"])
         if admission_nonce_t is not None:
             # 32 raw bytes; ProofProcessor merges them into
             # extra_flags.v3.admission_nonce via the shared helper (§3/§9) —
@@ -806,6 +812,11 @@ class CommonSamplerHelper:
             ),
             "ipfs_cid": ipfs_cid
         }
+        # Forward the miner-api ingress proof-version stamp (TIP-0003
+        # §9): ProofWriter.write_proof compares it against its configured
+        # proof_version and fails loudly on env drift. Absent on old proxies.
+        if pow_snapshot and pow_snapshot.get("proof_version") is not None:
+            pow_params["proof_version"] = int(pow_snapshot["proof_version"])
 
         # Attach completion_id from stable req-id mapping
         completion_id = None

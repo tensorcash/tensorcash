@@ -257,7 +257,26 @@ std::unordered_map<std::string, std::any> ProofProcessor::assemble_proof_dict(
     std::optional<std::string> completion_id
 ) {
     std::unordered_map<std::string, std::any> proof;
-    
+
+    // Proof-version agreement (TIP-0003): the miner-api proxy
+    // stamps its POW_PROOF_VERSION into the pow payload and the sampler
+    // forwards it here via pow_hasher_data. Drift between that stamp and
+    // this process's configured proof_version_ means every emitted proof is
+    // verifier-rejected (wrong profile force or wrong carrier) — fail loudly
+    // on the first proof instead. Absent stamp (old proxy) skips the check.
+    // Mirrors the Python-path check in pow_utils.ProofWriter.write_proof.
+    if (pow_hasher_data.contains("proof_version")) {
+        const int stamped = pow_hasher_data["proof_version"].cast<int>();
+        if (stamped != proof_version_) {
+            throw std::invalid_argument(
+                "POW_PROOF_VERSION disagreement: miner-api ingress stamped "
+                "proof_version=" + std::to_string(stamped) +
+                " but this ProofProcessor is configured for " +
+                std::to_string(proof_version_) +
+                "; align the env on both processes");
+        }
+    }
+
     // Basic metadata. Version comes from proof_version_ (TIP-0003
     // §3: version=3 turns on the v3 carrier rules); the pfunpack and
     // pow_zmq_writer serializers both read it from this dict entry.

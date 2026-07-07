@@ -156,6 +156,37 @@ class TestProofWriterCarrier:
         assert p.Version() == 3
         assert json.loads(extra) is not None
 
+    def test_proof_version_stamp_agreement(self, writer):
+        """The miner-api ingress stamps its POW_PROOF_VERSION into the pow
+        payload; the writer must fail loudly on drift (a mismatch means the
+        fixed-profile force and the emitted carrier disagree — every proof
+        would be verifier-rejected)."""
+        # Absent stamp (old proxy image): unchecked, writes fine.
+        _write(writer)
+        # Matching stamp: fine on both versions.
+        params = _pow_params()
+        params["proof_version"] = 2
+        writer.write_proof(seq_id=1, step_num=WINDOW, window_data=_window_data(),
+                           digest=_digest(), is_solution=False, pow_params=params,
+                           seq_info=_seq_info())
+        writer.set_proof_version(3)
+        params["proof_version"] = 3
+        writer.write_proof(seq_id=1, step_num=WINDOW, window_data=_window_data(),
+                           digest=_digest(), is_solution=False, pow_params=params,
+                           seq_info=_seq_info())
+        # Drift in either direction: loud failure.
+        params["proof_version"] = 2
+        with pytest.raises(ValueError, match="POW_PROOF_VERSION disagreement"):
+            writer.write_proof(seq_id=1, step_num=WINDOW, window_data=_window_data(),
+                               digest=_digest(), is_solution=False, pow_params=params,
+                               seq_info=_seq_info())
+        writer.set_proof_version(2)
+        params["proof_version"] = 3
+        with pytest.raises(ValueError, match="POW_PROOF_VERSION disagreement"):
+            writer.write_proof(seq_id=1, step_num=WINDOW, window_data=_window_data(),
+                               digest=_digest(), is_solution=False, pow_params=params,
+                               seq_info=_seq_info())
+
 
 class TestZmqWriterCarrier:
     def _proof_dict(self, version=2, **extra_keys):
