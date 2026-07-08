@@ -73,20 +73,30 @@ class CommonSamplerHelper:
 
         # ---- V3 admission grind scheduling (TIP-0003) ----
         # POW_V3_ADMISSION_MODE:
-        #   always (default) — speculatively grind admission for EVERY window
-        #           at its boundary (pay ~ELIG_ALPHA of decode even on windows
-        #           that turn out free). Only takes effect for proof version
-        #           >= 3, so v2 miners never grind. Always-include is the
-        #           testnet policy: simpler, and avoids the free-tier
-        #           no-nonce ambiguity against old nodes.
-        #   off    — never grind; v3 windows landing in [B_FLOOR, B_FREE)
-        #           are forfeited (nonce-less mining).
+        #   off (default) — never grind; emit v3 INERT (no admission nonce
+        #           folded into u / the final hash). This is the inert-rollout
+        #           default and MUST match the standalone scheduler default
+        #           (admission_scheduler.py): a v3 proof is safe to emit before
+        #           activation only when nonce-less, because bcore judges a
+        #           version>=3 proof under v2/reuse rules until height >=
+        #           V3ActivationHeight (validation.cpp:4099-4108). Folding a
+        #           nonce early diverges u from consensus -> self-punishing
+        #           block rejection. NOTE: the activation gate is height-driven
+        #           in bcore, but the MINER's pow.difficulty is the positive
+        #           registry value, so 'always' here would grind regardless of
+        #           height — hence off is the only safe default. Operators opt
+        #           in to 'always' for admission-band mining AT/AFTER activation.
+        #   always — speculatively grind admission for EVERY window at its
+        #           boundary (pay ~ELIG_ALPHA of decode even on windows that
+        #           turn out free). Only takes effect for proof version >= 3.
+        #           v3 windows landing in [B_FLOOR, B_FREE) get a nonce instead
+        #           of being forfeited as nonce-less mining.
         # The tier is only known post-decode, so these are the two honest
         # strategies (§6 overhead note). Grinding runs in the native
         # admission_grind (C++/libargon2, GIL released) — never a Python
         # nonce loop (§9).
         self.admission_mode = os.environ.get(
-            'POW_V3_ADMISSION_MODE', 'always').strip().lower()
+            'POW_V3_ADMISSION_MODE', 'off').strip().lower()
         try:
             self.admission_max_tries_factor = max(1, int(os.environ.get(
                 'POW_V3_GRIND_MAX_TRIES_FACTOR', '16')))
