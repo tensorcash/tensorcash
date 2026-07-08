@@ -14,11 +14,20 @@ on:
         default: 10
   push:
     branches: [main, develop, test_*, merge/*]
+    # Bare paths (no /**) catch submodule-pointer bumps, which appear as a
+    # gitlink change on the submodule's own path rather than as files inside
+    # it. Without them, a commit that only updates `services/core-node/bcore`
+    # does not trigger the suite (same convention as build-desktop.yml).
     paths:
+      - 'services/core-node/bcore'
       - 'services/core-node/bcore/**'
+      - 'services/core-node/cosign-bridge'
       - 'services/core-node/cosign-bridge/**'
+      - 'shared-utils/chiavdf'
       - 'shared-utils/chiavdf/**'
+      - 'shared-utils/secp256k1-zkp'
       - 'shared-utils/secp256k1-zkp/**'
+      - 'shared-utils/liboqs'
       - 'shared-utils/liboqs/**'
       - 'shared-utils/kyc-prover/**'
       - 'shared-utils/fb-schemas/**'
@@ -26,13 +35,19 @@ on:
   pull_request:
     branches: [main, develop]
     paths:
+      - 'services/core-node/bcore'
       - 'services/core-node/bcore/**'
+      - 'services/core-node/cosign-bridge'
       - 'services/core-node/cosign-bridge/**'
+      - 'shared-utils/chiavdf'
       - 'shared-utils/chiavdf/**'
+      - 'shared-utils/secp256k1-zkp'
       - 'shared-utils/secp256k1-zkp/**'
+      - 'shared-utils/liboqs'
       - 'shared-utils/liboqs/**'
       - 'shared-utils/kyc-prover/**'
       - 'shared-utils/fb-schemas/**'
+      - '.github/workflows/bcore-tests.yml'
 
 concurrency:
   group: bcore-tests-${{ github.event.pull_request.number || github.ref }}
