@@ -271,7 +271,11 @@ jobs:
     runs-on: k8s-build
     needs: changes
     if: needs.changes.outputs.verification-api == 'true' || needs.changes.outputs.workflows == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
-    timeout-minutes: 10  # 10 minute timeout as requested
+    # Cold ephemeral runner: setup-python + the full pip stack can eat ~10min
+    # alone before the actions/cache save ever runs; a timeout here skips the
+    # cache save and keeps every retry cold. Generous cap breaks that cycle —
+    # warm-cache runs finish far below it.
+    timeout-minutes: 30
     strategy:
       matrix:
         python-version: ['3.10']
@@ -616,7 +620,10 @@ jobs:
     runs-on: k8s-build
     needs: changes
     if: needs.changes.outputs.pow-utils == 'true' || needs.changes.outputs.workflows == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
-    timeout-minutes: 30  # Increased for comprehensive C++ and chiavdf builds
+    # Cold ephemeral runner: full C++/FlatBuffers/chiavdf builds from scratch
+    # exceed 30min before caches ever get saved (timeout skips the save =>
+    # every retry cold). Warm runs finish far below this cap.
+    timeout-minutes: 60
     strategy:
       matrix:
         python-version: ['3.11']  # Use Python 3.11 for modern type hints
@@ -1110,7 +1117,10 @@ jobs:
     runs-on: k8s-build
     needs: changes
     if: needs.changes.outputs.vllm-sampler == 'true' || needs.changes.outputs.pow-utils == 'true' || needs.changes.outputs.workflows == 'true' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
-    timeout-minutes: 20
+    # Cold ephemeral runner: the torch download alone can eat most of 20min
+    # before the cache save runs (timeout skips the save => retries stay
+    # cold). Warm runs finish far below this cap.
+    timeout-minutes: 40
 
     steps:
     - uses: actions/checkout@v6
