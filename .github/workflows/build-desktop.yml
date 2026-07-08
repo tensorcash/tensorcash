@@ -2108,6 +2108,10 @@ jobs:
     name: Sign Windows (${{ matrix.chain_type }})
     runs-on: k8s-sign
     needs: build-windows
+    # Signing is release work: it needs the k8s-sign runner (USB token node),
+    # which is not part of the donated public PR pool — on pull_request the
+    # job would queue forever. Runs on push to main, tags, and dispatch.
+    if: github.event_name != 'pull_request'
     timeout-minutes: 30
     strategy:
       fail-fast: false
