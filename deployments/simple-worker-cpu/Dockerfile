@@ -63,7 +63,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake curl git libomp-dev libcurl4-openssl-dev \
         libzmq3-dev libzmq5 cppzmq-dev pkg-config \
         unzip ca-certificates wget \
-        libssl-dev && \
+        libssl-dev libargon2-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Build FlatBuffers from source
@@ -108,7 +108,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git wget unzip \
         libzmq3-dev pkg-config \
         python3-dev \
-        libssl-dev libcrypto++-dev && \
+        libssl-dev libcrypto++-dev libargon2-dev && \
     rm -rf /var/lib/apt/lists/*
 
 RUN wget -q https://raw.githubusercontent.com/zeromq/cppzmq/v4.10.0/zmq.hpp -O /usr/include/zmq.hpp
@@ -142,7 +142,7 @@ WORKDIR /app
 # System runtime deps + supervisor
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git unzip ca-certificates rsync wget curl \
-        libboost-all-dev libflint-dev libzmq3-dev \
+        libboost-all-dev libflint-dev libzmq3-dev libargon2-1 \
         libomp5 libcurl4 libgomp1 \
         supervisor && \
     rm -rf /var/lib/apt/lists/*
