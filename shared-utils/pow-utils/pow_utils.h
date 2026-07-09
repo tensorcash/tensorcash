@@ -13,6 +13,7 @@
 #include <optional>
 #include <functional>
 #include <any>
+#include <array>
 #include <tuple>
 #include <atomic>
 
@@ -123,10 +124,18 @@ public:
     std::vector<std::vector<float>> softmax_normalizers;        // [window_size][max_rows]
     std::vector<int32_t> steps;                                  // [max_rows]
     std::vector<std::vector<std::vector<float>>> logsumexp_stats; // [window_size][max_rows][6]
-    
+
+    // v3 admission state (TIP-0003): the selected 32-byte
+    // admission nonce per row + valid flag, cleared with the row. Mirrors
+    // the Python RingBuffers pow_admission_nonce / pow_admission_valid.
+    std::vector<std::array<uint8_t, 32>> admission_nonce;        // [max_rows]
+    std::vector<uint8_t> admission_valid;                        // [max_rows]
+
     RingBuffers(int window_size, int max_rows);
     std::vector<int> get_positions(const std::vector<int>& rows);
     std::vector<std::vector<uint8_t>> get_window_digests(int row);
+    // nullptr clears (a nonce admits exactly one window), 32 bytes stores.
+    void write_admission_nonce(int row, const uint8_t* nonce32_or_null);
     void clear_row(int row);
     void clear_rows(const std::vector<int>& rows);
     void write_batch(const std::vector<int>& positions, 
@@ -153,6 +162,10 @@ private:
     std::string ipfs_cid;
     int request_id;
     float difficulty;
+    // Registered model difficulty as the exact integer chain value — the v3
+    // admission target derivation (§6) is integer-exact and must not go
+    // through the float above.
+    int64_t difficulty_i64 = 0;
     float temperature = 1.0f;
     float top_p = 1.0f;
     int top_k = 50;
@@ -164,15 +177,38 @@ private:
 public:
     PowHasher();
     void update_from_payload(const std::unordered_map<std::string, std::string>& payload);
-    std::tuple<std::vector<int64_t>, std::vector<float>, std::vector<std::vector<uint8_t>>> 
+    // admission_nonces: optional per-entry 32-byte admission nonces (§7),
+    // one pointer per context (nullptr = no nonce for that row). Empty
+    // vector = legacy v2 shape for every row. Size must otherwise match
+    // contexts (throws) — rows in one batch can differ (per-row admission).
+    std::tuple<std::vector<int64_t>, std::vector<float>, std::vector<std::vector<uint8_t>>>
         batch_sample_tokens(const std::vector<std::vector<int64_t>>& contexts,
                            const std::vector<int32_t>& steps,
                            const std::vector<std::vector<float>>& cdfs,
-                           const std::string& compute_precision);
-    std::tuple<int64_t, float, std::vector<uint8_t>> 
+                           const std::string& compute_precision,
+                           const std::vector<const uint8_t*>& admission_nonces = {});
+    // admission_nonce32: when non-null, the 32 raw admission-nonce bytes are
+    // appended to the legacy step preimage (TIP-0003 — the ONLY
+    // change to the v3 message shape). Null keeps the v2 shape byte-for-byte.
+    std::tuple<int64_t, float, std::vector<uint8_t>>
         sample_token(const std::vector<int64_t>& context,
                     int32_t step,
-                    const std::vector<float>& cdf);
+                    const std::vector<float>& cdf,
+                    const uint8_t* admission_nonce32 = nullptr);
+    // §6/§9: grind this window's Argon2id admission nonce against the
+    // registered-difficulty target using this hasher's header/vdf/tick/
+    // precision/model_identifier state. `context` is the window-first-step
+    // rolling window (msg_w carries NO nonce); prefix_tokens/prefix_pad_mask
+    // are the pre-window archive bound by the prompt commitment (the eventual
+    // proof's prompt_tokens). Byte-identical to pow_v3.build_admission_preimage.
+    // Returns true and fills out_nonce; false when difficulty is unset or the
+    // grind exhausts expected_tries * max_tries_factor (mine nonce-less).
+    bool grind_admission(const std::vector<int64_t>& context,
+                         int32_t step,
+                         const std::vector<int64_t>& prefix_tokens,
+                         const std::vector<uint8_t>& prefix_pad_mask,
+                         uint64_t max_tries_factor,
+                         std::array<uint8_t, 32>& out_nonce);
     std::vector<bool> check_solution(const std::vector<std::vector<uint8_t>>& digests);
     // Slice 11.4 — companion gate on the model-adjusted SHARE target
     // (numerically larger / easier than ``target``). Returns
@@ -273,10 +309,31 @@ private:
     std::vector<std::pair<float,int32_t>> cand_;     // (logit, idx)
     std::vector<float> cand_exp_;                    // exp(logit - max)
     std::atomic<int64_t> cooldown_until_ms_{0};
-    int64_t cooldown_duration_ms_ = 10 * 60 * 1000;
+    int64_t cooldown_duration_ms_ = 0;
+
+    // v3 config (TIP-0003), read from env at initialize() —
+    // mirrors the vLLM sampler: POW_PROOF_VERSION picks the emitted proof
+    // schema, POW_V3_ADMISSION_MODE ('off'|'always') gates the boundary
+    // grind, POW_V3_GRIND_MAX_TRIES_FACTOR bounds the per-window attempts.
+    int proof_version_ = 2;
+    std::string admission_mode_ = "off";
+    uint64_t admission_max_tries_factor_ = 16;
+    bool admission_warned_no_grinder_ = false;
+    // Full prompt+generated token archive per sequence: the pre-window
+    // prefix the v3 admission commitment binds, emitted as the v3 proof's
+    // prompt_tokens at each window boundary.
+    std::unordered_map<int, std::vector<int64_t>> seq_archive_;
 
     void apply_pow_params(const std::unordered_map<std::string, std::string>& pow_params);
     bool activate_sequence_params(int seq_id);
+    // Window-boundary admission prep (§6): clear the row's stale nonce,
+    // refresh the v3 prompt_tokens prefix, and (mode 'always') grind the
+    // window's nonce BEFORE its first sampled token.
+    void prepare_window_admission_(int seq_id, int row, const std::vector<int64_t>& context);
+    // Startup self-test mirroring common_sampler_helper.assert_v3_ready:
+    // fail initialize(), never the first window boundary, when v3 is
+    // configured on a binary that cannot grind admission.
+    void assert_v3_ready_();
     static int64_t now_ms_();
 
 public:

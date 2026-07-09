@@ -11,6 +11,7 @@
 #include <random>
 #include <filesystem>
 #include <ctime>
+#include <cctype>
 #include <cstdint>
 #include <vector>
 #include <tuple>
@@ -326,6 +327,20 @@ RingBuffers::RingBuffers(int window_size, int max_rows)
 
     digest_buffer.assign(max_rows, std::vector<std::vector<uint8_t>>(window_size, std::vector<uint8_t>(32)));
 
+    // v3 admission state (TIP-0003)
+    admission_nonce.assign(max_rows, std::array<uint8_t, 32>{});
+    admission_valid.assign(max_rows, 0);
+}
+
+void RingBuffers::write_admission_nonce(int row, const uint8_t* nonce32_or_null) {
+    if (row < 0 || row >= max_rows) return;
+    if (nonce32_or_null == nullptr) {
+        admission_nonce[row].fill(0);
+        admission_valid[row] = 0;
+    } else {
+        std::copy(nonce32_or_null, nonce32_or_null + 32, admission_nonce[row].begin());
+        admission_valid[row] = 1;
+    }
 }
 
 std::vector<int> RingBuffers::get_positions(const std::vector<int>& rows) {
@@ -362,6 +377,8 @@ void RingBuffers::clear_row(int row) {
         softmax_normalizers[i][row] = 0.0f;
     }
     steps[row] = 0;
+    admission_nonce[row].fill(0);
+    admission_valid[row] = 0;
 }
 
 void RingBuffers::clear_rows(const std::vector<int>& rows) {
@@ -501,6 +518,14 @@ void PowHasher::update_from_payload(const std::unordered_map<std::string, std::s
     }
     if (payload.find("difficulty") != payload.end()) {
         difficulty = std::stof(payload.at("difficulty"));
+        // Exact integer for the v3 admission target derivation (§6). The
+        // payload value is an integer chain param serialized as a string;
+        // fall back through the float only if it ever isn't.
+        try {
+            difficulty_i64 = std::stoll(payload.at("difficulty"));
+        } catch (const std::exception&) {
+            difficulty_i64 = static_cast<int64_t>(difficulty);
+        }
     }
     if (payload.find("header_prefix") != payload.end()) {
         header_prefix = hex_to_bytes(payload.at("header_prefix"));
@@ -689,6 +714,28 @@ ProofWriter::write_proof(
     const std::unordered_map<std::string, std::string>& pow_params,
     const std::unordered_map<std::string, std::any>& seq_info
 ) {
+    // Proof-version agreement (TIP-0003), mirroring the Python
+    // writer: the miner-api proxy stamps its own POW_PROOF_VERSION into the
+    // pow payload (it forces the v3 fixed sampler profile keyed off THAT
+    // env), while this writer's proof_version comes from THIS process's env.
+    // Drift between the two means every emitted proof is verifier-rejected
+    // (wrong profile or wrong carrier) — fail loudly on the first proof
+    // instead. Absent stamp (old proxy image / direct callers) skips the
+    // check.
+    {
+        auto stamped_it = pow_params.find("proof_version");
+        if (stamped_it != pow_params.end() &&
+            std::stoi(stamped_it->second) != proof_version) {
+            throw std::invalid_argument(
+                "POW_PROOF_VERSION disagreement: miner-api ingress stamped "
+                "proof_version=" + stamped_it->second +
+                " but this sampler process is configured for " +
+                std::to_string(proof_version) +
+                "; align the env on both processes (the proxy forces the v3 "
+                "fixed profile only when ITS env is >= 3)");
+        }
+    }
+
     // 1) Build the proof dictionary exactly as before:
     std::unordered_map<std::string, std::any> proof;
     proof["sequence_id"] = seq_id;
@@ -1090,36 +1137,47 @@ std::vector<uint8_t> nbits_to_target(int nbits) {
 }
 
 // Update batch_sample_tokens method:
-std::tuple<std::vector<int64_t>, std::vector<float>, std::vector<std::vector<uint8_t>>> 
+std::tuple<std::vector<int64_t>, std::vector<float>, std::vector<std::vector<uint8_t>>>
 PowHasher::batch_sample_tokens(const std::vector<std::vector<int64_t>>& contexts,
                               const std::vector<int32_t>& steps,
                               const std::vector<std::vector<float>>& cdfs,
-                              const std::string& compute_precision) {
-    
+                              const std::string& compute_precision,
+                              const std::vector<const uint8_t*>& admission_nonces) {
+
     int batch_size = contexts.size();
+    if (!admission_nonces.empty() &&
+        admission_nonces.size() != contexts.size()) {
+        throw std::invalid_argument(
+            "batch_sample_tokens: admission_nonces size must match contexts");
+    }
     std::vector<int64_t> token_ids;
     std::vector<float> us;
     std::vector<std::vector<uint8_t>> digests;
-    
+
     for (int b = 0; b < batch_size; ++b) {
         // Convert context to bytes
         auto ctx_bytes = tok_le_bytes(contexts[b]);
-        
+
         // Convert step to bytes
         auto j4 = u32le(steps[b]);
-        
+
         // Convert tick to bytes (8 bytes for T8)
         auto T8 = u32le(tick);
-        
+
         // Convert precision to bytes
         auto precision_bytes = str_bytes(compute_precision);
-        
+
         // Use header_prefix if available, otherwise h_b
         const auto& header_data = header_prefix.empty() ? h_b : header_prefix;
-        
+
         // Build message
         auto msg = build_msg(header_data, v, T8, j4, ctx_bytes, precision_bytes);
-        
+
+        // v3 (TIP-0003): append this row's admission nonce.
+        if (!admission_nonces.empty() && admission_nonces[b] != nullptr) {
+            msg.insert(msg.end(), admission_nonces[b], admission_nonces[b] + 32);
+        }
+
         // Compute hash using modern OpenSSL
         auto digest = sha256_single(msg);
         digests.push_back(digest);
@@ -1138,28 +1196,35 @@ PowHasher::batch_sample_tokens(const std::vector<std::vector<int64_t>>& contexts
 }
 
 // Update sample_token method:
-std::tuple<int64_t, float, std::vector<uint8_t>> 
+std::tuple<int64_t, float, std::vector<uint8_t>>
 PowHasher::sample_token(const std::vector<int64_t>& context,
                        int32_t step,
-                       const std::vector<float>& cdf) {
+                       const std::vector<float>& cdf,
+                       const uint8_t* admission_nonce32) {
     // Convert context to bytes
     auto ctx_bytes = tok_le_bytes(context);
-    
+
     // Convert step to bytes
     auto j4 = u32le(step);
-    
+
     // Convert tick to bytes (8 bytes total)
     auto T8 = u32le(tick);
 
     // Convert precision to bytes
     auto precision_bytes = str_bytes(compute_precision);
-    
+
     // Use header_prefix if available, otherwise h_b
     const auto& header_data = header_prefix.empty() ? h_b : header_prefix;
-    
+
     // Build message
     auto msg = build_msg(header_data, v, T8, j4, ctx_bytes, precision_bytes);
-    
+
+    // v3 (TIP-0003): the 32 admission-nonce bytes are appended
+    // to the legacy preimage — the only change to the message shape.
+    if (admission_nonce32 != nullptr) {
+        msg.insert(msg.end(), admission_nonce32, admission_nonce32 + 32);
+    }
+
     // Compute hash using modern OpenSSL
     auto digest = sha256_single(msg);
     
@@ -1171,6 +1236,43 @@ PowHasher::sample_token(const std::vector<int64_t>& context,
     int64_t token_id = std::distance(cdf.begin(), it);
     
     return {token_id, u, digest};
+}
+
+bool PowHasher::grind_admission(const std::vector<int64_t>& context,
+                                int32_t step,
+                                const std::vector<int64_t>& prefix_tokens,
+                                const std::vector<uint8_t>& prefix_pad_mask,
+                                uint64_t max_tries_factor,
+                                std::array<uint8_t, 32>& out_nonce) {
+    if (difficulty_i64 <= 0) {
+        return false;
+    }
+    // Byte-identical to pow_v3.build_admission_preimage (§6/§9): msg_w is
+    // this window's first-step preimage with NO nonce (header falls back to
+    // block_hash exactly like the sampling path); the commitment binds the
+    // full pre-window prefix; model_identifier must be the exact string the
+    // proof will carry ("unknown" fallback matches write_proof).
+    const auto& header_data = header_prefix.empty() ? h_b : header_prefix;
+    auto msg_w = pow_v3::build_step_message(
+        header_data, v,
+        static_cast<uint32_t>(tick), static_cast<uint32_t>(step),
+        context, compute_precision);
+    auto commitment = pow_v3::prompt_commitment(prefix_tokens, prefix_pad_mask);
+    auto target_le = pow_v3::admission_target_le(difficulty_i64);
+    if (max_tries_factor < 1) {
+        max_tries_factor = 1;
+    }
+    const uint64_t max_tries =
+        pow_v3::admission_expected_tries(difficulty_i64) * max_tries_factor;
+    auto nonce = pow_v3::admission_grind(
+        msg_w,
+        model_identifier.empty() ? "unknown" : model_identifier,
+        target_le, max_tries, commitment);
+    if (!nonce.has_value()) {
+        return false;
+    }
+    out_nonce = *nonce;
+    return true;
 }
 
 // Update check_solution method:
@@ -1270,7 +1372,20 @@ PowSamplingCoordinator::sample_token_complete(
     if (!row_opt.has_value()) {
         throw std::runtime_error("No row allocated for sequence " + std::to_string(seq_id));
     }
-    int32_t step = ring_buffers->steps[row_opt.value()] % window_size;
+    const int row = row_opt.value();
+    int32_t step = ring_buffers->steps[row] % window_size;
+
+    // v3 (TIP-0003): a window's admission nonce must exist
+    // BEFORE its first sampled token — it enters every u of the window.
+    const uint8_t* admission_nonce_ptr = nullptr;
+    if (proof_version_ >= pow_v3::V3_PROOF_VERSION) {
+        if (step == 0) {
+            prepare_window_admission_(seq_id, row, context);
+        }
+        if (ring_buffers->admission_valid[row]) {
+            admission_nonce_ptr = ring_buffers->admission_nonce[row].data();
+        }
+    }
 
     ensure_capacity_(n_vocab, top_k);
     const float ninf = -std::numeric_limits<float>::infinity();
@@ -1485,7 +1600,7 @@ PowSamplingCoordinator::sample_token_complete(
     }
 
     // ---------- 9) PoW sampling ----------
-    auto [token_id, u_val, digest] = hasher->sample_token(context, step, cdf_);
+    auto [token_id, u_val, digest] = hasher->sample_token(context, step, cdf_, admission_nonce_ptr);
     result.token_id   = token_id;
     result.u_value    = u_val;
     result.digest     = digest;
@@ -1531,6 +1646,53 @@ void PowSamplingCoordinator::apply_pow_params(
     }
 }
 
+void PowSamplingCoordinator::prepare_window_admission_(
+    int seq_id, int row, const std::vector<int64_t>& context) {
+    // A nonce admits exactly one window (§6) — msg_w changes at every
+    // boundary, so always clear before any grind decision. A stale nonce
+    // left set would corrupt every u of the new window.
+    ring_buffers->write_admission_nonce(row, nullptr);
+
+    // The v3 proof's prompt_tokens must be the pre-window prefix the
+    // admission commitment binds (prompt + all previously generated
+    // tokens), not just the original prompt — the verifier rebuilds both
+    // msg_w and the commitment from that field. v2 keeps the legacy
+    // set-once prompt_tokens (this helper only runs for version >= 3).
+    static const std::vector<int64_t> k_empty_prefix;
+    auto arch_it = seq_archive_.find(seq_id);
+    const std::vector<int64_t>& prefix =
+        arch_it != seq_archive_.end() ? arch_it->second : k_empty_prefix;
+    sequence_info_map[seq_id]["prompt_tokens"] =
+        std::vector<int32_t>(prefix.begin(), prefix.end());
+
+    if (admission_mode_ != "always") {
+        return;  // v3-inert: mine nonce-less; [B_FLOOR, B_FREE) forfeited
+    }
+    if (!pow_v3::argon2_compiled()) {
+        // Defensive: assert_v3_ready_() already failed startup for this.
+        if (!admission_warned_no_grinder_) {
+            admission_warned_no_grinder_ = true;
+            logger->log(
+                "v3 admission requested but this build lacks libargon2 — "
+                "mining nonce-less; [B_FLOOR, B_FREE) windows will be "
+                "forfeited", "ERROR");
+        }
+        return;
+    }
+    // Canonical v3 pad mask: all-false, one entry per prefix token (the
+    // verifier derives the same shape when the proof omits it).
+    const std::vector<uint8_t> pad_mask(prefix.size(), 0);
+    std::array<uint8_t, 32> nonce;
+    if (hasher->grind_admission(context, 0, prefix, pad_mask,
+                                admission_max_tries_factor_, nonce)) {
+        ring_buffers->write_admission_nonce(row, nonce.data());
+    } else {
+        logger->log(
+            "v3 admission grind exhausted/skipped for seq " +
+            std::to_string(seq_id) + " — window mined nonce-less", "WARN");
+    }
+}
+
 bool PowSamplingCoordinator::activate_sequence_params(int seq_id) {
     if (active_pow_seq_id.has_value() && active_pow_seq_id.value() == seq_id) {
         return true;
@@ -1562,12 +1724,65 @@ void PowSamplingCoordinator::initialize(const std::string& log_dir, const std::s
     submitter_ = std::make_unique<MiningResponseSubmitter>();
     seq_pow_params_map.clear();
     active_pow_seq_id.reset();
+    seq_archive_.clear();
     cooldown_duration_ms_ = 1000 * std::max(
         0,
-        std::stoi(get_env_var("MINING_SOLUTION_COOLDOWN_SEC", "600"))
+        std::stoi(get_env_var("MINING_SOLUTION_COOLDOWN_SEC", "0"))
     );
     cooldown_until_ms_.store(0);
+
+    // v3 opt-in (TIP-0003), mirroring the vLLM sampler env
+    // contract: POW_PROOF_VERSION=3 switches the emitted proof schema to the
+    // v3 carrier; POW_V3_ADMISSION_MODE=always grinds an admission nonce at
+    // every window boundary ('off' mines nonce-less and forfeits
+    // [B_FLOOR, B_FREE) windows). Defaults stay 2/'off' until activation.
+    proof_version_ = std::stoi(get_env_var("POW_PROOF_VERSION", "2"));
+    admission_mode_ = get_env_var("POW_V3_ADMISSION_MODE", "off");
+    // .strip().lower() like the Python side
+    while (!admission_mode_.empty() && std::isspace((unsigned char)admission_mode_.front())) admission_mode_.erase(admission_mode_.begin());
+    while (!admission_mode_.empty() && std::isspace((unsigned char)admission_mode_.back())) admission_mode_.pop_back();
+    std::transform(admission_mode_.begin(), admission_mode_.end(), admission_mode_.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    try {
+        admission_max_tries_factor_ = static_cast<uint64_t>(std::max(
+            1, std::stoi(get_env_var("POW_V3_GRIND_MAX_TRIES_FACTOR", "16"))));
+    } catch (const std::exception&) {
+        admission_max_tries_factor_ = 16;
+    }
+    proof_writer->set_proof_version(proof_version_);
+    if (proof_version_ >= pow_v3::V3_PROOF_VERSION) {
+        assert_v3_ready_();
+    }
+
     logger->log("PoW Sampling Coordinator initialized", "INFO");
+}
+
+void PowSamplingCoordinator::assert_v3_ready_() {
+    if (!pow_v3::argon2_compiled()) {
+        throw std::runtime_error(
+            "POW_PROOF_VERSION >= 3 but this llama-server build lacks "
+            "libargon2 (compiled without POW_V3_HAVE_ARGON2) — a v3 miner "
+            "without Argon2 would silently forfeit every admission-band "
+            "window. Rebuild with libargon2-dev or mine v2.");
+    }
+    // All-0xff little-endian target = max uint256: any digest except
+    // all-0xff passes the strict <, so the first try wins.
+    auto msg_w = pow_v3::build_step_message(
+        std::vector<uint8_t>(76, 0), std::vector<uint8_t>(32, 0), 0, 0,
+        std::vector<int64_t>{}, "selftest");
+    auto commitment = pow_v3::prompt_commitment(
+        std::vector<int64_t>{}, std::vector<uint8_t>{});
+    std::array<uint8_t, 32> target_le;
+    target_le.fill(0xff);
+    auto nonce = pow_v3::admission_grind(msg_w, "v3-selftest", target_le, 4,
+                                         commitment);
+    if (!nonce.has_value()) {
+        throw std::runtime_error(
+            "v3 startup self-test: admission_grind found no nonce against "
+            "the trivial target — Argon2 backend is broken.");
+    }
+    logger->log("v3 startup self-test passed: native Argon2 admission "
+                "grinder operational", "INFO");
 }
 
 void PowSamplingCoordinator::update_pow_params(
@@ -1640,6 +1855,7 @@ void PowSamplingCoordinator::cleanup_sequence(int seq_id) {
         logger->log("Cleaned up sequence " + std::to_string(seq_id), "DEBUG");
         sequence_info_map.erase(seq_id);
     }
+    seq_archive_.erase(seq_id);
 }
 
 void PowSamplingCoordinator::check_solutions(const std::vector<int>& seq_ids) {
@@ -1689,9 +1905,20 @@ void PowSamplingCoordinator::check_solutions(const std::vector<int>& seq_ids) {
         
         // Use step 0 (start of new cycle) consistent with Python
         int32_t step_offset = 0;
-        
+
+        // v3 (TIP-0003): the final target-critical digest folds
+        // the SAME nonce every step of this window hashed — the derived
+        // header nonce must match verifier replay. The next window's grind
+        // has not run yet (it happens at that window's first sampled token),
+        // so the ring buffer still holds this window's nonce.
+        const uint8_t* admission_nonce_ptr = nullptr;
+        if (proof_version_ >= pow_v3::V3_PROOF_VERSION &&
+            ring_buffers->admission_valid[row]) {
+            admission_nonce_ptr = ring_buffers->admission_nonce[row].data();
+        }
+
         // Recompute digest with step 0 and full context including last token
-        auto [token_id, u_val, digest] = hasher->sample_token(context, step_offset, {1.0f});
+        auto [token_id, u_val, digest] = hasher->sample_token(context, step_offset, {1.0f}, admission_nonce_ptr);
 
         // Slice 11.4 — dual-threshold check. Block-tier gates on
         // ``target``; share-tier on ``share_target`` (broker-derived,
@@ -1727,13 +1954,22 @@ void PowSamplingCoordinator::check_solutions(const std::vector<int>& seq_ids) {
             ? sequence_info_map[seq_id]
             : std::unordered_map<std::string, std::any>{};
 
+        // v3 (§3/§9): hand the window's selected nonce to the writer as 64
+        // lowercase hex — write_proof merges it into extra_flags through the
+        // shared helper. The writer never re-grinds.
+        auto proof_pow_params = seq_pow_params;
+        if (admission_nonce_ptr != nullptr) {
+            proof_pow_params["admission_nonce"] = bytes_to_hex(
+                std::vector<uint8_t>(admission_nonce_ptr, admission_nonce_ptr + 32));
+        }
+
         auto [fb_bytes, proof_dict] = proof_writer->write_proof(
             seq_id,
             step_offset,  // Use step 0
             window_data,
             digest,       // Use recomputed digest
             is_solution,  // Pass actual solution status
-            seq_pow_params,
+            proof_pow_params,
             seq_info
         );
 
@@ -1804,6 +2040,8 @@ double PowSamplingCoordinator::cooldown_remaining_seconds() const {
 void PowSamplingCoordinator::set_prompt_tokens(int seq_id,
                                                const std::vector<int32_t>& tokens) {
     sequence_info_map[seq_id]["prompt_tokens"] = tokens;
+    // Seed the prompt+generated archive (v3 pre-window prefix, §6).
+    seq_archive_[seq_id].assign(tokens.begin(), tokens.end());
 }
 
 void PowSamplingCoordinator::set_completion_id(int seq_id,
@@ -1835,7 +2073,13 @@ void PowSamplingCoordinator::record_complete_step(int seq_id, const SamplingResu
     for (size_t i = 0; i < 6 && i < result.logsumexp_stats.size(); i++) {
         ring_buffers->logsumexp_stats[pos][row][i] = result.logsumexp_stats[i];
     }
-    
+
+    // Extend the prompt+generated archive (v3 pre-window prefix, §6).
+    auto arch_it = seq_archive_.find(seq_id);
+    if (arch_it != seq_archive_.end()) {
+        arch_it->second.push_back(result.token_id);
+    }
+
     ring_buffers->increment_steps({row});
     
     logger->log("Recorded step for pos="+ std::to_string(pos) +" seq_id="+ std::to_string(seq_id), "DEBUG");

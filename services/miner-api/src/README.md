@@ -145,6 +145,12 @@ All configuration is managed through environment variables:
 - `MODEL_RETRY_BACKOFF`: Backoff for model API retries (default: 1.0)
 - `MODEL_POLL_INTERVAL`: Model registry poll interval in seconds (default: 600)
 
+Broker-mining workers advertise `supports_broker_registry: true` in `HELLO`
+and consume the chain model registry from the broker's `MODEL_REGISTRY_SYNC`
+frame. In that mode, the worker does not need to poll `MODEL_API_URL` directly
+for mining jobs; the broker must push the registry before dispatching share
+work.
+
 ### Mining Configuration
 - `DEFAULT_DIFFICULTY`: Default mining difficulty (default: 1000000)
 - `BASE_NBITS`: Base difficulty target in nBits format (default: 536990216)
@@ -157,7 +163,10 @@ All configuration is managed through environment variables:
 
 ### Special Modes
 - `MCP_MODE`: Enable MCP (Model Context Protocol) server (default: false)
-- `LLAMA_CPP`: Enable llama.cpp compatibility mode (default: false)
+- `LLAMA_CPP`: Enable llama.cpp compatibility mode (default: false). This is an
+  inference-backend selector, not a broker-mode switch. Set it for llama.cpp
+  worker builds so the proxy injects `model_identifier`; leave it false for
+  vLLM workers, where the sampler stamps `model_identifier` itself.
 - `GENESIS_GENERATOR`: Enable genesis prompt generation (default: false)
 
 ### Logging
