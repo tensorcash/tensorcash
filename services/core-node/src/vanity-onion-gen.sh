@@ -307,9 +307,28 @@ install_onion() {
     cp "${src_dir}/hs_ed25519_secret_key" "$staging/"
     cp "${src_dir}/hostname" "$staging/"
 
-    # Fix permissions for Tor (ownership matches whoever runs Tor)
+    # Ownership MUST match whoever runs Tor. Prod runs Tor as `debian-tor`; if the
+    # new HiddenServiceDir stays root-owned, debian-tor cannot read the key on
+    # SIGHUP and the onion silently fails to load (works in dev where Tor is root,
+    # breaks in prod). Derive the owner from the CURRENT HS_DIR (matches whatever
+    # Tor already runs as), else fall back to debian-tor if that user exists, else
+    # the current user (dev-root).
+    local hs_owner=""
+    if [ -d "$HS_DIR" ]; then
+        hs_owner="$(stat -c '%U:%G' "$HS_DIR" 2>/dev/null || true)"
+    fi
+    if [ -z "$hs_owner" ]; then
+        if id debian-tor >/dev/null 2>&1; then
+            hs_owner="debian-tor:debian-tor"
+        else
+            hs_owner="$(id -un):$(id -gn)"
+        fi
+    fi
+    chown -R "$hs_owner" "$staging" 2>/dev/null \
+        || log "WARN: could not chown staging to $hs_owner; Tor may not read the new key"
     chmod 700 "$staging"
     chmod 600 "$staging/hs_ed25519_secret_key"
+    log "Staged new HS dir owned by $hs_owner"
 
     # Atomic swap
     rm -rf "$HS_DIR"
@@ -318,11 +337,33 @@ install_onion() {
     # Update bitcoin.conf externalip
     update_externalip "$new_onion"
 
-    # Restart Tor to pick up new keys
-    log "Restarting Tor..."
-    if command -v supervisorctl &>/dev/null; then
-        supervisorctl restart tor 2>/dev/null || true
-        sleep 5
+    # Apply the new onion key by RELOADING Tor (SIGHUP), NOT restarting it.
+    #
+    # A full `restart tor` throws away Tor's live network state and forces a cold
+    # directory bootstrap. On a node whose on-disk consensus has gone stale, that
+    # cold bootstrap can wedge at 30% ("loading networkstatus consensus") for a
+    # long time and isolate the node — turning a harmless onion swap into a
+    # network-isolation event. SIGHUP re-reads the replaced HiddenServiceDir key
+    # in place and keeps the consensus + built circuits.
+    #
+    # Verified on Tor 0.4.6.10 (isolated test): replacing hs_ed25519_secret_key
+    # and sending SIGHUP makes Tor re-derive the new hostname with no restart.
+    log "Reloading Tor (SIGHUP) to apply new onion key (no cold bootstrap)..."
+    if command -v supervisorctl &>/dev/null && supervisorctl signal HUP tor &>/dev/null; then
+        : # supervisor delivered the signal
+    elif command -v pidof &>/dev/null && [ -n "$(pidof tor 2>/dev/null)" ]; then
+        tor_pids="$(pidof tor)"
+        if ! kill -HUP $tor_pids 2>/dev/null; then
+            log "ERROR: kill -HUP failed for tor pid(s) [$tor_pids] — onion key NOT reloaded"
+        fi
+    else
+        log "WARN: could not signal Tor to reload (no supervisorctl, no tor pid); new key applies on next Tor start"
+    fi
+    sleep 3
+    # Sanity: Tor must still be running after the reload (HUP never restarts it).
+    if command -v pidof &>/dev/null && [ -z "$(pidof tor 2>/dev/null)" ]; then
+        log "WARN: Tor not running after SIGHUP — starting it"
+        command -v supervisorctl &>/dev/null && supervisorctl start tor 2>/dev/null || true
     fi
 
     # Restart bitcoind to pick up new externalip — ONLY when quiescent.

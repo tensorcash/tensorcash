@@ -19,12 +19,12 @@ RUN apt-get update && \
       pkg-config \
       curl \
       ca-certificates \
-      tor \
       libevent-dev \
       libssl-dev \
       libzmq3-dev \
       libsqlite3-dev \
       libgmp-dev \
+      libargon2-dev \
       libboost-all-dev \
       libzstd-dev \
       libflint-dev \
@@ -60,6 +60,28 @@ RUN apt-get update && \
       icewm \
       netcat-openbsd \
       libsodium-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Tor from the OFFICIAL Tor Project apt repo — NOT Ubuntu's frozen 0.4.6.x, which
+# is end-of-life: stale directory-authority data, weak stuck-bootstrap recovery,
+# and no shelf life ("this version of Tor will eventually stop working as a
+# client"). Pin a supported floor and FAIL THE BUILD if the installed Tor is
+# older, so we can never silently ship an EOL Tor again.
+ARG TOR_MIN_VERSION=0.4.8.0
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends apt-transport-https gnupg wget ca-certificates; \
+    wget -qO- https://deb.torproject.org/torproject.org/A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89.asc \
+      | gpg --dearmor -o /usr/share/keyrings/deb.torproject.org-keyring.gpg; \
+    . /etc/os-release; \
+    echo "deb [signed-by=/usr/share/keyrings/deb.torproject.org-keyring.gpg] https://deb.torproject.org/torproject.org ${VERSION_CODENAME} main" \
+      > /etc/apt/sources.list.d/tor.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends tor deb.torproject.org-keyring; \
+    TOR_VER="$(tor --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"; \
+    echo "Installed Tor ${TOR_VER} (required floor ${TOR_MIN_VERSION})"; \
+    dpkg --compare-versions "${TOR_VER}" ge "${TOR_MIN_VERSION}" \
+      || { echo "FATAL: Tor ${TOR_VER} is below supported floor ${TOR_MIN_VERSION}"; exit 1; }; \
     rm -rf /var/lib/apt/lists/*
 
 # Build mkp224o (vanity .onion v3 generator)
@@ -180,7 +202,9 @@ COPY services/core-node/src/start_mining.sh /build/bcore/start_mining.sh
 COPY services/core-node/src/start_node.sh /build/bcore/start_node.sh
 COPY services/core-node/src/vanity-onion-gen.sh /usr/local/bin/vanity-onion-gen.sh
 COPY services/core-node/src/bootstrap-peers.sh /usr/local/bin/bootstrap-peers.sh
-RUN chmod +x /build/bcore/start_node.sh /build/bcore/start_mining.sh /usr/local/bin/vanity-onion-gen.sh /usr/local/bin/bootstrap-peers.sh
+COPY services/core-node/src/tor-start.sh /usr/local/bin/tor-start.sh
+COPY services/core-node/src/tor-health.sh /usr/local/bin/tor-health.sh
+RUN chmod +x /build/bcore/start_node.sh /build/bcore/start_mining.sh /usr/local/bin/vanity-onion-gen.sh /usr/local/bin/bootstrap-peers.sh /usr/local/bin/tor-start.sh /usr/local/bin/tor-health.sh
 
 # 8) Set up VNC server
 RUN mkdir -p /root/.vnc && \
