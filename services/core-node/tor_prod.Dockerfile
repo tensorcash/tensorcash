@@ -64,6 +64,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libzmq3-dev \
     libsqlite3-dev \
     libgmp-dev \
+    libargon2-dev \
     libboost-all-dev \
     libflint-dev \
     autoconf \
@@ -208,6 +209,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libzmq5 \
     libsqlite3-0 \
     libgmp10 \
+    libargon2-1 \
     libboost-filesystem1.74.0 \
     libboost-locale1.74.0 \
     libboost-thread1.74.0 \
@@ -217,8 +219,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Python for Model API server (required for miner-proxy communication)
     python3 \
     python3-pip \
-    # Tor (from distro, sufficient for client use)
-    tor \
     # Process manager (proper signal handling)
     tini \
     # Supervisor for multi-process management
@@ -229,7 +229,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     netcat-openbsd \
     curl \
     ca-certificates \
+    gnupg \
+    wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Tor from the OFFICIAL Tor Project apt repo — NOT Ubuntu's frozen 0.4.6.x, which
+# is end-of-life: stale directory-authority data, weak stuck-bootstrap recovery,
+# and no shelf life. Pin a supported floor and FAIL THE BUILD if the installed
+# Tor is older, so an EOL Tor can never be silently shipped again.
+ARG TOR_MIN_VERSION=0.4.8.0
+RUN set -eux; \
+    apt-get update; \
+    wget -qO- https://deb.torproject.org/torproject.org/A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89.asc \
+      | gpg --dearmor -o /usr/share/keyrings/deb.torproject.org-keyring.gpg; \
+    . /etc/os-release; \
+    echo "deb [signed-by=/usr/share/keyrings/deb.torproject.org-keyring.gpg] https://deb.torproject.org/torproject.org ${VERSION_CODENAME} main" \
+      > /etc/apt/sources.list.d/tor.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends tor deb.torproject.org-keyring; \
+    TOR_VER="$(tor --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"; \
+    echo "Installed Tor ${TOR_VER} (required floor ${TOR_MIN_VERSION})"; \
+    dpkg --compare-versions "${TOR_VER}" ge "${TOR_MIN_VERSION}" \
+      || { echo "FATAL: Tor ${TOR_VER} is below supported floor ${TOR_MIN_VERSION}"; exit 1; }; \
+    rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies for api_server.py (minimal set)
 RUN pip3 install --no-cache-dir \
@@ -248,6 +270,8 @@ COPY --from=builder /usr/local/bin/mkp224o /usr/local/bin/
 COPY services/core-node/src/vanity-onion-gen.sh /usr/local/bin/vanity-onion-gen.sh
 COPY services/core-node/src/bootstrap-peers.sh /usr/local/bin/bootstrap-peers.sh
 COPY services/core-node/src/start_mining.sh /usr/local/bin/start_mining.sh
+COPY services/core-node/src/tor-start.sh /usr/local/bin/tor-start.sh
+COPY services/core-node/src/tor-health.sh /usr/local/bin/tor-health.sh
 
 # Copy shared libraries
 COPY --from=builder /usr/local/lib/libzkprover.so /usr/local/lib/
@@ -270,7 +294,11 @@ RUN echo "DataDirectory /var/lib/tor" > /etc/tor/torrc.tensorcash && \
     echo "ControlPort 127.0.0.1:9051" >> /etc/tor/torrc.tensorcash && \
     echo "CookieAuthentication 1" >> /etc/tor/torrc.tensorcash && \
     echo "CookieAuthFileGroupReadable 1" >> /etc/tor/torrc.tensorcash && \
-    echo "Log notice file /var/log/tensorcash/tor.log" >> /etc/tor/torrc.tensorcash && \
+    # Log to stdout, NOT a file: Tor runs as debian-tor but /var/log/tensorcash is
+    # owned by tensorcash (and the entrypoint re-chowns it every boot), so a file
+    # log would be unwritable. Supervisor captures stdout to tor.out.log (written
+    # as root) and it also surfaces via `kubectl logs` for bootstrap diagnostics.
+    echo "Log notice stdout" >> /etc/tor/torrc.tensorcash && \
     chown tensorcash:tensorcash /etc/tor/torrc.tensorcash
 
 # Create supervisord configuration for multi-process management
@@ -308,13 +336,23 @@ startsecs=3
 depends_on=bitcoind
 
 [program:tor]
-command=/usr/bin/tor -f /etc/tor/torrc.tensorcash
+command=/usr/local/bin/tor-start.sh
 user=debian-tor
 autostart=%(ENV_TOR_ENABLED)s
 autorestart=true
 stderr_logfile=/var/log/tensorcash/tor.err.log
 stdout_logfile=/var/log/tensorcash/tor.out.log
 priority=5
+
+[program:tor_health]
+command=/usr/local/bin/tor-health.sh
+user=root
+autostart=%(ENV_TOR_ENABLED)s
+autorestart=true
+stderr_logfile=/var/log/tensorcash/tor-health.err.log
+stdout_logfile=/var/log/tensorcash/tor-health.out.log
+priority=40
+startsecs=0
 
 [program:bootstrap_peers]
 command=/usr/local/bin/bootstrap-peers.sh
@@ -449,7 +487,8 @@ HEALTH_EOF
 RUN chmod 755 /usr/local/bin/bitcoind /usr/local/bin/bitcoin-cli \
               /usr/local/bin/bitcoin-wallet /usr/local/bin/cosign-bridge \
               /usr/local/bin/mkp224o /usr/local/bin/vanity-onion-gen.sh \
-              /usr/local/bin/bootstrap-peers.sh /usr/local/bin/start_mining.sh
+              /usr/local/bin/bootstrap-peers.sh /usr/local/bin/start_mining.sh \
+              /usr/local/bin/tor-start.sh /usr/local/bin/tor-health.sh
 
 # Note: supervisord starts as root to manage processes with different users
 # (tensorcash for bitcoind/api_server, debian-tor for tor)
