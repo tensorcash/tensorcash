@@ -3,7 +3,7 @@ TIP: 0002
 Title: Issuer-published scalar settlement, non-native collateral, and two-sided securitisation
 Author: takakuni <takakuni@tensorcash.org>
 Type: Standards Track
-Status: Draft
+Status: Active
 Created: 2026-06-25
 ```
 

@@ -94,8 +94,8 @@ of the idea — that comes from review ACKs and, ultimately, network adoption.
 | TIP | Title | Type | Status |
 |----:|-------|------|--------|
 | [0001](tip-0001-tip-process.md) | TIP purpose and guidelines | Process | Active |
-| [0002](tip-0002-scalar-settlement.md) | Issuer-published scalar settlement, non-native collateral, and two-sided securitisation | Standards Track | Draft |
-| [0003](tip-0003-prompt-chaining.md) | Header-Bound Prompt Commitment (Prompt Chaining) | Standards Track | Draft |
+| [0002](tip-0002-scalar-settlement.md) | Issuer-published scalar settlement, non-native collateral, and two-sided securitisation | Standards Track | Active |
+| [0003](tip-0003-prompt-chaining.md) | Header-Bound Prompt Commitment (Prompt Chaining) | Standards Track | Active |
 | [0004](tip-0004-operator-blindness.md) | Model-operator blindness in verifiable proof-of-inference | Informational | Draft |
 | [0005](tip-0005-liveness-price-discovery-dex.md) | Liveness, price discovery, and a decentralised exchange (Layer 1.5) | Informational | Draft |
 | [0006](tip-0006-multimodal-proof-of-inference.md) | Multimodal Input/Output Extension for Proof-of-Inference | Informational | Draft |

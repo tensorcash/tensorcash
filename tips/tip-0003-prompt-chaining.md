@@ -3,7 +3,7 @@ TIP: 0003
 Title: Header-Bound Prompt Commitment (Prompt Chaining)
 Author: takakuni <takakuni@tensorcash.org>
 Type: Standards Track
-Status: Draft
+Status: Active
 Created: 2026-06-25
 ```
 
@@ -134,6 +134,14 @@ the decode-cost reference).
 **Direction for v3:** retain the threat model; drop inert-token injection as the primary
 construction; adopt B-conditional Argon admission as v3.0; treat prompt/context non-reuse as a
 separately reviewed v3.1 consensus change.
+
+**v3.1 (planned, shortly):** the prompt/context non-reuse rule above will be specified as a
+*hash-based prompt-binding anti-reuse* consensus change. Each accepted proof commits to a
+canonical hash of its (prompt, context); consensus rejects any later proof whose commitment
+reuses one already seen within the enforcement window. This binds a proof to a specific,
+non-reused forward pass, so a single admitted computation cannot be re-stamped across blocks.
+It is layered on top of v3.0 as a separate, separately reviewed consensus change and does not
+gate v3.0 activation; it follows shortly after.
 
 — takakuni-imosuke
 
