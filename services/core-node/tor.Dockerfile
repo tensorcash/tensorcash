@@ -207,9 +207,9 @@ COPY services/core-node/src/tor-health.sh /usr/local/bin/tor-health.sh
 RUN chmod +x /build/bcore/start_node.sh /build/bcore/start_mining.sh /usr/local/bin/vanity-onion-gen.sh /usr/local/bin/bootstrap-peers.sh /usr/local/bin/tor-start.sh /usr/local/bin/tor-health.sh
 
 # 8) Set up VNC server
-RUN mkdir -p /root/.vnc && \
-    echo "password" | vncpasswd -f > /root/.vnc/passwd && \
-    chmod 600 /root/.vnc/passwd
+# No password is baked into the image; /start-vnc.sh writes one at runtime
+# from VNC_PASSWORD and refuses to start VNC if it is unset.
+RUN mkdir -p /root/.vnc
 
 # Create VNC startup script with IceWM (simplest WM that works in Docker)
 RUN echo '#!/bin/bash' > /root/.vnc/xstartup && \
@@ -227,20 +227,25 @@ RUN echo '#!/bin/bash' > /root/.vnc/xstartup && \
     chmod +x /root/.vnc/xstartup
 
 # Create helper script to start VNC (runs in foreground for supervisord)
-# Password is set via VNC_PASSWORD env var (default: tensorcash)
+# VNC_PASSWORD is mandatory: without it the script parks (VNC stays off).
+# The server still binds container interfaces (a loopback-only bind would be
+# unreachable through Docker port mapping); host-side exposure is limited by
+# publishing 127.0.0.1:5907:5907 in the compose files — reach it via SSH tunnel.
 RUN echo '#!/bin/bash' > /start-vnc.sh && \
     echo 'export USER=root' >> /start-vnc.sh && \
     echo 'export HOME=/root' >> /start-vnc.sh && \
-    echo 'VNC_PASS="${VNC_PASSWORD:-tensorcash}"' >> /start-vnc.sh && \
+    echo 'if [ -z "$VNC_PASSWORD" ]; then' >> /start-vnc.sh && \
+    echo '  echo "VNC disabled: VNC_PASSWORD is not set. Set it to enable GUI access."' >> /start-vnc.sh && \
+    echo '  exec sleep infinity' >> /start-vnc.sh && \
+    echo 'fi' >> /start-vnc.sh && \
     echo 'mkdir -p /root/.vnc' >> /start-vnc.sh && \
-    echo 'echo "$VNC_PASS" | vncpasswd -f > /root/.vnc/passwd' >> /start-vnc.sh && \
+    echo 'echo "$VNC_PASSWORD" | vncpasswd -f > /root/.vnc/passwd' >> /start-vnc.sh && \
     echo 'chmod 600 /root/.vnc/passwd' >> /start-vnc.sh && \
     echo 'echo "Starting VNC server on port 5907 (password protected)..."' >> /start-vnc.sh && \
     echo 'vncserver -kill :7 2>/dev/null || true' >> /start-vnc.sh && \
     echo 'rm -rf /tmp/.X7-lock /tmp/.X11-unix/X7 2>/dev/null || true' >> /start-vnc.sh && \
     echo 'vncserver :7 -geometry 1280x800 -depth 24 -localhost no' >> /start-vnc.sh && \
-    echo 'echo "VNC server started! Connect via: vnc://localhost:5907"' >> /start-vnc.sh && \
-    echo 'echo "Password: $VNC_PASS"' >> /start-vnc.sh && \
+    echo 'echo "VNC server started. Tunnel in: ssh -L 5907:localhost:5907 <host>, then vnc://localhost:5907"' >> /start-vnc.sh && \
     echo '# Keep running to satisfy supervisord' >> /start-vnc.sh && \
     echo 'sleep 2 && tail -f /root/.vnc/*:7.log 2>/dev/null || sleep infinity' >> /start-vnc.sh && \
     chmod +x /start-vnc.sh
@@ -254,8 +259,12 @@ RUN echo '#!/bin/bash' > /start-gui.sh && \
     echo 'export QT_X11_NO_MITSHM=1' >> /start-gui.sh && \
     echo 'export LIBGL_ALWAYS_SOFTWARE=1' >> /start-gui.sh && \
     echo '' >> /start-gui.sh && \
-    echo '# Start VNC if not already running' >> /start-gui.sh && \
+    echo '# Start VNC if not already running (requires VNC_PASSWORD)' >> /start-gui.sh && \
     echo 'if ! xdpyinfo -display :7 >/dev/null 2>&1; then' >> /start-gui.sh && \
+    echo '  if [ -z "$VNC_PASSWORD" ]; then' >> /start-gui.sh && \
+    echo '    echo "ERROR: GUI mode needs a running VNC server; set VNC_PASSWORD." >&2' >> /start-gui.sh && \
+    echo '    exit 1' >> /start-gui.sh && \
+    echo '  fi' >> /start-gui.sh && \
     echo '  echo "Starting VNC server first..."' >> /start-gui.sh && \
     echo '  /start-vnc.sh &' >> /start-gui.sh && \
     echo '  sleep 2' >> /start-gui.sh && \

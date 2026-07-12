@@ -90,11 +90,13 @@ services:
       OPERATOR_API_BASE_URL: "${OPERATOR_API_BASE_URL:-}"
       GUI_MODE: "${GUI_MODE:-false}"
       NODE_START_FLAGS: "${NODE_START_FLAGS:-}"
+      # VNC password for GUI access — no default; VNC stays off unless set
+      VNC_PASSWORD: "${VNC_PASSWORD:-}"
 
     ports:
       - "8333:8333"
       - "8050:8050"
-      - "5907:5907"
+      - "127.0.0.1:5907:5907"  # VNC for Qt GUI — loopback only; use an SSH tunnel for remote access
 
   verification-api:
     # Pre-built image from CI with CUDA/VLLM versioning
