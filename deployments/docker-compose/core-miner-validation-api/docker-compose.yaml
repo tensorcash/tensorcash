@@ -104,14 +104,14 @@ services:
       GUI_MODE: "${GUI_MODE:-false}"
       # Optional startup switch for validation transport: --http or --desktop
       NODE_START_FLAGS: "${NODE_START_FLAGS:-}"
-      # VNC password for GUI access (default: tensorcash)
-      VNC_PASSWORD: "${VNC_PASSWORD:-tensorcash}"
+      # VNC password for GUI access — no default; VNC stays off unless set
+      VNC_PASSWORD: "${VNC_PASSWORD:-}"
       ISOLATED_NODE: "${ISOLATED_NODE:-false}"
 
     ports:
       - "8333:8333"
       - "8050:8050"
-      - "5907:5907"  # VNC for Qt GUI
+      - "127.0.0.1:5907:5907"  # VNC for Qt GUI — loopback only; use an SSH tunnel for remote access
 
   verification-api:
     # Pre-built image from CI with CUDA/VLLM versioning

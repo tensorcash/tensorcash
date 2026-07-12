@@ -60,7 +60,11 @@ fi
 
 if [ "${GUI_MODE:-false}" = "true" ]; then
     echo "=== Starting in GUI mode (bitcoin-qt) ==="
-    echo "Connect via VNC to localhost:5907"
+    if [ -z "${VNC_PASSWORD:-}" ]; then
+        echo "ERROR: GUI_MODE=true requires VNC_PASSWORD (VNC does not start without it)" >&2
+        exit 1
+    fi
+    echo "Connect via VNC to localhost:5907 (SSH tunnel: ssh -L 5907:localhost:5907 <host>)"
 
     # Wait for VNC to be ready
     for i in {1..30}; do
