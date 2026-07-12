@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import ipaddress
 import json
 import os
 import zmq
@@ -2186,6 +2187,16 @@ def _notify_gateway_decision(
         logger_http.warning(f"Failed to build gateway decision notification: {e}")
 
 
+def _is_loopback_addr(bind_addr: str) -> bool:
+    if bind_addr == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(bind_addr).is_loopback
+    except ValueError:
+        # Unparseable (hostname, empty string = all interfaces): assume exposed.
+        return False
+
+
 def _start_operator_http_server(validator: 'AsyncValidator'):
     """Start the embedded HTTP server for operator review endpoints."""
     global _validator_instance
@@ -2193,6 +2204,18 @@ def _start_operator_http_server(validator: 'AsyncValidator'):
 
     port = int(os.getenv("OPERATOR_HTTP_PORT", "9090"))
     bind_addr = os.getenv("OPERATOR_HTTP_BIND", "127.0.0.1")
+    # Without OPERATOR_API_KEY, operator auth is disabled entirely
+    # (see OperatorHTTPHandler._check_auth). That is only acceptable on
+    # loopback; refuse to expose an unauthenticated operator API.
+    if not os.getenv("OPERATOR_API_KEY", "") and not _is_loopback_addr(bind_addr):
+        logging.getLogger("operator-http").error(
+            "OPERATOR_API_KEY must be set when OPERATOR_HTTP_BIND=%s is not a "
+            "loopback address: without a key the operator endpoints are "
+            "unauthenticated. Set OPERATOR_API_KEY, or set "
+            "OPERATOR_HTTP_BIND=127.0.0.1 to keep the API local-only.",
+            bind_addr,
+        )
+        raise SystemExit(1)
     server = HTTPServer((bind_addr, port), OperatorHTTPHandler)
     server_thread = threading.Thread(
         target=server.serve_forever,

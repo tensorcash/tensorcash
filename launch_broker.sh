@@ -5,6 +5,12 @@
 # Before running, set your JWT token:
 #   export PROVIDER_JWT_TOKEN="eyJh..."
 #
+# Operator review API: defaults to loopback-only inside the container (no key
+# needed). To expose it on the published port, set BOTH:
+#   export OPERATOR_API_KEY="<secret>"
+#   export OPERATOR_HTTP_BIND=0.0.0.0
+# verification-api refuses to start with a non-loopback bind and no key.
+#
 set -e
 
 # Check if JWT token is set
@@ -48,6 +54,9 @@ sudo \
     GPU_MEMORY_GB=24 \
     WORKER_REGION=eu-west-2 \
     MAX_CONTEXT_WINDOW=32768 \
+    \
+    OPERATOR_API_KEY="${OPERATOR_API_KEY:-}" \
+    OPERATOR_HTTP_BIND="${OPERATOR_HTTP_BIND:-127.0.0.1}" \
     \
 docker compose -f deployments/docker-compose/core-miner-validation-api/docker-compose.yaml up --build -d
 

@@ -71,10 +71,13 @@ services:
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
       LOG_FORMAT: "${LOG_FORMAT:-'%(asctime)s - %(name)s - %(levelname)s - %(message)s'}"
 
-      # Operator review embedded HTTP server
+      # Operator review embedded HTTP server. OPERATOR_API_KEY is enforced at
+      # runtime by verification-api when the server binds beyond loopback; a
+      # hard ${VAR:?} requirement here would abort unrelated compose commands
+      # (e.g. `docker compose build`) at file parse time.
       OPERATOR_HTTP_PORT: "${OPERATOR_HTTP_PORT:-9090}"
       OPERATOR_HTTP_BIND: "${OPERATOR_HTTP_BIND:-0.0.0.0}"
-      OPERATOR_API_KEY: "${OPERATOR_API_KEY:?OPERATOR_API_KEY must be set for operator review auth}"
+      OPERATOR_API_KEY: "${OPERATOR_API_KEY:-}"
     ports:
       - "${OPERATOR_HTTP_PORT:-9090}:9090"
 

@@ -466,7 +466,7 @@ The `/data` and `/models` mount sources are configurable; supply any host direct
 
 ### Operator HTTP API
 
-The validator runs a lightweight HTTP server for operator review and health. Auth is via an optional `OPERATOR_API_KEY` bearer token; when unset, auth is disabled for local-only operation. CORS is restricted to `OPERATOR_CORS_ORIGIN` when configured (never wildcard).
+The validator runs a lightweight HTTP server for operator review and health. Auth is via an optional `OPERATOR_API_KEY` bearer token; when unset, auth is disabled for local-only operation. Because an unset key disables auth entirely, the service refuses to start when `OPERATOR_HTTP_BIND` is a non-loopback address and no key is set — to expose the operator API set both `OPERATOR_API_KEY` and `OPERATOR_HTTP_BIND=0.0.0.0`. CORS is restricted to `OPERATOR_CORS_ORIGIN` when configured (never wildcard).
 
 ```
 GET  /health                              — unauthenticated health check -> {"status": "ok"}
