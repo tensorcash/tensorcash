@@ -741,6 +741,14 @@ ProofWriter::write_proof(
     proof["sequence_id"] = seq_id;
     proof["steps"]       = step_num;
     proof["is_solution"] = is_solution;
+    // Wire the proof version into the returned dict, not just the FlatBuffer
+    // built below. The ZMQ egress path (pow_zmq_writer serialize_response) reads
+    // proof_dict["version"] and DEFAULTS a missing key to 2, so a v3-configured
+    // llama miner whose dict lacked this key emitted version=2 on the wire
+    // regardless of POW_PROOF_VERSION -- accepted as Full_Green by the validator
+    // then rejected by AcceptBlock (bad-proof-version-v3). Mirrors the Python
+    // ProofProcessor path, which sets proof["version"] = uint32_t(proof_version_).
+    proof["version"]     = static_cast<uint32_t>(proof_version);
     auto ts = std::to_string(
          std::chrono::system_clock::now().time_since_epoch().count()
     );
