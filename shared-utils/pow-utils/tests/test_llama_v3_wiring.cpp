@@ -317,6 +317,56 @@ static void test_proof_writer_guards(const std::string& scratch) {
 }
 
 // ---------------------------------------------------------------------- //
+// 4b. ProofWriter returns proof_dict["version"] (the ZMQ egress source)
+// ---------------------------------------------------------------------- //
+//
+// The .bin checks below read ProofWriter's own FlatBuffer (pb.add_version),
+// which is correct by construction — so they do NOT catch the real llama-path
+// bug: the miner-facing wire blob is serialized by pow_zmq_writer
+// serialize_response, which reads proof_dict["version"] and DEFAULTS a missing
+// key to 2. write_proof must set that key in the returned dict, or a
+// v3-configured miner emits version=2 on the wire regardless of the env
+// (Full_Green from the validator, then AcceptBlock bad-proof-version-v3).
+static void test_proof_writer_dict_version(const std::string& scratch) {
+    std::cout << "[proof-writer proof_dict version — ZMQ egress source]\n";
+
+    std::unordered_map<std::string, std::any> window_data;
+    window_data["chosen_tokens"]       = std::vector<int32_t>{1};
+    window_data["chosen_probs"]        = std::vector<float>{0.5f};
+    window_data["sampling_u"]          = std::vector<float>{0.5f};
+    window_data["softmax_normalizers"] = std::vector<float>{1.0f};
+    window_data["prompt_tokens"]       = std::vector<int32_t>{1};
+    window_data["pad_mask"]            = std::vector<bool>{false};
+    window_data["topk_logits"]         = std::vector<std::vector<float>>{{0.1f, 0.2f, 0.3f, 0.4f}};
+    window_data["topk_indices"]        = std::vector<std::vector<int32_t>>{{0, 1, 2, 3}};
+    window_data["logsumexp_stats"]     = std::vector<std::vector<float>>{{1.0f}};
+    std::unordered_map<std::string, std::any> seq_info;
+
+    for (int ver : {2, 3}) {
+        const std::string label = "v" + std::to_string(ver);
+        ProofWriter writer(scratch + "/writer_dictver_" + label);
+        writer.set_proof_version(ver);
+        writer.set_model_identifier(kModelId);
+        writer.set_compute_precision(kPrecision);
+        try {
+            auto [blob, proof_dict] = writer.write_proof(
+                7, 0, window_data, std::vector<uint8_t>(32, 0),
+                /*is_solution=*/false, base_pow_params(ver), seq_info);
+            (void)blob;
+            CHECK(proof_dict.count("version") == 1,
+                  label + ": write_proof sets proof_dict[\"version\"] (ZMQ reads this)");
+            if (proof_dict.count("version")) {
+                CHECK(std::any_cast<uint32_t>(proof_dict.at("version")) ==
+                          static_cast<uint32_t>(ver),
+                      label + ": proof_dict[\"version\"] == " + std::to_string(ver));
+            }
+        } catch (const std::exception& e) {
+            CHECK(false, label + std::string(": write_proof threw: ") + e.what());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------- //
 // 5/6. Coordinator end-to-end (v3 two windows, then v2 regression)
 // ---------------------------------------------------------------------- //
 
@@ -586,6 +636,7 @@ int main() {
     test_ring_buffers_admission_state();
     test_grind_admission_verifier_accepts();
     test_proof_writer_guards(scratch);
+    test_proof_writer_dict_version(scratch);
     test_coordinator_v3_two_windows(scratch);
     test_coordinator_v2_regression(scratch);
 
