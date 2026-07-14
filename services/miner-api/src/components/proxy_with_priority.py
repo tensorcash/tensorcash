@@ -53,6 +53,14 @@ class PriorityRequestManager(RequestManager):
         # Track batch generation tasks
         self._batch_tasks: Dict[str, asyncio.Task] = {}
         self._last_tip_block_hash: Optional[str] = None
+        # req_ids the broker cancelled via MINE_CANCEL (superseded).
+        # Gates dummy GENERATION: cancelling in-flight dummies is not
+        # enough — the local context still holds the dead parent until
+        # the next MINE_REQUEST refreshes it, so an ungated monitor
+        # loop would immediately re-mint dummies against the same
+        # cancelled req_id. Keyed req_id -> cancel time, bounded in
+        # cancel_dummy_requests_for_req_id.
+        self._broker_cancelled_req_ids: Dict[int, float] = {}
         self._dummy_poll_interval_seconds = 0.5
         # Single in-flight dummy batch generator (see monitor loop).
         self._dummy_batch_task: Optional[asyncio.Task] = None
@@ -217,6 +225,15 @@ class PriorityRequestManager(RequestManager):
             batch_position: Position in batch for priority-based abortion
         """
         snapshot = self.context.read()
+        if snapshot.request_id in self._broker_cancelled_req_ids:
+            # Broker cancelled this req_id (MINE_CANCEL, dead parent) and
+            # the context hasn't been re-anchored by a new MINE_REQUEST
+            # yet — minting more work against it is guaranteed waste.
+            logger.debug(
+                "[PriorityRequestManager] Skipping dummy generation: "
+                "req_id=%d cancelled by broker", snapshot.request_id,
+            )
+            return
         dummy_id = (
             f"resp_dummy_{snapshot.block_hash[:8]}_"
             f"{snapshot.request_id}_{uuid.uuid4().hex[:8]}"
@@ -528,6 +545,79 @@ class PriorityRequestManager(RequestManager):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     
+    @staticmethod
+    def _req_id_of_dummy(dummy_id: str) -> Optional[int]:
+        """Extract the mining req_id a dummy request was minted under.
+
+        Dummy IDs are ``resp_dummy_{block_hash[:8]}_{request_id}_{uuid8}``
+        (see _generate_single_dummy); the hash and uuid segments are hex
+        and can never contain an underscore, so the split is stable.
+        Returns None for any non-conforming id.
+        """
+        parts = dummy_id.split("_")
+        if len(parts) != 5 or parts[0] != "resp" or parts[1] != "dummy":
+            return None
+        try:
+            return int(parts[3])
+        except ValueError:
+            return None
+
+    def _current_req_id_cancelled(self) -> bool:
+        """True while the context still points at a broker-cancelled
+        req_id — i.e. between a MINE_CANCEL(superseded) and the next
+        MINE_REQUEST re-anchoring the context. Dummy generation must
+        pause in that window instead of re-minting dead-parent work."""
+        try:
+            return self.context.read().request_id in self._broker_cancelled_req_ids
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def cancel_dummy_requests_for_req_id(
+        self, request_id: int, reason: str,
+    ) -> int:
+        """Targeted cancel for one broker req_id (MINE_CANCEL path).
+
+        Cancels ONLY the dummy tasks whose ID embeds ``request_id`` —
+        same-parent work under a different (still-live) req_id keeps
+        running. Task cancellation triggers each dummy's own cleanup
+        path, which best-effort-cancels the upstream /v1/responses
+        generation; completions-path dummies only stop locally (the
+        backend finishes the generation, but its proofs are dropped by
+        the worker-client tombstone). Also gates future generation for
+        this req_id until the context moves on. Returns the number of
+        tasks cancelled.
+        """
+        self._broker_cancelled_req_ids[request_id] = time.time()
+        while len(self._broker_cancelled_req_ids) > 64:
+            self._broker_cancelled_req_ids.pop(
+                next(iter(self._broker_cancelled_req_ids))
+            )
+
+        targets = [
+            (dummy_id, task)
+            for dummy_id, task in list(self._dummy_tasks.items())
+            if self._req_id_of_dummy(dummy_id) == request_id
+        ]
+        if not targets:
+            logger.info(
+                "[PriorityRequestManager] MINE_CANCEL req_id=%d: no in-flight "
+                "dummy tasks matched (%d active); generation gated (%s)",
+                request_id, len(self._dummy_tasks), reason,
+            )
+            return 0
+
+        logger.info(
+            "[PriorityRequestManager] Cancelling %d dummy request(s) for "
+            "req_id=%d: %s",
+            len(targets), request_id, reason,
+        )
+        for _, task in targets:
+            task.cancel()
+        await asyncio.gather(
+            *(task for _, task in targets), return_exceptions=True,
+        )
+        return len(targets)
+
     async def _monitor_loop(self):
         """
         Enhanced monitor loop with priority-aware dummy generation.
@@ -582,6 +672,12 @@ class PriorityRequestManager(RequestManager):
                         logger.debug(f"[PriorityRequestManager] Mining context stale "
                                    f"(age={context_age:.1f}s > {constants.MINING_STALE_THRESHOLD_SECONDS}s), "
                                    f"skipping dummy generation")
+                    elif self._current_req_id_cancelled():
+                        logger.debug(
+                            "[PriorityRequestManager] Dummy generation gated: "
+                            "context req_id cancelled by broker; awaiting "
+                            "next MINE_REQUEST"
+                        )
                     elif await self.priority_manager.should_generate_dummy():
                         # Use batch generation for efficiency. One generator
                         # at a time: the monitor ticks every second, so an

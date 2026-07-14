@@ -61,7 +61,11 @@ class BrokerWorkerClient:
         request_manager: Optional["RequestManager"] = None,
     ):
         self.broker_url = constants.BROKER_WS_URL
-        self.worker_id = str(uuid.uuid4())
+        # WORKER_ID env pins a stable, human-readable id (broker and the
+        # mining PG treat it as an opaque string, ≤64 chars — used for
+        # per-worker share attribution/reconciliation). Random per-boot
+        # UUID otherwise.
+        self.worker_id = os.getenv("WORKER_ID", "").strip() or str(uuid.uuid4())
         # Separate JWT and shared secret tokens - prefer JWT for production
         # Strip whitespace/newlines that may be present from copy-paste
         self.jwt_token = (constants.PROVIDER_JWT_TOKEN or "").strip()
@@ -116,6 +120,15 @@ class BrokerWorkerClient:
         # observed in production as active_mining_jobs climbing past
         # 150 within hours. Purged from the heartbeat loop.
         self._mining_job_seen_at: Dict[int, float] = {}
+        # MINE_CANCEL tombstones: req_ids whose lease the broker
+        # terminally closed (superseded / expired). Late proof-collector
+        # callbacks and forward paths drop these locally instead of
+        # shipping dead shares the broker will reject as
+        # lease_inactive. Insertion-ordered dict (req_id -> cancel
+        # time), trimmed to a fixed bound in _mark_req_id_cancelled;
+        # membership reads also happen from the proof-collector thread,
+        # which is safe for a plain dict under the GIL.
+        self._cancelled_req_ids: Dict[int, float] = {}
         # Event loop reference for thread-safe callback
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -926,6 +939,11 @@ class BrokerWorkerClient:
         # W4: Mining sidecar - receive mining job from broker
         elif msg_type == "MINE_REQUEST":
             asyncio.create_task(self._handle_mine_request(msg))
+        # Broker terminally closed a lease (superseded/expired): stop
+        # grinding it now instead of discovering via the next
+        # MINE_REQUEST's context refresh.
+        elif msg_type == "MINE_CANCEL":
+            asyncio.create_task(self._handle_mine_cancel(msg))
         # Slice 9: broker-pushed chain model registry. Same JSON shape
         # as MODEL_API_URL/api/v1/models?extended=true, just sourced
         # from the broker over WS. We forward to ModelClient through
@@ -3957,6 +3975,10 @@ class BrokerWorkerClient:
             return
 
         request_id = request.template.request_id
+        # bcore req_ids recycle — a fresh dispatch under a previously
+        # cancelled req_id must not inherit its tombstone, or this
+        # job's proof would be dropped locally.
+        self._cancelled_req_ids.pop(request_id, None)
         self.mining_job_mapping[request.job_id] = request_id
         self.mining_request_mapping[request_id] = request.job_id
         self._mining_in_flight[request_id] = request
@@ -3984,6 +4006,152 @@ class BrokerWorkerClient:
             await self._send_mine_result_typed(
                 MineResult.from_request(request, worker_id=self.worker_id, agent_id=self._agent_id_for_result()),
                 error=f"processing_error: {exc}",
+            )
+
+    def _stale_parent_of(
+        self, request: "MineRequest",  # noqa: F821
+    ) -> Optional[tuple]:
+        """Return ``(request_parent, current_parent)`` iff the request is
+        provably mining a dead parent, else None.
+
+        Both sides are derived from header bytes so they share a domain:
+        the context's ``block_hash`` is ``prev_hash`` little-endian hex
+        as extracted by ``ZMQListener._process_mining_job``, and the
+        request's parent is the same 32 bytes at offset 4..36 of its own
+        ``header_prefix``. Do NOT compare ``template.block_hash`` here —
+        that field carries the broker/display byte order and never
+        matches the context's LE encoding.
+
+        Fails open (None) when either side is unavailable or the context
+        was never anchored by a real job (request_id 0) — the broker's
+        lease checks remain the authority; this is a local waste-cut
+        only. Compares PARENT hashes, never req_ids: a same-parent
+        template refresh keeps old req_id proof chain-valid.
+        """
+        if self.context is None:
+            return None
+        try:
+            snapshot = self.context.read()
+        except Exception:  # noqa: BLE001
+            return None
+        current = snapshot.block_hash
+        try:
+            anchored = int(getattr(snapshot, "request_id", 0) or 0) > 0
+        except (TypeError, ValueError):
+            anchored = False
+        if not current or not anchored:
+            return None
+        try:
+            request_parent = bytes.fromhex(request.template.header_prefix)[4:36].hex()
+        except Exception:  # noqa: BLE001
+            return None
+        if request_parent and request_parent != current:
+            return (request_parent, current)
+        return None
+
+    def _mark_req_id_cancelled(self, req_id: int) -> None:
+        """Tombstone a broker-cancelled req_id, bounded so the map can't
+        grow one entry per cancel forever (same leak class the
+        _mining_job_seen_at TTL purge exists for)."""
+        self._cancelled_req_ids[req_id] = time.time()
+        while len(self._cancelled_req_ids) > 512:
+            self._cancelled_req_ids.pop(next(iter(self._cancelled_req_ids)))
+
+    async def _handle_mine_cancel(self, msg: Dict[str, Any]):
+        """Broker → worker MINE_CANCEL: the lease is terminally closed.
+
+        ``reason=superseded`` and ``reason=expired_final`` hard-kill:
+        the lease is definitively dead, so every in-flight dummy
+        generation tagged with this req_id is pure waste — tombstone
+        the req_id, drop the mappings, and cancel the tagged dummy
+        tasks so the GPU frees for the next MINE_REQUEST instead of
+        grinding 40–113s of dead-parent proof (the measured pre-cancel
+        stale window).
+
+        ``reason=expired`` (share-silence timeout) is a SOFT cancel:
+        the parent is usually still valid — the tip monitor would have
+        superseded a stale-parent lease first — and the broker keeps a
+        share-grace plus a late-result salvage window open for exactly
+        this lease. Killing the generation here would forfeit the very
+        block win the salvage path exists to capture, so we let the
+        in-flight work finish and keep the mappings routable. When that
+        salvage window closes with no result the broker follows up with
+        ``reason=expired_final``, which hard-kills like superseded.
+
+        Unknown jobs/req_ids no-op quietly: the broker sends cancels
+        unconditionally on terminal close, including for leases whose
+        MINE_REQUEST never reached us (pre-send failures).
+        """
+        job_id = msg.get("job_id")
+        reason = str(msg.get("reason") or "unspecified")
+        req_id = msg.get("work_unit_id")
+        if req_id is None and job_id:
+            req_id = self.mining_job_mapping.get(job_id)
+        try:
+            req_id = int(req_id)
+        except (TypeError, ValueError):
+            logger.debug(
+                "MINE_CANCEL without resolvable req_id (job_id=%s work_unit_id=%r); ignoring",
+                job_id, msg.get("work_unit_id"),
+            )
+            return
+
+        # bcore recycles req_ids: a delayed cancel for an OLD lease can
+        # name the same req_id a FRESH MINE_REQUEST is now mining under.
+        # Only act when the cancel's job_id matches the job currently
+        # mapped to that req_id (or nothing is mapped — pure-tombstone
+        # case protecting late callbacks). Job ids are broker-unique and
+        # never recycled, so this is the authoritative identity check.
+        current_job = self.mining_request_mapping.get(req_id)
+        if job_id and current_job and current_job != job_id:
+            logger.info(
+                "stale_cancel_mismatch: MINE_CANCEL for job_id=%s req_id=%d "
+                "but req_id now belongs to job_id=%s (recycled); ignoring",
+                job_id, req_id, current_job,
+            )
+            return
+
+        known = (
+            req_id in self._mining_in_flight
+            or req_id in self.mining_request_mapping
+        )
+        logger.info(
+            "Received MINE_CANCEL: job_id=%s req_id=%d reason=%s known=%s",
+            job_id, req_id, reason, known,
+        )
+
+        if reason not in ("superseded", "expired_final"):
+            # Soft cancel — see docstring. The broker-side grace/salvage
+            # windows want this work to finish.
+            return
+
+        self._mark_req_id_cancelled(req_id)
+        if job_id:
+            self.mining_job_mapping.pop(job_id, None)
+        self.mining_request_mapping.pop(req_id, None)
+        self._mining_in_flight.pop(req_id, None)
+        self._mining_job_seen_at.pop(req_id, None)
+
+        cancel_fn = getattr(
+            self.request_manager, "cancel_dummy_requests_for_req_id", None,
+        ) if self.request_manager is not None else None
+        if cancel_fn is None:
+            logger.debug(
+                "MINE_CANCEL req_id=%d: request manager has no targeted "
+                "cancel; tombstone-only (late proof dropped locally)",
+                req_id,
+            )
+            return
+        try:
+            cancelled = await cancel_fn(req_id, reason=f"broker_cancel:{reason}")
+            logger.info(
+                "MINE_CANCEL req_id=%d: cancelled %s in-flight dummy generation(s)",
+                req_id, cancelled,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "MINE_CANCEL req_id=%d: targeted dummy cancellation raised: %s",
+                req_id, exc,
             )
 
     def _build_block_header_fb(self, request: "MineRequest") -> bytes:  # noqa: F821
@@ -4055,6 +4223,17 @@ class BrokerWorkerClient:
         Runs in the proof_collector thread; schedules the async work
         on the main event loop.
         """
+        if req_id in self._cancelled_req_ids:
+            # Broker sent MINE_CANCEL (superseded) for this req_id; the
+            # lease is terminally closed and its parent is dead. Drop
+            # locally instead of shipping proof the broker rejects as
+            # lease_inactive.
+            logger.debug(
+                "Proof for cancelled req_id=%d dropped locally (broker MINE_CANCEL)",
+                req_id,
+            )
+            return
+
         job_id = self.mining_request_mapping.get(req_id)
         if not job_id:
             logger.debug(f"Solution received for unknown req_id={req_id}, not from broker")
@@ -4132,6 +4311,15 @@ class BrokerWorkerClient:
         """
         from components.mining_protocol import MineResult
 
+        if req_id in self._cancelled_req_ids:
+            logger.info(
+                "drop_cancelled solution req_id=%d job_id=%s — broker "
+                "cancelled the lease; dropping locally", req_id, job_id,
+            )
+            self.mining_job_mapping.pop(job_id, None)
+            self.mining_request_mapping.pop(req_id, None)
+            return
+
         request = self._mining_in_flight.get(req_id)
         if request is None:
             logger.warning(
@@ -4141,6 +4329,23 @@ class BrokerWorkerClient:
             await self._send_mine_result_raw(job_id, error="no_in_flight_context")
             self.mining_job_mapping.pop(job_id, None)
             self.mining_request_mapping.pop(req_id, None)
+            return
+
+        stale = self._stale_parent_of(request)
+        if stale is not None:
+            # Defense-in-depth (catches the post-context-refresh tail
+            # MINE_CANCEL might miss): the local mining context moved to
+            # a new parent, so this solution can never validate on
+            # chain. Same-parent template refreshes pass — only a
+            # PARENT change invalidates, never a req_id change.
+            logger.info(
+                "drop_stale_parent solution req_id=%d job_id=%s "
+                "request_parent=%s current_parent=%s",
+                req_id, job_id, stale[0][:16], stale[1][:16],
+            )
+            self.mining_job_mapping.pop(job_id, None)
+            self.mining_request_mapping.pop(req_id, None)
+            self._mining_in_flight.pop(req_id, None)
             return
 
         result = MineResult.from_request(
@@ -4219,6 +4424,34 @@ class BrokerWorkerClient:
         nonce + achieved_hash for the wire payload); ``share_b64`` is
         the same bytes b64-encoded for the ``proof_b64`` field.
         """
+        # Cheap local rejections FIRST — before the function-level
+        # imports below, which pull in the FlatBuffer proof decoder.
+        if req_id in self._cancelled_req_ids:
+            logger.debug(
+                "drop_cancelled share req_id=%d job_id=%s — broker "
+                "cancelled the lease; dropping locally", req_id, job_id,
+            )
+            return
+
+        request = self._mining_in_flight.get(req_id)
+        if request is None:
+            logger.warning(
+                "Share arrived for req_id=%d (job_id=%s) but no in-flight MineRequest cached; "
+                "broker may have evicted the lease — dropping share",
+                req_id, job_id,
+            )
+            return
+
+        stale = self._stale_parent_of(request)
+        if stale is not None:
+            # Defense-in-depth; see the mirror check in _forward_solution.
+            logger.info(
+                "drop_stale_parent share req_id=%d job_id=%s "
+                "request_parent=%s current_parent=%s",
+                req_id, job_id, stale[0][:16], stale[1][:16],
+            )
+            return
+
         from components import constants as _constants
         from components.mining_protocol import (
             MineShare,
@@ -4229,15 +4462,6 @@ class BrokerWorkerClient:
             _extract_proof_hash_hex,
             _extract_proof_nonce,
         )
-
-        request = self._mining_in_flight.get(req_id)
-        if request is None:
-            logger.warning(
-                "Share arrived for req_id=%d (job_id=%s) but no in-flight MineRequest cached; "
-                "broker may have evicted the lease — dropping share",
-                req_id, job_id,
-            )
-            return
 
         base_share_target = request.template.base_share_target
         if not base_share_target:
