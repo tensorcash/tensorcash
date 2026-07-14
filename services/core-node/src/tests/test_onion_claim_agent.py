@@ -44,6 +44,7 @@ def agent(monkeypatch, tmp_path):
     mod.DATA_DIR = str(data)
     mod.CONF = str(data / "bitcoin.conf")
     mod.EXPIRY_FILE = str(hs / ".expiry_height")
+    mod.RESTART_PENDING = str(hs / ".restart_pending")
     mod.WANT_PREFIX = ""
     return mod
 
@@ -241,6 +242,52 @@ def test_no_restart_when_syncing(agent, monkeypatch):
 def test_no_restart_on_bad_rpc(agent, monkeypatch):
     monkeypatch.setattr(agent, "bitcoin_cli", lambda *a: (1, "", "error"))
     assert agent.restart_bitcoind_if_quiescent() is False
+
+
+def test_deferred_restart_sets_marker_and_retries_when_quiescent(agent, monkeypatch):
+    os.makedirs(agent.HS_DIR)
+    state = {"quiescent": False, "restarts": 0}
+
+    def fake_cli(*a):
+        b = 500 if state["quiescent"] else 400
+        return (0, json.dumps({"blocks": b, "headers": 500}), "")
+
+    def fake_run(argv, **kw):
+        if argv[:2] == ["supervisorctl", "restart"]:
+            state["restarts"] += 1
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(agent, "bitcoin_cli", fake_cli)
+    monkeypatch.setattr(agent.subprocess, "run", fake_run)
+
+    # syncing -> deferred, marker written, no restart
+    assert agent.restart_bitcoind_if_quiescent() is False
+    assert os.path.exists(agent.RESTART_PENDING)
+    assert state["restarts"] == 0
+
+    # still syncing on a later tick -> retry is a no-op restart-wise, marker stays
+    agent.retry_pending_restart()
+    assert state["restarts"] == 0 and os.path.exists(agent.RESTART_PENDING)
+
+    # node becomes quiescent -> retry restarts bitcoind and clears the marker
+    state["quiescent"] = True
+    agent.retry_pending_restart()
+    assert state["restarts"] == 1
+    assert not os.path.exists(agent.RESTART_PENDING)
+
+
+def test_retry_pending_restart_noop_without_marker(agent, monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent, "restart_bitcoind_if_quiescent",
+                        lambda: calls.append(1))
+    agent.retry_pending_restart()  # no marker present
+    assert calls == []
+
+
+def test_main_refuses_when_vanity_also_enabled(agent, monkeypatch):
+    monkeypatch.setenv("VANITY_ONION_ENABLED", "true")
+    with pytest.raises(SystemExit):
+        agent.main()
 
 
 # ---------------- install ----------------
