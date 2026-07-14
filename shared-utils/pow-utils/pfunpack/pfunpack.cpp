@@ -189,6 +189,18 @@ static py::dict unpack_proof_obj(const proof::Proof *pf) {
   out["compute_precision"]  = pf->compute_precision()
                               ? std::string(pf->compute_precision()->c_str(), pf->compute_precision()->size())
                               : std::string();
+  out["ipfs_cid"]           = pf->ipfs_cid()
+                              ? std::string(pf->ipfs_cid()->c_str(), pf->ipfs_cid()->size())
+                              : std::string();
+  // v3 admission-nonce carrier: the nested unpack MUST surface extra_flags or
+  // the verifier replays nonce-bound proofs without the nonce and rejects
+  // every consensus-valid admission proof ("Sampling hash inconsistent with
+  // recomputation"). The standalone unpack_proof always extracted it; this
+  // helper — the path every live BlockValidation/Challenge job takes —
+  // silently dropped it.
+  out["extra_flags"]        = pf->extra_flags()
+                              ? std::string(pf->extra_flags()->c_str(), pf->extra_flags()->size())
+                              : std::string();
 
   // 5) 1D vectors → Python lists
   auto copy_uint_vec = [&](const flatbuffers::Vector<uint32_t>* vec){

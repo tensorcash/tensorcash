@@ -304,6 +304,37 @@ class TestPfunpackV3Carrier:
         with pytest.raises(Exception):
             pfunpack.pack_proof(u0)
 
+    def test_v3_nonce_survives_nested_validation_request_unpack(self):
+        # REGRESSION (testnet block 9710, 2026-07-14): unpack_validation_request
+        # unpacks the nested Proof via unpack_proof_obj, which omitted
+        # extra_flags — the verifier then replayed every nonce-bound proof
+        # WITHOUT the nonce ("Sampling hash inconsistent with recomputation")
+        # and rejected every consensus-valid admission proof. The standalone
+        # unpack_proof path always surfaced extra_flags, so only the nested
+        # BlockValidation/Challenge path was broken. Pin the nested path.
+        import json
+        nonce_hex = "ab" * 32
+        carrier = json.dumps({"v3": {"admission_nonce": nonce_hex}},
+                             separators=(",", ":"))
+        proof_dict = self._full_proof_dict(version=3, model_config_diff="{}")
+        proof_dict['extra_flags'] = carrier
+        payload = pfunpack.pack_validation_request({
+            'hash_id': 'h' * 32,
+            'validation_type': 0,
+            'request': {
+                'kind': 'BlockValidation',
+                'difficulty': 1_000_000,
+                'prev_block_hash': 'p' * 32,
+                'pow_blob': proof_dict,
+            },
+        })
+        req = pfunpack.unpack_validation_request(payload)['request']
+        assert req['difficulty'] == 1_000_000
+        blob = req['pow_blob']
+        assert blob['extra_flags'] == carrier
+        assert json.loads(blob['extra_flags'])["v3"]["admission_nonce"] == nonce_hex
+        assert blob['ipfs_cid'] == ''
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
