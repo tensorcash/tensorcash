@@ -109,7 +109,13 @@ RUN cd /tmp && \
 WORKDIR /build
 COPY shared-utils/pow-utils/ ./
 COPY shared-utils/fb-schemas/ ./fb-schemas/
-RUN FB_SCHEMAS_DIR=/build/fb-schemas bash -c '. tests/build_proofprocessor_simple.sh'
+# Purge build-output dirt swept in from dev working trees: a gitignored macOS
+# flatc at tests/build/flatc shadows the arm64-native /usr/local/bin/flatc in
+# the script's lookup order, and its version-probe fallback then downloads an
+# x86_64 release asset (flatbuffers ships no linux-arm64 flatc) → Exec format
+# error. tests/build is script OUTPUT; it mkdir -p's it fresh.
+RUN rm -rf tests/build && \
+    FB_SCHEMAS_DIR=/build/fb-schemas bash -c '. tests/build_proofprocessor_simple.sh'
 
 # =============================================================================
 # Stage 3: Build vLLM wheel from local POW-on-v0.16 source
