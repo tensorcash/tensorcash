@@ -141,6 +141,7 @@ jobs:
           test_broker_inference_only.py \
           test_worker_client_mining_gate.py \
           test_worker_client_phase3.py \
+          test_worker_client_mine_cancel.py \
           unit/test_worker_client_unit.py \
           -v \
           --timeout=30 \
