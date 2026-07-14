@@ -204,7 +204,17 @@ COPY services/core-node/src/vanity-onion-gen.sh /usr/local/bin/vanity-onion-gen.
 COPY services/core-node/src/bootstrap-peers.sh /usr/local/bin/bootstrap-peers.sh
 COPY services/core-node/src/tor-start.sh /usr/local/bin/tor-start.sh
 COPY services/core-node/src/tor-health.sh /usr/local/bin/tor-health.sh
-RUN chmod +x /build/bcore/start_node.sh /build/bcore/start_mining.sh /usr/local/bin/vanity-onion-gen.sh /usr/local/bin/bootstrap-peers.sh /usr/local/bin/tor-start.sh /usr/local/bin/tor-health.sh
+COPY services/core-node/src/onion-claim-agent.py /usr/local/bin/onion-claim-agent.py
+RUN chmod +x /build/bcore/start_node.sh /build/bcore/start_mining.sh /usr/local/bin/vanity-onion-gen.sh /usr/local/bin/bootstrap-peers.sh /usr/local/bin/tor-start.sh /usr/local/bin/tor-health.sh /usr/local/bin/onion-claim-agent.py
+
+# Consumer alternative to the local vanity grinder: claim a pre-ground onion
+# (e.g. `tensorc`) from an operator-provided k8s onion-grinder pool and install
+# it via SIGHUP. Gated per node via ONION_CLAIM_ENABLED; default false so nodes
+# running this image are unaffected (supervisord expands
+# %(ENV_ONION_CLAIM_ENABLED)s at start). The pool Secrets and the
+# RBAC/ServiceAccount the agent needs to claim them are supplied by the
+# deployment, NOT baked into this image.
+ENV ONION_CLAIM_ENABLED=false
 
 # 8) Set up VNC server
 # No password is baked into the image; /start-vnc.sh writes one at runtime
