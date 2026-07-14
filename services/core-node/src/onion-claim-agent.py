@@ -35,6 +35,7 @@ CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "120"))
 WANT_PREFIX     = os.environ.get("VANITY_PREFIX", "")             # "" = accept any pool prefix
 NODE_ID         = os.environ.get("HOSTNAME", "node")
 EXPIRY_FILE     = os.path.join(HS_DIR, ".expiry_height")          # our record of current onion's expiry
+RESTART_PENDING = os.path.join(HS_DIR, ".restart_pending")        # set when an externalip restart was deferred (node not quiescent)
 
 SA   = "/var/run/secrets/kubernetes.io/serviceaccount"
 APIH = os.environ.get("KUBERNETES_SERVICE_HOST"); APIP = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
@@ -137,6 +138,10 @@ def set_externalip(onion):
     if not seen_l: lines.append("listenonion=0")
     open(CONF, "w").write("\n".join(lines) + "\n")
 
+def _clear_restart_pending():
+    try: os.remove(RESTART_PENDING)
+    except OSError: pass
+
 def restart_bitcoind_if_quiescent():
     rc, out, _ = bitcoin_cli("getblockchaininfo")
     try: info = json.loads(out)
@@ -145,9 +150,23 @@ def restart_bitcoind_if_quiescent():
     if b > 0 and b == h:
         subprocess.run(["supervisorctl", "restart", "node"], capture_output=True)
         LOG.info("quiescent (blocks=%d==headers) — restarted bitcoind to apply externalip", b)
+        _clear_restart_pending()
         return True
-    LOG.info("NOT quiescent (blocks=%s headers=%s) — externalip persisted, applies on next clean restart", b, h)
+    # Defer, but leave a marker so a later tick actually retries the restart once
+    # the node is quiescent. Without it, ensure_externalip_advertised() sees the
+    # correct externalip= already in the conf and returns early forever, so a
+    # claim installed mid-sync would sit unapplied until some unrelated restart.
+    try: open(RESTART_PENDING, "w").write(str(int(time.time())))
+    except OSError: pass
+    LOG.info("NOT quiescent (blocks=%s headers=%s) — restart deferred (pending marker set)", b, h)
     return False
+
+def retry_pending_restart():
+    """Retry a previously-deferred bitcoind restart. No-op unless a restart is
+    pending; restart_bitcoind_if_quiescent() clears the marker on success."""
+    if os.path.exists(RESTART_PENDING):
+        LOG.info("restart pending from an earlier deferred externalip apply — retrying")
+        restart_bitcoind_if_quiescent()
 
 # ---------------- decide + rotate ----------------
 def need_refresh(tip):
@@ -212,8 +231,24 @@ def tick():
     else:
         LOG.info("no refresh: %s", why)
         ensure_externalip_advertised()
+    # Always retry a deferred restart; ensure_externalip_advertised() returns
+    # early once the conf is correct, so this is the only place a mid-sync
+    # deferral gets re-attempted after the node reaches quiescence.
+    retry_pending_restart()
 
 def main():
+    # Mutually exclusive with the local vanity grinder: if both are enabled the
+    # two supervisor programs fight over HS_DIR. Fail fast rather than corrupt
+    # the onion identity.
+    if os.environ.get("VANITY_ONION_ENABLED", "").lower() == "true":
+        LOG.error("ONION_CLAIM_ENABLED and VANITY_ONION_ENABLED are both true — "
+                  "mutually exclusive. Set VANITY_ONION_ENABLED=false on a claim node.")
+        raise SystemExit(2)
+    # The claim installs a key, but Tor is what derives the .onion hostname from
+    # it. Without Tor the agent claims bundles it can never advertise.
+    if os.environ.get("TOR_ENABLED", "").lower() != "true":
+        LOG.warning("TOR_ENABLED is not 'true' — claimed keys will install but Tor "
+                    "will not derive a hostname; the node cannot advertise its onion.")
     LOG.info("up: pool_ns=%s hs_dir=%s buffer=%d interval=%ds prefix=%s",
              POOL_NS, HS_DIR, ROTATION_BUFFER, CHECK_INTERVAL, WANT_PREFIX or "<any>")
     once = os.environ.get("RUN_ONCE") == "1"
