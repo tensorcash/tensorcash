@@ -272,6 +272,7 @@ COPY services/core-node/src/bootstrap-peers.sh /usr/local/bin/bootstrap-peers.sh
 COPY services/core-node/src/start_mining.sh /usr/local/bin/start_mining.sh
 COPY services/core-node/src/tor-start.sh /usr/local/bin/tor-start.sh
 COPY services/core-node/src/tor-health.sh /usr/local/bin/tor-health.sh
+COPY services/core-node/src/onion-claim-agent.py /usr/local/bin/onion-claim-agent.py
 
 # Copy shared libraries
 COPY --from=builder /usr/local/lib/libzkprover.so /usr/local/lib/
@@ -383,6 +384,19 @@ stderr_logfile=/var/log/tensorcash/vanity-onion.err.log
 stdout_logfile=/var/log/tensorcash/vanity-onion.out.log
 priority=15
 startsecs=10
+
+# Consumer alternative to vanity_onion: claim a pre-ground onion from an
+# operator-provided onion-grinder pool (mutually exclusive with vanity_onion).
+# Default off; set ONION_CLAIM_ENABLED=true + VANITY_ONION_ENABLED=false on a
+# consumer node. Pool Secrets + RBAC/ServiceAccount are deployment-supplied.
+[program:onion_claim]
+command=python3 /usr/local/bin/onion-claim-agent.py
+autostart=%(ENV_ONION_CLAIM_ENABLED)s
+autorestart=true
+stderr_logfile=/var/log/tensorcash/onion-claim.err.log
+stdout_logfile=/var/log/tensorcash/onion-claim.out.log
+priority=15
+startsecs=5
 SUPERVISOR_EOF
 
 # Create entrypoint script
@@ -401,6 +415,7 @@ export VALIDATOR_PULL_PORT="${VALIDATOR_PULL_PORT:-7001}"
 export API_PORT="${API_PORT:-8050}"
 export TOR_ENABLED="${TOR_ENABLED:-false}"
 export VANITY_ONION_ENABLED="${VANITY_ONION_ENABLED:-false}"
+export ONION_CLAIM_ENABLED="${ONION_CLAIM_ENABLED:-false}"
 
 # Chain identity — the fallback bitcoin.conf below MUST be a valid config for
 # this chain (a chain-less default silently runs mainnet and is rejected by a
