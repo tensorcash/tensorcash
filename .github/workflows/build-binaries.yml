@@ -20,6 +20,13 @@ env:
   ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS: "1200000"
   ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY: "4"
 
+# The org pins the default workflow token to read-only, so the softprops
+# action-gh-release "Upload release assets" steps 403 without an explicit
+# elevation (same as build-desktop.yml). No job here pushes to ghcr, so
+# contents:write alone is sufficient to attach llama-server + the DMG.
+permissions:
+  contents: write
+
 jobs:
   # ===========================================================================
   # Build llama-server with static dependencies (no Homebrew runtime deps)

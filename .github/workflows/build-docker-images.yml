@@ -149,7 +149,14 @@ jobs:
           # Additional llama.cpp variants published under the same repository.
           matrix_items+=("{\"service\":\"llama-backend\",\"cuda_version\":\"12.3.0\",\"vllm_version\":\"\",\"platform\":\"linux/amd64\",\"dockerfile\":\"services/miner-api/llama.Dockerfile\",\"build_target\":\"model-prep\",\"fixed_tag\":\"model-prep\"}")
           matrix_items+=("{\"service\":\"llama-backend\",\"cuda_version\":\"12.3.0\",\"vllm_version\":\"\",\"platform\":\"linux/amd64\",\"dockerfile\":\"services/miner-api/llama.Dockerfile\",\"build_target\":\"llama-cuda\",\"fixed_tag\":\"cuda\"}")
-          
+
+          # v0.19 Hopper (H100) single-worker. The Dockerfile COPYs from a named
+          # build context `vllm_src`; a dedicated step below fetches it from the
+          # public tensorcash/vllm feature/pow-on-v0.19 branch (the vllm-v019
+          # submodule pin is NOT relied upon — it may not be a public commit).
+          # amd64 only; Blackwell/arm64 is built out-of-band, not in this matrix.
+          matrix_items+=("{\"service\":\"simple-worker\",\"cuda_version\":\"12.8.0\",\"vllm_version\":\"0.19.0\",\"platform\":\"linux/amd64\",\"dockerfile\":\"deployments/simple-worker-h100-v19/Dockerfile\",\"build_target\":\"\",\"fixed_tag\":\"vllm-v019-h100\",\"vllm_src_branch\":\"feature/pow-on-v0.19\"}")
+
           # Create JSON matrix
           matrix_json="{\"include\":["
           for i in "${!matrix_items[@]}"; do
@@ -223,6 +230,17 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # v0.19 workers COPY --from=vllm_src; fetch that named build context from
+      # the public tensorcash/vllm branch. Kept separate from the submodule so
+      # the build never depends on a possibly-non-public submodule pin.
+      - name: Fetch vLLM source build context (v0.19 workers)
+        if: matrix.vllm_src_branch != ''
+        uses: actions/checkout@v6
+        with:
+          repository: tensorcash/vllm
+          ref: ${{ matrix.vllm_src_branch }}
+          path: vllm-v019
 
       - name: Generate image metadata
         id: meta
@@ -316,6 +334,7 @@ jobs:
         with:
           builder: shared-builder
           context: .
+          build-contexts: ${{ matrix.vllm_src_branch != '' && 'vllm_src=./vllm-v019' || '' }}
           file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
           target: ${{ matrix.build_target }}
@@ -352,6 +371,7 @@ jobs:
         with:
           builder: shared-builder
           context: .
+          build-contexts: ${{ matrix.vllm_src_branch != '' && 'vllm_src=./vllm-v019' || '' }}
           file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
           target: ${{ matrix.build_target }}
