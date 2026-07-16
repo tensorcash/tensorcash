@@ -1383,7 +1383,7 @@ jobs:
                 libssl-dev libdbus-1-dev libzstd-dev \
                 libgl1-mesa-dev libglu1-mesa-dev \
                 libxkbcommon-dev libvulkan-dev \
-                libgmp-dev \
+                libgmp-dev libargon2-dev \
                 patchelf file \
                 bzip2 xz-utils python3 tor
           - distro: centos
@@ -1401,7 +1401,7 @@ jobs:
                 libevent-devel boost-devel zeromq-devel cppzmq-devel qrencode-devel sqlite-devel openssl-devel \
                 dbus-devel mesa-libGL-devel mesa-libGLU-devel libzstd-devel \
                 libxkbcommon-devel vulkan-headers \
-                gmp-devel \
+                gmp-devel libargon2-devel \
                 patchelf file \
                 bzip2 xz python3 tor
 
