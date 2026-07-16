@@ -51,6 +51,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The org forces the default workflow token to read-only, so the softprops
+# action-gh-release upload steps 403 ("Resource not accessible by integration")
+# without an explicit elevation. Caching uses the runtime token (not this scope)
+# and no job pushes to ghcr here, so contents:write alone is sufficient.
+permissions:
+  contents: write
+
 env:
   BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
