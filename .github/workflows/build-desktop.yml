@@ -1392,7 +1392,7 @@ jobs:
                 libxkbcommon-dev libvulkan-dev \
                 libgmp-dev libargon2-dev \
                 patchelf file \
-                bzip2 xz-utils python3 tor
+                bzip2 xz-utils python3
           - distro: centos
             container: quay.io/centos/centos:stream9
             pkg_install: |
@@ -1410,7 +1410,7 @@ jobs:
                 libxkbcommon-devel vulkan-headers \
                 gmp-devel libargon2-devel \
                 patchelf file \
-                bzip2 xz python3 tor
+                bzip2 xz python3
 
     steps:
       - name: Install git and bash in container
@@ -1819,23 +1819,48 @@ jobs:
           cp packaging/common/validator-config.json "${DIST_DIR}/${DIST_NAME}/defaults/" || true
           cp packaging/common/default-bitcoin.conf "${DIST_DIR}/${DIST_NAME}/defaults/bitcoin.conf"
 
-          # Bundle Tor binary and its shared library dependencies
-          TOR_BIN="$(command -v tor 2>/dev/null || true)"
-          if [ -n "${TOR_BIN}" ] && [ -x "${TOR_BIN}" ]; then
-            echo "Bundling Tor binary from ${TOR_BIN}..."
-            cp "${TOR_BIN}" "${DIST_DIR}/${DIST_NAME}/bin/tor"
-            chmod +x "${DIST_DIR}/${DIST_NAME}/bin/tor"
-            # Copy non-system shared libs and set rpath to find them in ../lib
-            for so in $(ldd "${TOR_BIN}" 2>/dev/null | awk '/=>/{print $3}' | grep -v '^/lib\|^/usr/lib'); do
-              so_name="$(basename "${so}")"
-              if [ ! -f "${DIST_DIR}/${DIST_NAME}/lib/${so_name}" ]; then
-                echo "  Bundling Tor dependency: ${so_name}"
-                cp "${so}" "${DIST_DIR}/${DIST_NAME}/lib/${so_name}"
-              fi
-            done
-            patchelf --set-rpath '$ORIGIN/../lib' "${DIST_DIR}/${DIST_NAME}/bin/tor" 2>/dev/null || true
-          else
-            echo "ERROR: Tor binary not found. Install tor (apt install tor) to bundle it."
+          # Bundle Tor from the official Tor Expert Bundle (linux-x86_64), NEVER
+          # the distro package: ubuntu:22.04's apt tor is 0.4.6.10 — an EOL
+          # series that current relays/directory authorities reject, so circuits
+          # never build and Tor-mode wallets sit at 0 connections. Mirrors the
+          # Windows leg, which already downloads the expert bundle.
+          TOR_BUNDLE_VERSION="${TOR_BUNDLE_VERSION:-15.0.18}"
+          fetch_tor_bundle() {
+            curl -fsSL -o /tmp/tor-expert-bundle.tar.gz \
+              "https://dist.torproject.org/torbrowser/$1/tor-expert-bundle-linux-x86_64-$1.tar.gz"
+          }
+          if ! fetch_tor_bundle "${TOR_BUNDLE_VERSION}"; then
+            # Tor Project prunes old releases from dist.torproject.org, so a
+            # hardcoded pin eventually 404s — discover the newest instead.
+            echo "Pinned Tor bundle ${TOR_BUNDLE_VERSION} unavailable; discovering latest..."
+            LATEST_TOR="$(curl -fsSL https://dist.torproject.org/torbrowser/ 2>/dev/null \
+              | grep -oE 'href="[0-9]+\.[0-9]+\.[0-9]+/"' \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -uV | tail -1)"
+            if [ -z "${LATEST_TOR}" ] || ! fetch_tor_bundle "${LATEST_TOR}"; then
+              echo "ERROR: could not download the Tor Expert Bundle. Refusing to fall back to a distro tor."
+              exit 1
+            fi
+            echo "Using discovered Tor bundle ${LATEST_TOR}"
+          fi
+          rm -rf /tmp/tor-expert && mkdir -p /tmp/tor-expert
+          tar -xzf /tmp/tor-expert-bundle.tar.gz -C /tmp/tor-expert
+          cp /tmp/tor-expert/tor/tor "${DIST_DIR}/${DIST_NAME}/bin/tor"
+          chmod +x "${DIST_DIR}/${DIST_NAME}/bin/tor"
+          # The expert bundle ships its own libcrypto/libssl/libevent alongside
+          # the binary; carry them into lib/ and point tor's rpath there.
+          for so in /tmp/tor-expert/tor/*.so*; do
+            [ -f "${so}" ] || continue
+            so_name="$(basename "${so}")"
+            if [ ! -f "${DIST_DIR}/${DIST_NAME}/lib/${so_name}" ]; then
+              echo "  Bundling Tor dependency: ${so_name}"
+              cp "${so}" "${DIST_DIR}/${DIST_NAME}/lib/${so_name}"
+            fi
+          done
+          patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN' "${DIST_DIR}/${DIST_NAME}/bin/tor" 2>/dev/null || true
+          # Hard gate: never ship an EOL tor series again.
+          "${DIST_DIR}/${DIST_NAME}/bin/tor" --version | head -1
+          if ! "${DIST_DIR}/${DIST_NAME}/bin/tor" --version | head -1 | grep -qE 'Tor version 0\.(4\.[8-9]|[5-9])\.'; then
+            echo "ERROR: bundled tor is missing, unrunnable, or an EOL series (< 0.4.8)."
             exit 1
           fi
 

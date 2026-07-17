@@ -554,7 +554,7 @@ fi
 
 # Bundle Tor binary for onion peer discovery
 TOR_BINARY="${TOR_BINARY:-}"
-TOR_VERSION="${TOR_VERSION:-15.0.11}"
+TOR_VERSION="${TOR_VERSION:-15.0.18}"
 if [[ -z "${TOR_BINARY}" ]]; then
     # Try to find a pre-existing tor.exe in depends
     for candidate in "${DEPENDS_PREFIX:-}/bin/tor.exe"; do
