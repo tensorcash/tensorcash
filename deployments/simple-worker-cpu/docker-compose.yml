@@ -43,6 +43,10 @@ services:
       API_KEY: internal-secret
       MINING_ENABLED: "true"
       PROOF_CACHE_ENABLED: "true"
+      # Mainnet activated proof v3 (h8000); v2 proofs are silently rejected
+      # (bad-proof-version-v3). Must be 3 to win a mainnet block; override to 2
+      # only for a pre-v3 testnet.
+      POW_PROOF_VERSION: ${POW_PROOF_VERSION:-3}
 
     volumes:
       - models-cache:/models
