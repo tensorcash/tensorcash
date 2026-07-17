@@ -392,6 +392,134 @@ jobs:
           path: miner-proxy-darwin-arm64.tar.gz
 
   # ===========================================================================
+  # Bundle miner-proxy with PyInstaller (Linux x86_64) — native no-Docker worker
+  # ===========================================================================
+  build-miner-proxy-linux:
+    runs-on: [self-hosted, linux, x64, docker]
+
+    steps:
+      - name: Install build deps (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git pkg-config nasm yasm \
+            libtool autoconf automake m4 wget \
+            libgmp-dev libflint-dev libboost-all-dev libzmq3-dev libssl-dev
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Initialize submodules
+        run: |
+          git submodule init
+          for sub in $(git config --file .gitmodules --get-regexp path | awk '{print $2}'); do
+            git submodule update --init --recursive "$sub" || echo "Warning: $sub failed"
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip wheel setuptools
+          pip install pyinstaller
+          pip install -r services/miner-api/proxy_requirements.txt
+
+      - name: Build ChiaVDF
+        env:
+          BUILD_VDF_CLIENT: "N"
+          BUILD_VDF_BENCH: "N"
+        run: |
+          cd shared-utils/chiavdf
+          git init
+          git config user.email "build@ci"
+          git config user.name "CI Build"
+          git add .
+          git commit -m "Initial commit" || true
+          git tag -a v1.0.0 -m "Version 1.0.0" || true
+          pip install .
+
+      - name: Build flatbuffers from source
+        run: |
+          cd "${{ runner.temp }}"
+          curl -sL "https://github.com/google/flatbuffers/archive/refs/tags/v23.5.26.tar.gz" | tar xz
+          cd flatbuffers-23.5.26
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ runner.temp }}/flatbuffers-install" \
+            -DFLATBUFFERS_BUILD_TESTS=OFF \
+            -DFLATBUFFERS_BUILD_FLATLIB=ON \
+            -DFLATBUFFERS_BUILD_FLATC=ON
+          cmake --build . --config Release -j"$(nproc)"
+          cmake --install .
+          echo "${{ runner.temp }}/flatbuffers-install/bin" >> $GITHUB_PATH
+
+      - name: Prepare source bundle
+        run: |
+          set -eux
+          BUNDLE_SRC="${{ runner.temp }}/miner-proxy-src"
+          mkdir -p "$BUNDLE_SRC"
+          cp -r services/miner-api/src/* "$BUNDLE_SRC/"
+          mkdir -p "$BUNDLE_SRC/utils"
+          cp shared-utils/pow-utils/pow_utils.py "$BUNDLE_SRC/utils/"
+          cp shared-utils/pow-utils/pow_v3.py "$BUNDLE_SRC/utils/"
+          cp shared-utils/pow-utils/bcred_table_r1024.py "$BUNDLE_SRC/utils/"
+          cp shared-utils/pow-utils/uint256_arithmetics.py "$BUNDLE_SRC/utils/"
+          mkdir -p "$BUNDLE_SRC/config"
+          cp shared-utils/config/constants.py "$BUNDLE_SRC/config/"
+          cd "$BUNDLE_SRC"
+          flatc --python "${{ github.workspace }}/shared-utils/fb-schemas/proof.fbs"
+          flatc --python "${{ github.workspace }}/shared-utils/fb-schemas/validation.fbs"
+          flatc --python "${{ github.workspace }}/shared-utils/fb-schemas/blockheader.fbs"
+          echo "BUNDLE_SRC=$BUNDLE_SRC" >> $GITHUB_ENV
+
+      - name: Build with PyInstaller
+        run: |
+          cd "$BUNDLE_SRC"
+          pyinstaller \
+            --onefile \
+            --name miner-proxy \
+            --paths "$BUNDLE_SRC" \
+            --hidden-import aiohttp --hidden-import websockets --hidden-import zmq \
+            --hidden-import httpx --hidden-import numpy --hidden-import flatbuffers \
+            --hidden-import chiavdf --hidden-import mcp --hidden-import uvicorn \
+            --hidden-import starlette \
+            --hidden-import components.vdf_service --hidden-import components.zmq_listener \
+            --hidden-import components.proxy --hidden-import components.proxy_with_priority \
+            --hidden-import components.request_priority_manager --hidden-import components.proof_cache \
+            --hidden-import components.proof_collector --hidden-import components.model_synch \
+            --hidden-import components.context --hidden-import components.constants \
+            --hidden-import worker_client \
+            --add-data "components:components" \
+            --add-data "config:config" \
+            --add-data "utils:utils" \
+            --add-data "proof:proof" \
+            main.py
+          ls -la dist/
+
+      - name: Package
+        run: |
+          mkdir -p "${{ runner.temp }}/output"
+          cp "$BUNDLE_SRC/dist/miner-proxy" "${{ runner.temp }}/output/"
+          tar czf miner-proxy-linux-x64.tar.gz -C "${{ runner.temp }}/output" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: miner-proxy-linux-x64
+          path: miner-proxy-linux-x64.tar.gz
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: miner-proxy-linux-x64.tar.gz
+
+  # ===========================================================================
   # Build TensorMiner.app and create signed/notarized DMG
   # ===========================================================================
   build-dmg:
