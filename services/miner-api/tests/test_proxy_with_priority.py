@@ -26,6 +26,7 @@ if "utils.uint256_arithmetics" not in sys.modules:
 import unittest
 import asyncio
 import time
+from dataclasses import replace
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
@@ -313,6 +314,52 @@ class TestPriorityRequestManager(AioHTTPTestCase):
         # Should have checked and generated dummy
         self.manager.priority_manager.should_generate_dummy.assert_called()
         self.manager.priority_manager.cleanup_stale_requests.assert_called()
+
+    @unittest_run_loop
+    async def test_monitor_loop_broker_mining_ignores_wall_clock_stale_context(self):
+        """Broker mining leases remain authoritative after the context age threshold."""
+        self.manager.context.vdf_initialised = True
+        self.manager.context.miner_initialised = True
+        self.manager.context._snapshot = replace(
+            self.manager.context.read(),
+            timestamp=time.time() - 120,
+        )
+        self.manager._broker_mining_mode = True
+
+        self.manager.priority_manager.cleanup_stale_requests = AsyncMock()
+        self.manager.priority_manager.should_generate_dummy = AsyncMock(return_value=True)
+        self.manager._generate_dummy_batch = AsyncMock()
+
+        with patch("components.proxy_with_priority.constants.MINING_STALE_THRESHOLD_SECONDS", 60):
+            with patch('asyncio.sleep', side_effect=asyncio.CancelledError()):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.manager._monitor_loop()
+
+        self.manager.priority_manager.should_generate_dummy.assert_called()
+        self.manager._generate_dummy_batch.assert_called_once()
+
+    @unittest_run_loop
+    async def test_monitor_loop_standalone_respects_wall_clock_stale_context(self):
+        """Standalone mining keeps the original stale-context safety gate."""
+        self.manager.context.vdf_initialised = True
+        self.manager.context.miner_initialised = True
+        self.manager.context._snapshot = replace(
+            self.manager.context.read(),
+            timestamp=time.time() - 120,
+        )
+        self.manager._broker_mining_mode = False
+
+        self.manager.priority_manager.cleanup_stale_requests = AsyncMock()
+        self.manager.priority_manager.should_generate_dummy = AsyncMock(return_value=True)
+        self.manager._generate_dummy_batch = AsyncMock()
+
+        with patch("components.proxy_with_priority.constants.MINING_STALE_THRESHOLD_SECONDS", 60):
+            with patch('asyncio.sleep', side_effect=asyncio.CancelledError()):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.manager._monitor_loop()
+
+        self.manager.priority_manager.should_generate_dummy.assert_not_called()
+        self.manager._generate_dummy_batch.assert_not_called()
     
     @unittest_run_loop
     async def test_priority_cleanup_loop(self):
