@@ -303,7 +303,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: 1.85
+          toolchain: stable
           target: ${{ matrix.rust_target }}
 
       - name: Cache Cargo
@@ -1487,7 +1487,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: 1.85
+          toolchain: stable
           target: x86_64-unknown-linux-gnu
 
       - name: Cache Cargo
@@ -2039,7 +2039,7 @@ jobs:
         run: |
           export RUSTUP_HOME="${HOME}/.rustup"
           export CARGO_HOME="${HOME}/.cargo"
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           source "${CARGO_HOME}/env"
           rustup target add x86_64-pc-windows-gnu
           echo "RUSTUP_HOME=${RUSTUP_HOME}" >> $GITHUB_ENV
