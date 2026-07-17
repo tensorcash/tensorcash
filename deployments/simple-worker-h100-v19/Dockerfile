@@ -302,7 +302,7 @@ ENV MODEL_NAME="Qwen/Qwen3.5-27B-FP8" \
     MAX_MODEL_LEN=32768 \
     GPU_MEM_UTIL=0.85 \
     VLLM_ENABLE_POW=1 \
-    POW_PROOF_VERSION=3 \
+    API_KEY="internal-secret" \
     POW_LOG_DIR=/data/miner_logs
 
 # Miner-proxy broker mode (standalone — no core-node sync)

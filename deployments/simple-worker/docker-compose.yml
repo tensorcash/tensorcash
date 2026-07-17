@@ -57,11 +57,6 @@ services:
       TARGET_URL: http://127.0.0.1:8000
       API_KEY: internal-secret
       MINING_ENABLED: "true"
-      # Emitted proof version. Mainnet activated v3 (h8000); v2 proofs are
-      # rejected post-activation (bad-proof-version-v3) while dashboards still
-      # look healthy, so this MUST be 3 to win a mainnet block. Override to 2
-      # only for a pre-v3 testnet.
-      POW_PROOF_VERSION: ${POW_PROOF_VERSION:-3}
       PROOF_CACHE_ENABLED: "true"
 
     volumes:

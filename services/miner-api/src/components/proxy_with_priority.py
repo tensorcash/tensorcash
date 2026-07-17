@@ -666,20 +666,7 @@ class PriorityRequestManager(RequestManager):
                     # Check if mining context is stale (no block from core-node recently)
                     context_status = self.context.get_status()
                     context_age = context_status.get("age_seconds", 0)
-                    # In BROKER mining mode the lease — not wall-clock template
-                    # age — is authoritative. The broker re-issues a MINE_REQUEST
-                    # only on tip change (~70s+, up to 160s+ observed), so a
-                    # perfectly valid template routinely outlives
-                    # MINING_STALE_THRESHOLD_SECONDS. Applying this wall-clock gate
-                    # then stops mining a still-valid lease and drains the GPU to
-                    # Running:0 until the next template arrives. Real staleness is
-                    # caught authoritatively above (tip-change → _cancel_all_dummy_
-                    # requests) and below (broker-cancel gate) plus the broker's own
-                    # lease-silence expiry — so suppress the wall-clock gate here.
-                    is_stale = (
-                        context_age > constants.MINING_STALE_THRESHOLD_SECONDS
-                        and not self._broker_mining_mode
-                    )
+                    is_stale = context_age > constants.MINING_STALE_THRESHOLD_SECONDS
 
                     if is_stale:
                         logger.debug(f"[PriorityRequestManager] Mining context stale "

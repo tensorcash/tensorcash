@@ -341,23 +341,15 @@ py::dict unpack_validation_request(py::bytes buf) {
       case ValidationUnion_ModelValidation: {
         auto mdl = req->request_as_ModelValidation();
         py::dict d;
-        // Every string/vector field here is OPTIONAL in the schema — a minimal
-        // ModelValidation (e.g. the verification-service admission probe, or an
-        // under-populated on-chain model-registration request) leaves them
-        // unset, so the accessor returns nullptr. Guard every deref (matching
-        // the BlockValidation branch and unpack_proof_obj above); an unguarded
-        // ->str()/->data() on a null field segfaults the whole verifier.
-        d["model_name"]   = mdl->model_name()  ? mdl->model_name()->str()  : std::string();
-        d["model_commit"] = mdl->model_commit() ? mdl->model_commit()->str() : std::string();
+        d["model_name"]   = mdl->model_name()->str();
+        d["model_commit"] = mdl->model_commit()->str();
         d["difficulty"]   = mdl->difficulty();
-        d["cid"]          = mdl->cid()   ? mdl->cid()->str()   : std::string();
-        d["extra"]        = mdl->extra() ? mdl->extra()->str() : std::string();
+        d["cid"]          = mdl->cid()->str();
+        d["extra"]        = mdl->extra()->str();
         auto tx = mdl->txid();
-        d["txid"]         = tx ? py::bytes(reinterpret_cast<const char*>(tx->data()), tx->size())
-                               : py::bytes();
+        d["txid"]         = py::bytes(reinterpret_cast<const char*>(tx->data()), tx->size());
         auto bh = mdl->block_hash();
-        d["block_hash"]   = bh ? py::bytes(reinterpret_cast<const char*>(bh->data()), bh->size())
-                               : py::bytes();
+        d["block_hash"]   = py::bytes(reinterpret_cast<const char*>(bh->data()), bh->size());
         d["block_height"] = mdl->block_height();
         out["request"]    = d;
         break;

@@ -1374,22 +1374,10 @@ class RequestManager:
                         logger.warning(f"[RequestManager] Cleaning up stale request: {rid}")
                         del self.active_requests[rid]
 
-                    # Check if mining context is stale (no block from core-node recently).
-                    # In BROKER mining mode the broker lease is authoritative, not the
-                    # wall-clock template age: a valid template routinely outlives
-                    # MINING_STALE_THRESHOLD_SECONDS (broker re-issues MINE_REQUEST only
-                    # on tip change), and gating on age here idles the GPU to Running:0
-                    # on a still-valid lease. Suppress the wall-clock gate in broker
-                    # mode and rely on broker MINE_CANCEL / lease expiry. (This base
-                    # RequestManager path is the standalone/fallback path; the live
-                    # broker path is PriorityRequestManager, which also honours the
-                    # broker-cancel gate.)
+                    # Check if mining context is stale (no block from core-node recently)
                     context_status = self.context.get_status()
                     context_age = context_status.get("age_seconds", 0)
-                    is_stale = (
-                        context_age > constants.MINING_STALE_THRESHOLD_SECONDS
-                        and not self._broker_mining_mode
-                    )
+                    is_stale = context_age > constants.MINING_STALE_THRESHOLD_SECONDS
 
                     if is_stale:
                         logger.debug(f"[RequestManager] Mining context stale "
