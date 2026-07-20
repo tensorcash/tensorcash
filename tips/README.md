@@ -100,3 +100,5 @@ of the idea — that comes from review ACKs and, ultimately, network adoption.
 | [0005](tip-0005-liveness-price-discovery-dex.md) | Liveness, price discovery, and a decentralised exchange (Layer 1.5) | Informational | Draft |
 | [0006](tip-0006-multimodal-proof-of-inference.md) | Multimodal Input/Output Extension for Proof-of-Inference | Informational | Draft |
 | [0007](tip-0007-hosted-cosign-ceremonies.md) | Hosted multi-tenant cosign and watch-only spot/adaptor ceremonies | Standards Track | Draft |
+| [0008](tip-0008-verifier-verdict-attestations.md) | Verifier verdict attestations and aggregate validation envelopes | Standards Track | Draft |
+| [0009](tip-0009-community-verification-service.md) | Community verification service reference deployment | Informational | Draft |
