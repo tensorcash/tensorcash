@@ -3333,6 +3333,27 @@ class ProofVerifier:
         """
         with self.logger.verification_context(step="block_sanity_check"):
             try:
+                # 0. Enforce the proof window size. A valid mined proof is emitted
+                # only at an exact window boundary (check_solutions writes a proof
+                # only when nsteps % window_size == 0, over the full 256-token
+                # window), so it must carry exactly POW_WINDOW_SIZE chosen tokens.
+                # window_size stays pinned at 256 while chosen_tokens is adopted
+                # as-is, so a short/long proof would otherwise index out of bounds
+                # in verify_sequence_light instead of cleanly rejecting. Mirror of
+                # the C++ QuickVerifier::VerifyBlockSanity window-size check.
+                num_tokens = len(self.chosen_tokens)
+                if num_tokens != POW_WINDOW_SIZE:
+                    self.logger.error(
+                        "Invalid proof window size",
+                        failure_type="invalid_proof_window_size",
+                        hash_id=self.proof.get('hash'),
+                        proof_data={
+                            'chosen_tokens': num_tokens,
+                            'expected': POW_WINDOW_SIZE,
+                        }
+                    )
+                    return False
+
                 # 1. Verify VDF
                 vdf_valid = chiavdf_verify(
                     self.proof['block_hash'],
