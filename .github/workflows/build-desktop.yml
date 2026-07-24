@@ -1610,7 +1610,7 @@ jobs:
         env:
           BUILD_DIR: services/core-node/bcore/build-linux-${{ matrix.distro }}-${{ matrix.chain_type }}
         run: |
-          cmake --build "$BUILD_DIR" --target bitcoin-qt bitcoin-cli -j"$(nproc)"
+          cmake --build "$BUILD_DIR" --target bitcoin-qt bitcoin-cli bitcoind -j"$(nproc)"
 
       - name: Package artifacts with linuxdeploy
         shell: bash
@@ -1656,6 +1656,7 @@ jobs:
           # Copy main executables
           cp "${BUILD_DIR}/bin/bitcoin-qt" "${APPDIR}/usr/bin/${APP_LABEL}"
           cp "${BUILD_DIR}/bin/bitcoin-cli" "${APPDIR}/usr/bin/"
+          cp "${BUILD_DIR}/bin/bitcoind" "${APPDIR}/usr/bin/"
           cp services/core-node/cosign-bridge/target/release/cosign-bridge "${APPDIR}/usr/bin/"
 
           # Copy liboqs from /usr/local (linuxdeploy won't find it automatically)
@@ -1740,6 +1741,7 @@ jobs:
             --appdir "${APPDIR}" \
             --executable "${APPDIR}/usr/bin/${APP_LABEL}" \
             --executable "${APPDIR}/usr/bin/bitcoin-cli" \
+            --executable "${APPDIR}/usr/bin/bitcoind" \
             --desktop-file "${APPDIR}/usr/share/applications/tensorcash.desktop" \
             --plugin qt \
             --output appimage || echo "linuxdeploy finished (AppImage creation may have failed, but bundling should be complete)"
@@ -1788,19 +1790,60 @@ jobs:
           echo "Plugins directory contents:"
           find "${DIST_DIR}/${DIST_NAME}/plugins" -type f -name "*.so" 2>/dev/null | head -20 || echo "No plugins found!"
 
-          # Rename main executable
+          # Rename main executable; daemon gets the branded name too
           mv "${DIST_DIR}/${DIST_NAME}/bin/${APP_LABEL}" "${DIST_DIR}/${DIST_NAME}/bin/${DIST_PREFIX}" || true
+          mv "${DIST_DIR}/${DIST_NAME}/bin/bitcoind" "${DIST_DIR}/${DIST_NAME}/bin/${DIST_PREFIX}d" || true
 
-          # Create wrapper scripts
+          # Create wrapper scripts. The GUI wrapper preflights the two failure
+          # modes fresh systems actually hit (missing "system" libs on minimal
+          # installs, no display on headless/WSL) and says what to do, instead
+          # of leaving users with a bare loader error.
           cat > "${DIST_DIR}/${DIST_NAME}/${APP_LABEL}" << WRAPPER
           #!/bin/bash
           SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
           export LD_LIBRARY_PATH="\${SCRIPT_DIR}/lib:\${LD_LIBRARY_PATH}"
           export QT_PLUGIN_PATH="\${SCRIPT_DIR}/plugins"
+
+          # lib/fallback holds libraries desktop distros always provide but
+          # minimal installs (WSL, servers, containers) may not. Only add it
+          # when something is actually missing so desktop systems keep using
+          # their own copies.
+          if ldd "\${SCRIPT_DIR}/bin/${DIST_PREFIX}" 2>/dev/null | grep -q "not found" || \\
+             ldd "\${SCRIPT_DIR}/plugins/platforms/libqxcb.so" 2>/dev/null | grep -q "not found"; then
+            export LD_LIBRARY_PATH="\${LD_LIBRARY_PATH}:\${SCRIPT_DIR}/lib/fallback"
+          fi
+
+          missing="\$(ldd "\${SCRIPT_DIR}/bin/${DIST_PREFIX}" 2>/dev/null | grep "not found" | awk '{print \$1}' | sort -u)"
+          if [ -n "\${missing}" ]; then
+            echo "ERROR: this system is missing libraries the wallet needs:" >&2
+            echo "\${missing}" | sed "s/^/  /" >&2
+            echo "On Debian/Ubuntu, install them with:" >&2
+            echo "  sudo apt install libfontconfig1 libfreetype6 libharfbuzz0b libsm6 libice6" >&2
+            exit 1
+          fi
+
+          if [ -z "\${DISPLAY:-}" ] && [ -z "\${WAYLAND_DISPLAY:-}" ]; then
+            echo "NOTE: no graphical display detected (DISPLAY/WAYLAND_DISPLAY are unset)." >&2
+            echo "This starts the GUI wallet - run it from a desktop session (Windows 11" >&2
+            echo "WSL gets one via WSLg). For a headless node, run ./${DIST_PREFIX}d instead." >&2
+          fi
+
           exec "\${SCRIPT_DIR}/bin/${DIST_PREFIX}" "\$@"
           WRAPPER
           sed -i 's/^          //' "${DIST_DIR}/${DIST_NAME}/${APP_LABEL}"
           chmod +x "${DIST_DIR}/${DIST_NAME}/${APP_LABEL}"
+
+          cat > "${DIST_DIR}/${DIST_NAME}/${DIST_PREFIX}d" << WRAPPER
+          #!/bin/bash
+          SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="\${SCRIPT_DIR}/lib:\${LD_LIBRARY_PATH}"
+          if ldd "\${SCRIPT_DIR}/bin/${DIST_PREFIX}d" 2>/dev/null | grep -q "not found"; then
+            export LD_LIBRARY_PATH="\${LD_LIBRARY_PATH}:\${SCRIPT_DIR}/lib/fallback"
+          fi
+          exec "\${SCRIPT_DIR}/bin/${DIST_PREFIX}d" "\$@"
+          WRAPPER
+          sed -i 's/^          //' "${DIST_DIR}/${DIST_NAME}/${DIST_PREFIX}d"
+          chmod +x "${DIST_DIR}/${DIST_NAME}/${DIST_PREFIX}d"
 
           cat > "${DIST_DIR}/${DIST_NAME}/bitcoin-cli" << 'WRAPPER'
           #!/bin/bash
@@ -1819,11 +1862,53 @@ jobs:
           cp packaging/common/validator-config.json "${DIST_DIR}/${DIST_NAME}/defaults/" || true
           cp packaging/common/default-bitcoin.conf "${DIST_DIR}/${DIST_NAME}/defaults/bitcoin.conf"
 
+          # Bundle fallback copies of "system" libraries that linuxdeploy
+          # deliberately excludes (fontconfig/freetype/harfbuzz/SM/ICE).
+          # Desktop installs always have them; fresh WSL, server and container
+          # installs do NOT, and without them the wallet dies with a bare
+          # loader error. They live in lib/fallback/, which the launcher adds
+          # to LD_LIBRARY_PATH only when the host is missing something.
+          echo "Bundling fallback system libraries..."
+          FALLBACK_DIR="${DIST_DIR}/${DIST_NAME}/lib/fallback"
+          mkdir -p "${FALLBACK_DIR}"
+          for lib in libfontconfig.so libfreetype.so libharfbuzz.so libSM.so libICE.so; do
+            for libdir in /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib /lib/x86_64-linux-gnu; do
+              for f in "${libdir}/${lib}"*; do
+                if [[ -f "$f" && ! -e "${FALLBACK_DIR}/$(basename "$f")" ]]; then
+                  cp -P "$f" "${FALLBACK_DIR}/" 2>/dev/null || true
+                fi
+              done
+            done
+          done
+          # Pull in the dependency closure of the fallback libs: anything they
+          # need that is neither core glibc nor already bundled in lib/.
+          for pass in 1 2 3 4 5; do
+            closure_added=0
+            for so in "${FALLBACK_DIR}"/*.so*; do
+              [[ -f "$so" ]] || continue
+              for dep in $(ldd "$so" 2>/dev/null | awk '/=>/ {print $3}'); do
+                dep_name="$(basename "$dep")"
+                case "$dep_name" in
+                  libc.so*|libm.so*|libpthread.so*|libdl.so*|librt.so*|ld-linux*|libgcc_s.so*|libstdc++.so*) continue ;;
+                esac
+                if [[ -f "$dep" && ! -e "${DIST_DIR}/${DIST_NAME}/lib/${dep_name}" && ! -e "${FALLBACK_DIR}/${dep_name}" ]]; then
+                  echo "  Bundling fallback dependency: ${dep_name}"
+                  cp -L "$dep" "${FALLBACK_DIR}/${dep_name}"
+                  closure_added=1
+                fi
+              done
+            done
+            if [[ "$closure_added" == "0" ]]; then break; fi
+          done
+          echo "Fallback libraries bundled:"
+          ls "${FALLBACK_DIR}" || true
+
           # Bundle Tor from the official Tor Expert Bundle (linux-x86_64), NEVER
           # the distro package: ubuntu:22.04's apt tor is 0.4.6.10 — an EOL
           # series that current relays/directory authorities reject, so circuits
-          # never build and Tor-mode wallets sit at 0 connections. Mirrors the
-          # Windows leg, which already downloads the expert bundle.
+          # never build and Tor-mode wallets sit at 0 connections (releases up
+          # to rc28 shipped this broken). Mirrors the Windows leg, which already
+          # downloads the expert bundle (build-windows.sh).
           TOR_BUNDLE_VERSION="${TOR_BUNDLE_VERSION:-15.0.18}"
           fetch_tor_bundle() {
             curl -fsSL -o /tmp/tor-expert-bundle.tar.gz \
