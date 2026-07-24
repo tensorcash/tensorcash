@@ -1,5 +1,5 @@
 @echo off
-title TensorCash Wallet — fast
+title TensorCash Wallet
 cd /d "%~dp0"
 set DATADIR=%~dp0tensorcash-data
 if not exist "%DATADIR%" mkdir "%DATADIR%"
