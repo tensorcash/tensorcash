@@ -1,84 +1,34 @@
 {
-  "$schema": "https://tensorcash.io/schemas/validator-config.json",
-  "version": 1,
-  "description": "Default validator endpoints for TensorCash desktop clients",
+  "$schema": "https://tensorcash.org/schemas/validator-config.json",
+  "version": 2,
+  "description": "Verification defaults shipped with TensorCash desktop clients",
+
+  "note": "This file is informational. The active setting is `validatorhttpurl` in bitcoin.conf (or the VALIDATOR_HTTP_URL / VALIDATOR_API_KEY environment variables). Desktop wallets (`validationapi=desktop`) run quick verification locally and use the keyless, read-only public lookup below for proof-status queries. No API key is needed for that; the startup notice about VALIDATOR_API_KEY only matters for nodes that submit authenticated verification requests (miners / validators).",
 
   "networks": {
     "mainnet": {
-      "validators": [
-        {
-          "name": "TensorCash Foundation (Primary)",
-          "host": "validator-1.mainnet.tensorcash.io",
-          "pushPort": 6001,
-          "pullPort": 7001,
-          "tls": true,
-          "priority": 1
-        },
-        {
-          "name": "TensorCash Foundation (Backup)",
-          "host": "validator-2.mainnet.tensorcash.io",
-          "pushPort": 6001,
-          "pullPort": 7001,
-          "tls": true,
-          "priority": 2
-        }
-      ],
-      "healthCheck": {
-        "endpoint": "https://status.tensorcash.io/api/validators/mainnet",
-        "intervalSeconds": 300
+      "publicStatusLookup": {
+        "url": "https://verify.tensorcash.org",
+        "auth": "none",
+        "methods": ["GET"],
+        "readOnly": true,
+        "notes": "Read-only verdict lookup edge. Not a writable validator. No trailing slash."
       }
     },
-
     "testnet": {
-      "validators": [
-        {
-          "name": "TensorCash Testnet Validator",
-          "host": "validator.testnet.tensorcash.io",
-          "pushPort": 16001,
-          "pullPort": 17001,
-          "tls": true,
-          "priority": 1
-        }
-      ],
-      "healthCheck": {
-        "endpoint": "https://status.tensorcash.io/api/validators/testnet",
-        "intervalSeconds": 60
+      "publicStatusLookup": {
+        "url": "https://verify.tensorcash.org",
+        "auth": "none",
+        "methods": ["GET"],
+        "readOnly": true
       }
     },
-
     "regtest": {
-      "validators": [
-        {
-          "name": "Local Mock Validator",
-          "host": "127.0.0.1",
-          "pushPort": 6001,
-          "pullPort": 7001,
-          "tls": false,
-          "priority": 1,
-          "note": "Uses -validationapi=mock by default on regtest"
-        }
-      ]
+      "notes": "Regtest uses -validationapi=mock by default; no remote endpoint is contacted."
     }
   },
 
-  "connectionSettings": {
-    "zmq": {
-      "connectTimeoutMs": 5000,
-      "sendTimeoutMs": 30000,
-      "recvTimeoutMs": 600000,
-      "reconnectIntervalMs": 1000,
-      "maxReconnectIntervalMs": 30000
-    },
-    "tls": {
-      "verifyPeer": true,
-      "caCertBundle": "embedded"
-    }
-  },
-
-  "fallbackBehavior": {
-    "onAllValidatorsUnavailable": "queue_and_retry",
-    "maxQueuedRequests": 1000,
-    "retryIntervalSeconds": 30,
-    "showUserWarningAfterSeconds": 60
+  "privateValidator": {
+    "notes": "To use your own or a third-party authenticated validator instead, set `validatorhttpurl` plus `validatorapikey` in bitcoin.conf, or the VALIDATOR_HTTP_URL / VALIDATOR_API_KEY environment variables."
   }
 }
